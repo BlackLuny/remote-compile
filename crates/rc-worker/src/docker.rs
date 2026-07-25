@@ -584,6 +584,12 @@ pub fn target_volume(worktree_id: &str) -> String {
     format!("rc-target-{worktree_id}")
 }
 
+/// One rustup store for the whole worker: `rust-toolchain.toml` pins differ per
+/// project but the toolchains themselves are shared, immutable and large.
+pub fn rustup_volume() -> String {
+    "rc-rustup".to_string()
+}
+
 pub fn registry_volume(project_id: &str) -> String {
     format!("rc-cargo-{project_id}")
 }

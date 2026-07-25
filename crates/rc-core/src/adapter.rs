@@ -19,6 +19,15 @@ pub struct CacheConfig {
     pub target_mount: Option<String>,
     /// Per-project volume — downloaded dependency sources.
     pub registry_mount: Option<String>,
+    /// Worker-wide volume holding rustup's toolchains.
+    ///
+    /// `rust-toolchain.toml` pins a version per project, and the container root
+    /// is read-only (§7.1), so a project asking for anything but the one baked
+    /// into the image cannot install it — rustup fails on
+    /// `/usr/local/rustup: Read-only file system`. Toolchains are large,
+    /// identical across projects and immutable once written, so one volume for
+    /// the whole worker is the right granularity.
+    pub rustup_mount: Option<String>,
     /// Mount the host sccache unix socket (§7.2: the container is
     /// `--network=none`, so the daemon lives on the host and credentials for
     /// the remote cache backend never enter untrusted code).
@@ -166,6 +175,7 @@ impl Adapter for RustAdapter {
         env.insert("CARGO_INCREMENTAL".into(), "0".into());
         env.insert("CARGO_TERM_COLOR".into(), "never".into());
         env.insert("CARGO_HOME".into(), "/rc/cargo".into());
+        env.insert("RUSTUP_HOME".into(), "/rc/rustup".into());
         env.insert("SCCACHE_SERVER_UDS".into(), "/rc/sccache/sccache.sock".into());
         for (k, v) in &profile.env {
             env.insert(k.clone(), v.clone());
@@ -174,6 +184,7 @@ impl Adapter for RustAdapter {
             env,
             target_mount: Some("/rc/target".into()),
             registry_mount: Some("/rc/cargo".into()),
+            rustup_mount: Some("/rc/rustup".into()),
             sccache_uds: true,
         }
     }
@@ -298,6 +309,7 @@ impl Adapter for GenericAdapter {
             env: profile.env.clone().into_iter().collect(),
             target_mount: None,
             registry_mount: None,
+            rustup_mount: None,
             sccache_uds: false,
         }
     }

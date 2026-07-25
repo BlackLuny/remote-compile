@@ -249,6 +249,15 @@ impl Runner {
             self.sandbox.ensure_volume(&name, labels.clone()).await?;
             volumes.push((name, mount.clone()));
         }
+        if let Some(mount) = &cache.rustup_mount {
+            // Worker-wide, unlabelled by project: a toolchain is the same bytes
+            // whoever asked for it, and GC keys off project/worktree labels.
+            let name = docker::rustup_volume();
+            self.sandbox
+                .ensure_volume(&name, docker::Sandbox::base_labels())
+                .await?;
+            volumes.push((name, mount.clone()));
+        }
         if let Some(mount) = &cache.registry_mount {
             let name = docker::registry_volume(&assignment.project_id);
             let mut vol_labels = docker::Sandbox::base_labels();

@@ -2,8 +2,8 @@
 #
 # What a usable rc environment image must provide:
 #   * the toolchain and any system libraries the project's build scripts need;
-#   * writable /rc/cargo and /rc/target mount points, because the container
-#     root filesystem is read-only (§7.1).
+#   * writable /rc/cargo, /rc/target and /rc/rustup mount points, because the
+#     container root filesystem is read-only (§7.1).
 #
 # Build and push it, then approve the resulting digest in the console:
 #   docker build -f deploy/Dockerfile.rust-env -t rc-registry:5000/env/rust:1 .
@@ -35,8 +35,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # still be cleaned up before the next task (§7.3). That uid is not known when
 # this image is built, and named volumes inherit these modes.
 RUN mkdir -p /rc/cargo /rc/target /rc/home /work && chmod 0777 /rc/cargo /rc/target /rc/home /work
+
+# rustup lives on a mount too. A project's rust-toolchain.toml pins a version
+# that need not be the one baked in here, and installing it into the image's
+# own /usr/local/rustup fails on the read-only root. Moving the store to /rc
+# lets the worker back it with a volume: docker seeds a fresh named volume from
+# whatever the image has at that path, so the toolchain below is already there
+# and only genuinely new pins get downloaded — once per worker, not per task.
+RUN mv /usr/local/rustup /rc/rustup && chmod -R a+rwX /rc/rustup
 ENV CARGO_HOME=/rc/cargo \
     CARGO_TARGET_DIR=/rc/target \
+    RUSTUP_HOME=/rc/rustup \
     HOME=/rc/home
 
 WORKDIR /work
