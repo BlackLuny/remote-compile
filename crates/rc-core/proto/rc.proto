@@ -23,12 +23,27 @@ message FileEntry {
   string symlink_target = 7;
 }
 
+// 一个参与构建的本地目录。多根时（cargo path 依赖指向仓库外）用于披露与可观测；
+// 条目本身一律进 Manifest.entries，路径以 anchor 为基准。
+message RootInfo {
+  string mount = 1;            // 相对 anchor 的路径，'/' 分隔；单根时为 ""
+  string local_path = 2;       // 开发机上的绝对路径，仅供展示
+  bool primary = 3;            // 调用方点名的那个根
+  uint64 bytes = 4;
+  uint32 files = 5;
+}
+
 // L2 dirty layer: the authoritative description of the workspace.
 message Manifest {
   repeated FileEntry entries = 1;
   string root_hash = 2;        // blake3 over canonical entry list
   string base_commit = 3;      // "" when no git baseline
   bool baseline = 4;           // true => worker should materialize L1 from git mirror
+  // 主根相对 anchor 的路径。单根时为 ""，此时 entries 的路径与历史完全一致，
+  // root_hash 也因此不变。多根时 worker 把 L1 基线展开到 <workspace>/<anchor_mount>，
+  // 构建目录也以它为前缀。
+  string anchor_mount = 5;
+  repeated RootInfo roots = 6;
 }
 
 message ResolvedProfile {
@@ -321,6 +336,9 @@ message Heartbeat {
   WorkerStats stats = 1;
   repeated string active_task_ids = 2;
   string status = 3;             // online|draining
+  // worker 支持的可选能力，每次心跳上报。放在心跳而非 Enroll，是因为入伍只发生一次：
+  // 一台升级过的老 worker 不会重新入伍，能力若只在入伍时记录就永远不会更新。
+  repeated string capabilities = 4;
 }
 
 message TaskProgress {

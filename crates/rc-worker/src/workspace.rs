@@ -189,6 +189,44 @@ pub fn apply_deletions(root: &Path, plan: &RebuildPlan) -> Result<()> {
     Ok(())
 }
 
+/// Materialize `rel` under `root` as a real directory, replacing anything on
+/// the way that is not one.
+///
+/// The previous task's build ran as this uid inside the workspace and could
+/// have swapped a directory for a symlink pointing anywhere. Plain
+/// `create_dir_all` is happy with that — the path exists and is a directory,
+/// through the link — so whatever gets written next lands outside the
+/// workspace. Callers that write before the manifest-driven cleanup runs
+/// (baseline extraction, notably) have to come through here.
+pub fn ensure_real_dir(root: &Path, rel: &str) -> Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    std::fs::create_dir_all(&path)?;
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        if part == ".." || part == "." {
+            return Err(anyhow!("refusing to traverse `{rel}`"));
+        }
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() && !meta.is_symlink() => {}
+            Ok(meta) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    symlink = meta.is_symlink(),
+                    "replacing a workspace path that should be a directory"
+                );
+                if meta.is_dir() {
+                    std::fs::remove_dir_all(&path)?;
+                } else {
+                    std::fs::remove_file(&path)?;
+                }
+                std::fs::create_dir(&path)?;
+            }
+            Err(_) => std::fs::create_dir(&path)?,
+        }
+    }
+    Ok(path)
+}
+
 /// Write one file's content with the manifest's mode.
 pub fn write_file(root: &Path, entry: &FileEntry, data: &[u8]) -> Result<()> {
     let path = root.join(&entry.path);
@@ -508,6 +546,8 @@ mod tests {
             root_hash: String::new(),
             base_commit: String::new(),
             baseline: false,
+            anchor_mount: String::new(),
+            roots: Vec::new(),
         };
         assert!(plan(&root, &m).is_err());
     }

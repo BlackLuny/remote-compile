@@ -20,6 +20,15 @@ pub struct FingerprintInput<'a> {
     /// Canonical text form of the fully resolved profile, including the
     /// selected task type and the final command line.
     pub profile_canonical: &'a str,
+    /// Where the primary root sits inside the workspace mount.
+    ///
+    /// The manifest hash covers *content*, not shape, and the two can disagree:
+    /// a repository that simply contains `app/` and `lib/` produces the same
+    /// entry list as a two-root layout mounting `app` and `lib` side by side.
+    /// The entries are identical, so `root_hash` is identical — but the first
+    /// builds in `/work` and the second in `/work/app`. Without this they share
+    /// a fingerprint and one serves the other's cached result.
+    pub anchor_mount: &'a str,
 }
 
 /// Reasons a set of inputs cannot produce a trustworthy fingerprint.
@@ -78,6 +87,7 @@ pub fn compute(input: FingerprintInput<'_>) -> Result<String, FingerprintError> 
     // Length-prefixed so no concatenation of two fields can mimic another.
     for part in [
         EXECUTOR_ABI,
+        input.anchor_mount,
         input.manifest_root_hash,
         input.image_digest,
         input.toolchain,
@@ -90,12 +100,17 @@ pub fn compute(input: FingerprintInput<'_>) -> Result<String, FingerprintError> 
 }
 
 /// Convenience wrapper over the wire type.
-pub fn compute_for(manifest_root_hash: &str, profile: &ResolvedProfile) -> Result<String, FingerprintError> {
+pub fn compute_for(
+    manifest_root_hash: &str,
+    profile: &ResolvedProfile,
+    anchor_mount: &str,
+) -> Result<String, FingerprintError> {
     compute(FingerprintInput {
         manifest_root_hash,
         image_digest: &profile.image,
         toolchain: &profile.toolchain,
         profile_canonical: &profile.canonical,
+        anchor_mount,
     })
 }
 
@@ -112,6 +127,7 @@ mod tests {
             image_digest: image,
             toolchain: tc,
             profile_canonical: prof,
+            anchor_mount: "",
         }
     }
 
@@ -129,6 +145,19 @@ mod tests {
         assert_ne!(base, compute(input("m1", DIGEST2, "rustc 1.85.0", "cmd=cargo check")).unwrap());
         assert_ne!(base, compute(input("m1", DIGEST, "rustc 1.86.0", "cmd=cargo check")).unwrap());
         assert_ne!(base, compute(input("m1", DIGEST, "rustc 1.85.0", "cmd=cargo clippy")).unwrap());
+    }
+
+    #[test]
+    fn the_same_files_laid_out_differently_are_not_the_same_task() {
+        // A repository that simply contains `app/` and `lib/` produces the same
+        // entry list — and therefore the same root_hash — as a two-root layout
+        // mounting them side by side. The first builds in /work, the second in
+        // /work/app. Sharing a fingerprint would serve one the other's result.
+        let mut flat = input("m1", DIGEST, "rustc 1.85.0", "cmd=cargo check");
+        flat.anchor_mount = "";
+        let mut nested = input("m1", DIGEST, "rustc 1.85.0", "cmd=cargo check");
+        nested.anchor_mount = "app";
+        assert_ne!(compute(flat).unwrap(), compute(nested).unwrap());
     }
 
     #[test]

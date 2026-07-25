@@ -2,6 +2,8 @@
 //! context small (§11, §12).
 
 use crate::client::AgentClient;
+use crate::consent;
+use crate::multiroot;
 use crate::config::AgentConfig;
 use crate::index::{KnownBlobs, ResultCache, StatIndex};
 use crate::scanner::{self, ScanError};
@@ -67,11 +69,35 @@ impl Engine {
         let excludes = adapter.default_exclude().to_vec();
 
         self.cfg.ensure_dirs()?;
-        let mut index = StatIndex::open(&self.cfg.index_path(&root))?;
-        if index.is_empty() {
-            tracing::info!(root = %root.display(), "cold stat index: this first scan hashes every file");
+
+        // ---- roots (§multi-root) ----
+        let layout = match self.resolve_roots(&root, adapter.as_ref())? {
+            Ok(l) => l,
+            Err(message) => {
+                return Ok(Outcome {
+                    task_id: String::new(),
+                    kind: None,
+                    status: "needs_approval".into(),
+                    text: message,
+                })
+            }
+        };
+        if layout.roots.len() > 1 {
+            tracing::info!(
+                roots = layout.roots.len(),
+                anchor = %layout.anchor.display(),
+                "the build reaches outside the repository; syncing every root"
+            );
         }
-        let scan = match scanner::scan(&root, &excludes, &mut index) {
+
+        let cfg = &self.cfg;
+        let scan = match multiroot::scan_all(&layout, &excludes, |p| {
+            let index = StatIndex::open(&cfg.index_path(p))?;
+            if index.is_empty() {
+                tracing::info!(root = %p.display(), "cold stat index: this first scan hashes every file");
+            }
+            Ok(index)
+        }) {
             Ok(s) => s,
             Err(ScanError::Unstable { attempts, changed }) => {
                 return Ok(Outcome {
@@ -89,9 +115,6 @@ impl Engine {
             Err(e) => return Err(anyhow!("{e}")),
         };
 
-        if scan.attempts > 1 {
-            tracing::info!(attempts = scan.attempts, "workspace settled after a rescan (§4.2)");
-        }
         let project_id = rc_core::ids::project_id(scan.repo_url.as_deref(), &root);
         let worktree_id = rc_core::ids::worktree_id(&root, &scan.first_base_commit);
         tracing::debug!(
@@ -126,7 +149,8 @@ impl Engine {
             }
         };
         let profile_pb = resolution.to_pb();
-        let fingerprint = rc_core::fingerprint::compute_for(&scan.manifest.root_hash, &profile_pb)
+        let fingerprint =
+            rc_core::fingerprint::compute_for(&scan.manifest.root_hash, &profile_pb, &scan.manifest.anchor_mount)
             .map_err(|e| anyhow!("{e}"))?;
 
         // ---- local result cache: answer without touching the network ----
@@ -142,9 +166,24 @@ impl Engine {
             }
         }
 
+        // A root inside the repository normally needs no permission — it is
+        // part of what `check <path>` covers. One that had to be scanned
+        // *separately* is different: the repository's own enumeration does not
+        // list it, so it is `.gitignore`d, and uploading ignored content is not
+        // something the caller asked for. This is the last gate before anything
+        // leaves the machine.
+        if let Some(message) = self.unapproved_hidden_roots(&root, &scan) {
+            return Ok(Outcome {
+                task_id: String::new(),
+                kind: None,
+                status: "needs_approval".into(),
+                text: message,
+            });
+        }
+
         // ---- sync ----
         let mut known = KnownBlobs::open(&self.cfg.cas_known_path())?;
-        let bytes = self.sync_blobs(&mut client, &root, &scan, &mut known).await?;
+        let bytes = self.sync_blobs(&mut client, &scan, &mut known).await?;
         let bundle_blob = self
             .sync_baseline(&mut client, &mut known, &project_id, &root, &scan)
             .await
@@ -170,6 +209,10 @@ impl Engine {
             no_cache: req.no_cache,
         };
 
+        // What actually got synced beyond the named directory. Approval was
+        // given once, in the repo config; this keeps it visible afterwards.
+        let root_note = describe_roots(&scan);
+
         let mut handle = client.submit(submit.clone()).await?;
         if handle.status == "needs_blobs" {
             // The control plane garbage-collected something between our
@@ -178,7 +221,7 @@ impl Engine {
             for h in &handle.missing_blobs {
                 known.forget(h).ok();
             }
-            self.upload_specific(&mut client, &root, &scan, &handle.missing_blobs, &mut known)
+            self.upload_specific(&mut client, &scan, &handle.missing_blobs, &mut known)
                 .await?;
             submit.fingerprint = fingerprint.clone();
             handle = client.submit(submit).await?;
@@ -193,6 +236,7 @@ impl Engine {
         if handle.cache_hit {
             let result = handle.result.clone().unwrap_or_default();
             let mut text = format_result(&handle.task_id, &result, self.cfg.max_diagnostics, true, bytes);
+            text = with_note(text, &root_note);
             text = with_warnings(text, &scan.warnings);
             results.put(&fingerprint, &handle.task_id, &result.kind).ok();
             return Ok(Outcome {
@@ -207,6 +251,7 @@ impl Engine {
         let wait = req.wait_secs.unwrap_or(self.cfg.default_wait_secs);
         let status = client.get_task(&handle.task_id, wait).await?;
         let mut outcome = self.render(&status, bytes);
+        outcome.text = with_note(outcome.text, &root_note);
         // §4.3: a degraded enumeration is exactly the situation where a
         // remote/local divergence appears, so never hide it.
         outcome.text = with_warnings(outcome.text, &scan.warnings);
@@ -295,6 +340,95 @@ impl Engine {
             status: status.status.clone(),
             text,
         }
+    }
+
+    /// Work out which local directories this build needs, and whether the user
+    /// has agreed to sync the ones outside the repository.
+    ///
+    /// `Ok(Err(message))` means "stop and show this" — either discovery could
+    /// not promise a complete answer, or a root is awaiting approval. Neither
+    /// is a failure of the build; both are situations where guessing would be
+    /// worse than asking.
+    #[allow(clippy::type_complexity)]
+    fn resolve_roots(
+        &self,
+        root: &Path,
+        adapter: &dyn rc_core::adapter::Adapter,
+    ) -> Result<Result<rc_core::roots::Layout, String>> {
+        let discovery = adapter.extra_roots(root);
+        if !discovery.complete {
+            // Falling back to a narrower root set here would reproduce exactly
+            // the fingerprint this project had before it grew the dependency,
+            // and the agent would then answer from cache — a stale success with
+            // no warning attached (§4.3).
+            return Ok(Err(format!(
+                "✗ 无法确定构建需要哪些目录，因此没有提交。\n{}\n\n\
+                 继续的办法：修好上面的问题，或在 {} 里用 extra_roots 显式列出仓库外的目录。",
+                discovery.notes.join("\n"),
+                rc_core::profile::REPO_CONFIG_FILE
+            )));
+        }
+
+        let external = multiroot::external_to(root, &discovery.roots);
+        let policy = self.repo_extra_roots(root);
+        let approved = match consent::evaluate(root, &external, policy.as_ref()) {
+            consent::Consent::Approved(roots) => roots,
+            consent::Consent::Blocked { message, .. } => return Ok(Err(message)),
+        };
+
+        // Roots inside the repository need no permission — they are already
+        // part of what `check <path>` covers — but they still take part in the
+        // layout, because one of them may be `.gitignore`d and therefore
+        // invisible to the repository's own enumeration.
+        let mut candidates = approved;
+        candidates.extend(
+            discovery
+                .roots
+                .iter()
+                .filter(|p| p.starts_with(root))
+                .cloned(),
+        );
+
+        match rc_core::roots::compute(root, &candidates) {
+            Ok(layout) => Ok(Ok(layout)),
+            Err(e) => Ok(Err(format!(
+                "✗ 这些目录无法组成一个可用的容器布局：{e}\n\
+                 把它们放到同一棵目录树下，或用 extra_roots = [] 关掉仓库外同步。"
+            ))),
+        }
+    }
+
+    /// Roots inside the repository that its own enumeration does not cover, and
+    /// which the config has not approved either.
+    ///
+    /// These are `.gitignore`d directories that cargo nonetheless builds. They
+    /// have to be synced for the build to work, but a repository ignores a
+    /// directory for a reason, so uploading it is the user's call.
+    fn unapproved_hidden_roots(&self, root: &Path, scan: &multiroot::MultiScan) -> Option<String> {
+        let hidden: Vec<PathBuf> = scan
+            .scanned
+            .iter()
+            .filter(|r| r.nested && r.path.starts_with(root))
+            .map(|r| r.path.clone())
+            .collect();
+        if hidden.is_empty() {
+            return None;
+        }
+        match consent::evaluate(root, &hidden, self.repo_extra_roots(root).as_ref()) {
+            consent::Consent::Approved(_) => None,
+            consent::Consent::Blocked { message, .. } => Some(format!(
+                "{message}\n\n（这些目录在仓库内，但被 .gitignore 排除，仓库自身的枚举看不到它们；\
+                 cargo 却要用它们构建。）"
+            )),
+        }
+    }
+
+    /// `extra_roots` as declared by the repository itself. Only the repo file
+    /// counts: this is a decision about the user's own data, so a value learned
+    /// from the fleet or guessed by an adapter has no business granting it.
+    fn repo_extra_roots(&self, root: &Path) -> Option<rc_core::profile::ExtraRoots> {
+        let text = std::fs::read_to_string(root.join(rc_core::profile::REPO_CONFIG_FILE)).ok()?;
+        rc_core::profile::parse_toml(&text).ok()?.profile.extra_roots
     }
 
     /// §3.2 chain: explicit > repo file > server > detected.
@@ -398,8 +532,7 @@ impl Engine {
     async fn sync_blobs(
         &self,
         client: &mut AgentClient,
-        root: &Path,
-        scan: &scanner::Scan,
+        scan: &multiroot::MultiScan,
         known: &mut KnownBlobs,
     ) -> Result<u64> {
         let needed = rc_core::manifest::blobs_to_reconcile(&scan.manifest);
@@ -416,15 +549,14 @@ impl Engine {
         if missing.is_empty() {
             return Ok(0);
         }
-        let bytes = self.upload_specific(client, root, scan, &missing, known).await?;
+        let bytes = self.upload_specific(client, scan, &missing, known).await?;
         Ok(bytes)
     }
 
     async fn upload_specific(
         &self,
         client: &mut AgentClient,
-        root: &Path,
-        scan: &scanner::Scan,
+        scan: &multiroot::MultiScan,
         hashes: &[String],
         known: &mut KnownBlobs,
     ) -> Result<u64> {
@@ -433,7 +565,9 @@ impl Engine {
         let mut by_hash: HashMap<String, PathBuf> = HashMap::new();
         for entry in &scan.manifest.entries {
             if wanted.contains(&entry.hash) && !by_hash.contains_key(&entry.hash) {
-                by_hash.insert(entry.hash.clone(), root.join(&entry.path));
+                // Manifest paths are relative to the anchor, which is the
+                // primary root only when there is nothing else to sync.
+                by_hash.insert(entry.hash.clone(), scan.anchor.join(&entry.path));
             }
         }
 
@@ -476,7 +610,7 @@ impl Engine {
         known: &mut KnownBlobs,
         project_id: &str,
         root: &Path,
-        scan: &scanner::Scan,
+        scan: &multiroot::MultiScan,
     ) -> Result<String> {
         if !scan.manifest.baseline || scan.manifest.base_commit.is_empty() {
             return Ok(String::new());
@@ -547,6 +681,29 @@ impl Engine {
     pub async fn list_workers(&self) -> Result<pb::ListWorkersResp> {
         self.client().await?.list_workers().await
     }
+}
+
+/// One line naming every directory beyond the primary root that took part in
+/// this build. Silent when there is only one, which is the common case — the
+/// point is that syncing a sibling checkout never becomes invisible routine.
+fn describe_roots(scan: &multiroot::MultiScan) -> String {
+    if scan.scanned.len() < 2 {
+        return String::new();
+    }
+    let others: Vec<String> = scan
+        .scanned
+        .iter()
+        .filter(|r| !r.primary)
+        .map(|r| r.mount.clone())
+        .collect();
+    format!("同步了 {} 个目录，除主仓库外还有: {}", scan.scanned.len(), others.join(", "))
+}
+
+fn with_note(text: String, note: &str) -> String {
+    if note.is_empty() {
+        return text;
+    }
+    format!("{text}\n{note}")
 }
 
 fn with_warnings(text: String, warnings: &[String]) -> String {

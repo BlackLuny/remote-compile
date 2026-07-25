@@ -151,7 +151,11 @@ impl Runner {
             );
             baseline_note = format!("{source:?}");
             if source != BaselineSource::Unavailable {
-                if let Err(e) = mirror.extract(&manifest.base_commit, &root) {
+                // The manifest's paths are relative to the anchor, and the
+                // baseline describes only the primary root, so it materialises
+                // under that root's mount rather than at the top.
+                let dest = baseline_dir(&root, &manifest.anchor_mount)?;
+                if let Err(e) = mirror.extract(&manifest.base_commit, &dest) {
                     // Not fatal: the manifest still describes every file, so
                     // the L2 layer can supply all of them (§4.1 step 4).
                     tracing::warn!(error = %e, "baseline extraction failed; falling back to full L2");
@@ -322,7 +326,7 @@ impl Runner {
         // the mounted workspace (§3.2). The path comes from the agent, so it is
         // checked rather than trusted: `../..` here would put the build's cwd
         // outside the workspace entirely.
-        let workdir = subproject_workdir(&profile.path)?;
+        let workdir = subproject_workdir(&assignment_anchor(assignment), &profile.path)?;
 
         // pre_commands generate code, so they run inside the same sandbox and
         // are part of the fingerprint (§5.1).
@@ -501,19 +505,53 @@ impl Runner {
     }
 }
 
-/// Absolute working directory for a build, given the profile's sub-project
-/// path. Empty means the workspace root.
-fn subproject_workdir(path: &str) -> Result<String> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        return Ok(docker::WORKSPACE_MOUNT.to_string());
+/// Where in the mounted workspace the primary root sits. Empty for the ordinary
+/// single-root case, in which the mount and the repository coincide.
+fn assignment_anchor(assignment: &TaskAssignment) -> String {
+    assignment
+        .manifest
+        .as_ref()
+        .map(|m| m.anchor_mount.clone())
+        .unwrap_or_default()
+}
+
+/// Absolute working directory for a build.
+///
+/// Two independent prefixes: `anchor_mount` locates the primary root inside the
+/// workspace (non-empty only when other roots are synced alongside it), and
+/// `path` selects a sub-project within that root (§3.2). Both come from the
+/// agent, so both are checked rather than trusted — `../..` in either would put
+/// the build's working directory outside the workspace.
+fn subproject_workdir(anchor_mount: &str, path: &str) -> Result<String> {
+    let mut out = docker::WORKSPACE_MOUNT.to_string();
+    for (label, part) in [("anchor mount", anchor_mount), ("profile path", path)] {
+        let trimmed = part.trim_matches('/');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !rc_core::manifest::is_safe_relative_path(trimmed) {
+            return Err(anyhow!(
+                "{label} `{part}` is not a safe relative path; refusing to run outside the workspace"
+            ));
+        }
+        out.push('/');
+        out.push_str(trimmed);
     }
-    if !rc_core::manifest::is_safe_relative_path(trimmed) {
-        return Err(anyhow!(
-            "profile path `{path}` is not a safe relative path; refusing to run outside the workspace"
-        ));
+    Ok(out)
+}
+
+/// Directory the L1 baseline is extracted into.
+///
+/// Extraction runs *before* the manifest-driven cleanup, so it cannot rely on
+/// strays having been removed yet: every component is materialised as a real
+/// directory first, or a build that swapped one for a symlink would redirect
+/// `git archive | tar -C` outside the workspace.
+fn baseline_dir(workspace: &Path, anchor_mount: &str) -> Result<PathBuf> {
+    let trimmed = anchor_mount.trim_matches('/');
+    if !trimmed.is_empty() && !rc_core::manifest::is_safe_relative_path(trimmed) {
+        return Err(anyhow!("anchor mount `{anchor_mount}` is not a safe relative path"));
     }
-    Ok(format!("{}/{trimmed}", docker::WORKSPACE_MOUNT))
+    workspace::ensure_real_dir(workspace, trimmed)
 }
 
 /// Whether to wire the shared compilation cache into builds (§7.2).
@@ -619,9 +657,23 @@ mod tests {
 
     #[test]
     fn a_subproject_path_becomes_the_working_directory() {
-        assert_eq!(subproject_workdir("crates/backend").unwrap(), "/work/crates/backend");
-        assert_eq!(subproject_workdir("/crates/backend/").unwrap(), "/work/crates/backend");
-        assert_eq!(subproject_workdir("").unwrap(), "/work");
+        assert_eq!(subproject_workdir("", "crates/backend").unwrap(), "/work/crates/backend");
+        assert_eq!(subproject_workdir("", "/crates/backend/").unwrap(), "/work/crates/backend");
+        assert_eq!(subproject_workdir("", "").unwrap(), "/work");
+    }
+
+    #[test]
+    fn the_anchor_mount_shifts_the_build_into_the_primary_root() {
+        // With extra roots synced alongside it, the repository no longer sits
+        // at the top of the workspace: `../private_tun` has to resolve to a
+        // sibling of it, which only works if it is one level down.
+        assert_eq!(subproject_workdir("app", "").unwrap(), "/work/app");
+        assert_eq!(
+            subproject_workdir("app", "crates/backend").unwrap(),
+            "/work/app/crates/backend"
+        );
+        // Single-root layouts are unchanged.
+        assert_eq!(subproject_workdir("", "").unwrap(), docker::WORKSPACE_MOUNT);
     }
 
     #[test]
@@ -630,7 +682,7 @@ mod tests {
         // repository onto the sub-project's pathname: a build with
         // `path = "crates/backend"` compiled the entire workspace while the
         // real sub-project sat at `/work/crates/backend/crates/backend`.
-        let workdir = subproject_workdir("crates/backend").unwrap();
+        let workdir = subproject_workdir("", "crates/backend").unwrap();
         assert_eq!(docker::WORKSPACE_MOUNT, "/work");
         assert_ne!(workdir, docker::WORKSPACE_MOUNT);
         assert!(
@@ -640,16 +692,70 @@ mod tests {
     }
 
     #[test]
-    fn a_traversing_subproject_path_is_refused() {
+    fn a_traversing_path_is_refused_from_either_prefix() {
         for evil in ["../..", "crates/../../etc", "a/./b", "a//b", "..", "C:/win"] {
             assert!(
-                subproject_workdir(evil).is_err(),
+                subproject_workdir("", evil).is_err(),
                 "`{evil}` must not become a working directory"
             );
+            assert!(
+                subproject_workdir(evil, "").is_err(),
+                "`{evil}` must not pass as an anchor mount either"
+            );
+            assert!(baseline_dir(Path::new("/w"), evil).is_err());
         }
         // A leading slash is a typo, not an escape: it is trimmed and stays
         // inside the mount.
-        assert_eq!(subproject_workdir("/etc").unwrap(), "/work/etc");
+        assert_eq!(subproject_workdir("", "/etc").unwrap(), "/work/etc");
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rc-base-{tag}-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_baseline_lands_under_the_primary_roots_mount() {
+        let w = scratch("mount");
+        assert_eq!(baseline_dir(&w, "").unwrap(), w);
+        assert_eq!(baseline_dir(&w, "app").unwrap(), w.join("app"));
+        assert_eq!(baseline_dir(&w, "/app/").unwrap(), w.join("app"));
+        assert!(w.join("app").is_dir(), "the destination must exist before tar runs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_point_swapped_for_a_symlink_is_replaced_before_extraction() {
+        // Extraction happens before the manifest-driven cleanup, so it cannot
+        // assume strays are gone. `git archive | tar -C` through a leftover
+        // symlink would write the whole baseline outside the workspace.
+        let w = scratch("swap");
+        let outside = scratch("swap-outside");
+        std::fs::write(outside.join("victim"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, w.join("app")).unwrap();
+
+        let dest = baseline_dir(&w, "app").unwrap();
+        assert_eq!(dest, w.join("app"));
+        assert!(!dest.symlink_metadata().unwrap().is_symlink());
+        assert!(dest.is_dir());
+
+        std::fs::write(dest.join("extracted"), b"x").unwrap();
+        assert!(!outside.join("extracted").exists(), "nothing may land outside");
+        assert!(outside.join("victim").exists(), "and nothing outside may be destroyed");
+    }
+
+    #[test]
+    fn an_assignment_without_a_manifest_anchors_at_the_top() {
+        assert_eq!(assignment_anchor(&TaskAssignment::default()), "");
+        let assignment = TaskAssignment {
+            manifest: Some(pb::Manifest {
+                anchor_mount: "app".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(assignment_anchor(&assignment), "app");
     }
 
     #[test]

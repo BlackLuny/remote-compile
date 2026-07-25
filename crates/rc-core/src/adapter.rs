@@ -65,6 +65,17 @@ pub trait Adapter: Send + Sync {
 
     /// Default image when the fleet has no better idea.
     fn default_image(&self) -> &'static str;
+
+    /// Directories outside `repo_root` that the build reads from.
+    ///
+    /// Most languages resolve dependencies from a registry or a vendor
+    /// directory inside the repository and have nothing to report. Cargo does
+    /// not: a `path` dependency may point anywhere, and the literal in
+    /// `Cargo.toml` has to keep meaning the same thing remotely.
+    fn extra_roots(&self, repo_root: &Path) -> crate::discover::Discovery {
+        let _ = repo_root;
+        crate::discover::Discovery::complete(Vec::new())
+    }
 }
 
 pub fn for_name(name: &str) -> Box<dyn Adapter> {
@@ -195,6 +206,10 @@ impl Adapter for RustAdapter {
 
     fn default_image(&self) -> &'static str {
         "docker.io/library/rust:1-bookworm"
+    }
+
+    fn extra_roots(&self, repo_root: &Path) -> crate::discover::Discovery {
+        crate::discover::cargo_path_dependencies(repo_root)
     }
 }
 

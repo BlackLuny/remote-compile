@@ -132,6 +132,7 @@ path = "crates/backend"                              # monorepo sub-project
 env = { RUSTFLAGS = "-C target-cpu=native" }
 features = ["ssr"]
 pre_commands = ["cargo run -p xtask codegen"]
+extra_roots = ["../private_tun"]                     # see below
 
 [tasks]
 check  = "cargo check --workspace --all-targets"
@@ -142,6 +143,33 @@ clippy = "cargo clippy -- -D warnings"
 Resolution order: explicit call arguments → this file → what the control plane
 stored → adapter auto-detection. After a project's first green build the agent
 publishes what worked, so the next agent inherits it.
+
+### Dependencies outside the repository
+
+A cargo `path` dependency can point at a sibling checkout, and `../private_tun`
+has to keep meaning the same thing on the worker. The agent finds those
+directories, mounts every root under a common ancestor so their relative
+positions survive, and syncs them alongside the repository.
+
+Doing that sends code the caller never named to a CAS that is **not encrypted at
+rest**, so it is not done silently. The first time such a directory appears the
+check stops and prints the line to add:
+
+```toml
+extra_roots = ["../private_tun", "../shadow-tls-tokio"]
+extra_roots = "auto"    # allow whatever is discovered
+extra_roots = []        # sync nothing outside the repo; the build fails plainly
+```
+
+Only the repository's own file grants this — never a profile learned from the
+fleet. Directories the repository `.gitignore`s but cargo still builds need
+listing too, for the same reason.
+
+Discovery covers path dependencies (including ones inherited from
+`[workspace.dependencies]` or declared per-target), workspace members outside the
+repository, and `[patch]`/`[replace]` entries in the workspace manifest and
+`.cargo/config.toml`. When it cannot promise a complete answer it refuses to
+build rather than compiling against a guess.
 
 ## Admin console
 
@@ -201,9 +229,9 @@ and Slack all accept.
 ## Development
 
 ```bash
-cargo test --workspace        # 282 unit tests
+cargo test --workspace        # 338 unit tests
 cargo clippy --workspace --all-targets
-./scripts/smoke.sh            # 36 end-to-end checks against real binaries
+./scripts/smoke.sh            # 44 end-to-end checks against real binaries
 
 cd web && npm run dev         # console with hot reload, proxying to :7700
 ```

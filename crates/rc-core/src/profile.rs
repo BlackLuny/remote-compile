@@ -26,6 +26,39 @@ pub struct BuildProfile {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub tasks: BTreeMap<String, String>,
+    /// Directories outside this repository that the build needs — cargo `path`
+    /// dependencies pointing at sibling checkouts, typically.
+    ///
+    /// Syncing them means uploading code the caller did not name, to a CAS that
+    /// is not encrypted at rest (§16), so it is not something to infer. Absent,
+    /// the agent reports what it found and waits.
+    pub extra_roots: Option<ExtraRoots>,
+}
+
+/// What the repository permits beyond its own root.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExtraRoots {
+    /// `extra_roots = ["../private_tun"]` — exactly these, relative to the repo
+    /// root. Discovering anything else is an error rather than a silent
+    /// upload. `[]` means "none", and a build needing one will fail plainly.
+    Allow(Vec<String>),
+    /// `extra_roots = "auto"` — whatever discovery finds, no further questions.
+    Mode(String),
+}
+
+impl ExtraRoots {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ExtraRoots::Mode(m) if m.eq_ignore_ascii_case("auto"))
+    }
+
+    /// The listed paths, or none for `auto`.
+    pub fn allowed(&self) -> &[String] {
+        match self {
+            ExtraRoots::Allow(v) => v,
+            ExtraRoots::Mode(_) => &[],
+        }
+    }
 }
 
 /// Where a resolved profile ultimately came from — reported to the agent so
@@ -73,6 +106,7 @@ const KNOWN_KEYS: &[&str] = &[
     "pre_commands",
     "env",
     "tasks",
+    "extra_roots",
 ];
 
 pub fn parse_toml(text: &str) -> Result<ParsedProfile, String> {
@@ -100,7 +134,7 @@ impl BuildProfile {
         macro_rules! fill {
             ($($f:ident),+) => { $( if self.$f.is_none() { self.$f = lower.$f.clone(); } )+ };
         }
-        fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands);
+        fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands, extra_roots);
         for (k, v) in &lower.env {
             self.env.entry(k.clone()).or_insert_with(|| v.clone());
         }

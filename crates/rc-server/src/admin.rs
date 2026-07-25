@@ -553,6 +553,23 @@ async fn get_task(
         })).collect::<Vec<_>>(),
         "profile": inputs.as_ref().map(|(_, p, _)| p.clone()),
         "base_commit": inputs.as_ref().map(|(_, _, b)| b.clone()),
+        // Which local directories this task actually synced. Without it an
+        // operator seeing a workspace several times the size of the repository
+        // has no way to find out why.
+        "roots": inputs
+            .as_ref()
+            .and_then(|(m, _, _)| serde_json::from_str::<Option<pb::Manifest>>(m).ok().flatten())
+            .map(|m| json!({
+                "anchor_mount": m.anchor_mount,
+                "entries": m.entries.len(),
+                "roots": m.roots.iter().map(|r| json!({
+                    "mount": r.mount,
+                    "local_path": r.local_path,
+                    "primary": r.primary,
+                    "bytes": r.bytes,
+                    "files": r.files,
+                })).collect::<Vec<_>>(),
+            })),
     })))
 }
 

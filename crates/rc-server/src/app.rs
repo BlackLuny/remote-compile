@@ -41,6 +41,21 @@ pub struct App {
     building: Mutex<HashMap<String, (String, i64)>>,
 }
 
+/// Worker features a task cannot run without.
+///
+/// A manifest spanning several roots places the repository below the workspace
+/// root, and a worker that does not know that would extract the git baseline
+/// one directory too high — producing a tree that fails in a way which looks
+/// like CAS corruption. Better to leave the task queued and say why.
+fn required_capabilities(manifest: Option<&pb::Manifest>) -> Vec<String> {
+    match manifest {
+        Some(m) if !m.anchor_mount.is_empty() || !m.roots.is_empty() => {
+            vec![rc_core::CAP_MULTI_ROOT.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// How long a dispatched image build is assumed to still be running. Past this
 /// the order goes out again, so that a worker which died mid-build does not
 /// strand the environment forever (§8.2).
@@ -108,6 +123,41 @@ impl App {
         true
     }
 
+    /// Refuse work no connected worker could ever take.
+    ///
+    /// Queueing it instead would look identical to ordinary congestion: the
+    /// agent gets a task id, waits, and is never told that the reason is a
+    /// fleet that has not been upgraded.
+    fn check_capabilities_available(&self, manifest: &pb::Manifest) -> Result<()> {
+        let needed = required_capabilities(Some(manifest));
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let online: Vec<_> = self
+            .workers
+            .snapshot()
+            .into_iter()
+            .filter(|w| w.status == "online")
+            .collect();
+        // An empty fleet is ordinary congestion — the machines may be starting,
+        // draining or briefly disconnected — and queueing is the right answer.
+        // What is worth refusing is a fleet that is up and cannot do the work.
+        if online.is_empty() {
+            return Ok(());
+        }
+        for cap in &needed {
+            let anyone = online.iter().any(|w| w.capabilities.contains(cap));
+            if !anyone {
+                return Err(anyhow!(
+                    "no online worker supports `{cap}`, which this task needs; \
+                     upgrade the compile machines, or set extra_roots = [] to build \
+                     without the directories outside the repository"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The build finished (either way) — stop holding the slot.
     pub fn release_image_build(&self, env_id: &str) {
         self.building.lock().remove(env_id);
@@ -147,10 +197,12 @@ impl App {
             return Err(anyhow!("malformed worktree_id: {}", req.worktree_id));
         }
         self.check_image_admissible(&profile.image, &policy)?;
+        self.check_capabilities_available(manifest)?;
 
         // The server computes the fingerprint itself. Trusting the client's
         // value would let one buggy agent poison every other agent's cache.
-        let fingerprint = rc_core::fingerprint::compute_for(&manifest.root_hash, profile)
+        let fingerprint =
+            rc_core::fingerprint::compute_for(&manifest.root_hash, profile, &manifest.anchor_mount)
             .map_err(|e| anyhow!("{e}"))?;
         if !req.fingerprint.is_empty() && req.fingerprint != fingerprint {
             tracing::warn!(
@@ -381,6 +433,35 @@ impl App {
         if candidates.is_empty() {
             return Ok(false);
         }
+        // Loaded before placement, not after: which worker may run this task
+        // depends on what the manifest asks for.
+        let Some((manifest_json, profile_json, _base)) = self.store.get_task_inputs(&task.id)? else {
+            self.fail_task(&task.id, ResultKind::InfraError, "task inputs are missing")?;
+            return Ok(false);
+        };
+        // Deserialisation failure used to become `None`, which erased the
+        // task's capability requirements and let it go to a worker that cannot
+        // run it. An unreadable input is an infrastructure failure, not an
+        // empty one.
+        let manifest: Option<pb::Manifest> = match serde_json::from_str(&manifest_json) {
+            Ok(m) => m,
+            Err(e) => {
+                self.fail_task(&task.id, ResultKind::InfraError, &format!("stored manifest is unreadable: {e}"))?;
+                return Ok(false);
+            }
+        };
+        let profile: Option<pb::ResolvedProfile> = match serde_json::from_str(&profile_json) {
+            Ok(p) => p,
+            Err(e) => {
+                self.fail_task(&task.id, ResultKind::InfraError, &format!("stored profile is unreadable: {e}"))?;
+                return Ok(false);
+            }
+        };
+        if manifest.is_none() {
+            self.fail_task(&task.id, ResultKind::InfraError, "task has no manifest")?;
+            return Ok(false);
+        }
+
         let demand = Demand {
             worktree_id: task.worktree_id.clone(),
             project_id: task.project_id.clone(),
@@ -388,17 +469,11 @@ impl App {
             arch: String::new(),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id)?,
+            required_capabilities: required_capabilities(manifest.as_ref()),
         };
         let Some(choice) = scheduler::pick(&candidates, &demand, policy) else {
             return Ok(false);
         };
-
-        let Some((manifest_json, profile_json, _base)) = self.store.get_task_inputs(&task.id)? else {
-            self.fail_task(&task.id, ResultKind::InfraError, "task inputs are missing")?;
-            return Ok(false);
-        };
-        let manifest: Option<pb::Manifest> = serde_json::from_str(&manifest_json).unwrap_or(None);
-        let profile: Option<pb::ResolvedProfile> = serde_json::from_str(&profile_json).unwrap_or(None);
 
         let assignment = pb::TaskAssignment {
             task_id: task.id.clone(),
@@ -456,6 +531,7 @@ impl App {
                 cached_projects: w.stats.cached_projects.clone(),
                 cached_images: w.stats.cached_images.clone(),
                 busy_worktrees: self.store.busy_worktrees_on_worker(&w.id)?,
+                capabilities: w.capabilities.iter().cloned().collect(),
             });
         }
         Ok(out)
@@ -485,6 +561,14 @@ impl App {
             arch: String::new(),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id).unwrap_or_default(),
+            required_capabilities: self
+                .store
+                .get_task_inputs(&task.id)
+                .ok()
+                .flatten()
+                .and_then(|(manifest_json, _, _)| serde_json::from_str(&manifest_json).ok())
+                .map(|m: Option<pb::Manifest>| required_capabilities(m.as_ref()))
+                .unwrap_or_default(),
         };
         scheduler::explain(&candidates, &demand, &policy)
             .into_iter()
@@ -845,6 +929,42 @@ mod tests {
             "reg/evil@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
         let err = app.submit(&req).unwrap_err().to_string();
         assert!(err.contains("not approved"), "{err}");
+    }
+
+    #[test]
+    fn multi_root_is_only_required_when_the_layout_is_actually_multi_root() {
+        // Every ordinary project must stay runnable on every worker.
+        assert!(required_capabilities(None).is_empty());
+        assert!(required_capabilities(Some(&pb::Manifest::default())).is_empty());
+
+        let nested = pb::Manifest {
+            anchor_mount: "app".into(),
+            ..Default::default()
+        };
+        assert_eq!(required_capabilities(Some(&nested)), vec!["multi-root"]);
+    }
+
+    #[test]
+    fn an_empty_fleet_queues_but_an_incapable_one_refuses() {
+        // "No workers at all" is congestion and resolves itself. "Workers that
+        // cannot do this" never does, and queueing there looks identical to the
+        // agent while never completing.
+        let app = test_app();
+        let multi = pb::Manifest {
+            anchor_mount: "app".into(),
+            ..Default::default()
+        };
+        assert!(
+            app.check_capabilities_available(&multi).is_ok(),
+            "an empty fleet must not turn into a hard failure"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        app.workers.connect("w-old", "x86_64", "0.1.0", 4, tx);
+        let err = app.check_capabilities_available(&multi).unwrap_err();
+        assert!(err.to_string().contains("multi-root"), "{err}");
+        // A plain task is unaffected.
+        assert!(app.check_capabilities_available(&pb::Manifest::default()).is_ok());
     }
 
     #[test]

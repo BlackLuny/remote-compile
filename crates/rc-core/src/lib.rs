@@ -8,11 +8,13 @@ pub mod adapter;
 pub mod ansi;
 pub mod cas;
 pub mod diag;
+pub mod discover;
 pub mod fingerprint;
 pub mod ids;
 pub mod manifest;
 pub mod model;
 pub mod profile;
+pub mod roots;
 pub mod transport;
 
 pub mod pb {
@@ -25,6 +27,20 @@ pub use model::{ResultKind, TaskState, TaskType};
 
 /// Version of the agent<->server<->worker contract. Bumped on breaking changes.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Worker capability: understands `Manifest.anchor_mount` and can therefore
+/// rebuild a workspace holding more than one root.
+///
+/// A worker without it would extract the git baseline at the top of the
+/// workspace instead of under the primary root's mount. Every baseline file
+/// would then be a stray at the wrong path, get deleted, and be re-fetched from
+/// a CAS that never held it — because baseline content is deliberately not
+/// uploaded. The task would fail in a way that looks like CAS corruption, so
+/// such a worker is excluded from multi-root tasks instead.
+pub const CAP_MULTI_ROOT: &str = "multi-root";
+
+/// Capabilities this build advertises.
+pub const CAPABILITIES: &[&str] = &[CAP_MULTI_ROOT];
 
 /// Directories never synced, regardless of adapter.
 pub const ALWAYS_EXCLUDE: &[&str] = &[".git", "node_modules", ".direnv", ".venv"];

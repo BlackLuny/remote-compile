@@ -66,13 +66,39 @@ impl From<anyhow::Error> for ScanError {
 
 pub const MAX_SCAN_ATTEMPTS: u32 = 3;
 
+/// How to decide what a directory contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enumeration {
+    /// git when the directory is in a repository, otherwise an ignore-walk.
+    /// This is what a repository root wants.
+    Auto,
+    /// Force an ignore-walk and disregard ancestor ignore rules.
+    ///
+    /// For a directory that lies inside a repository which deliberately does
+    /// not track it — a `.gitignore`d local crate that cargo nonetheless
+    /// builds. Asking git about it returns nothing, and an ordinary ignore-walk
+    /// re-applies the very `.gitignore` that hid it, so both would report an
+    /// empty directory and the build would silently lose the code.
+    Standalone,
+}
+
 /// Enumerate, hash and package a worktree.
 pub fn scan(root: &Path, excludes: &[&str], index: &mut StatIndex) -> Result<Scan, ScanError> {
+    scan_with(root, excludes, index, Enumeration::Auto)
+}
+
+pub fn scan_with(
+    root: &Path,
+    excludes: &[&str],
+    index: &mut StatIndex,
+    mode: Enumeration,
+) -> Result<Scan, ScanError> {
     let root = root
         .canonicalize()
         .map_err(|e| ScanError::Other(anyhow!("canonicalize {}: {e}", root.display())))?;
-    let is_git = git_root(&root).is_some();
+    let is_git = mode == Enumeration::Auto && git_root(&root).is_some();
     let repo_url = if is_git { remote_url(&root) } else { None };
+    let standalone = mode == Enumeration::Standalone;
 
     let mut attempts = 0;
     let mut warnings = Vec::new();
@@ -81,12 +107,14 @@ pub fn scan(root: &Path, excludes: &[&str], index: &mut StatIndex) -> Result<Sca
         let listing = if is_git {
             git_listing(&root)?
         } else {
-            warnings.push(
-                "not a git repository: falling back to .gitignore-based walking, which may miss \
-                 ignored-but-required files (§4.3)"
-                    .to_string(),
-            );
-            ignore_listing(&root, excludes)?
+            if !standalone {
+                warnings.push(
+                    "not a git repository: falling back to .gitignore-based walking, which may miss \
+                     ignored-but-required files (§4.3)"
+                        .to_string(),
+                );
+            }
+            ignore_listing(&root, excludes, standalone)?
         };
 
         let before = stat_all(&root, &listing.paths, excludes);
@@ -98,7 +126,7 @@ pub fn scan(root: &Path, excludes: &[&str], index: &mut StatIndex) -> Result<Sca
         let after_listing = if is_git {
             git_listing(&root)?
         } else {
-            ignore_listing(&root, excludes)?
+            ignore_listing(&root, excludes, standalone)?
         };
         let after = stat_all(&root, &after_listing.paths, excludes);
 
@@ -205,7 +233,7 @@ fn git_listing(root: &Path) -> Result<Listing, ScanError> {
 }
 
 /// Degraded enumeration for non-git directories (§4.3 fallback).
-fn ignore_listing(root: &Path, excludes: &[&str]) -> Result<Listing, ScanError> {
+fn ignore_listing(root: &Path, excludes: &[&str], standalone: bool) -> Result<Listing, ScanError> {
     let mut paths = Vec::new();
     let mut walker = ignore::WalkBuilder::new(root);
     walker
@@ -213,6 +241,9 @@ fn ignore_listing(root: &Path, excludes: &[&str]) -> Result<Listing, ScanError> 
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        // Ancestor rules are what hid a standalone root in the first place;
+        // re-applying them here would enumerate nothing.
+        .parents(!standalone)
         .follow_links(false);
     for entry in walker.build().flatten() {
         let Ok(rel) = entry.path().strip_prefix(root) else {
@@ -310,6 +341,30 @@ fn hash_entries(
 
     index.record_all(&to_record).map_err(ScanError::Other)?;
     Ok((entries, hashed, reused))
+}
+
+/// Enumerate a root the same way `scan` would, without hashing anything.
+/// Used to re-check the whole root set after a multi-root sweep.
+pub fn enumerate(root: &Path, excludes: &[&str], mode: Enumeration) -> Result<Vec<String>, ScanError> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| ScanError::Other(anyhow!("canonicalize {}: {e}", root.display())))?;
+    let listing = if mode == Enumeration::Auto && git_root(&root).is_some() {
+        git_listing(&root)?
+    } else {
+        ignore_listing(&root, excludes, mode == Enumeration::Standalone)?
+    };
+    Ok(listing
+        .paths
+        .into_iter()
+        .filter(|p| !is_excluded(p, excludes))
+        .collect())
+}
+
+/// Stat a set of paths relative to `base`. Used across roots, where the base
+/// is the anchor and the paths are anchor-relative.
+pub fn stat_entries(base: &Path, paths: &[String]) -> HashMap<String, (u64, i64)> {
+    stat_all(base, paths, &[])
 }
 
 /// Stat everything that will actually end up in the manifest. Excluded paths

@@ -8,8 +8,26 @@
 use crate::pb::{EntryType, FileEntry, Manifest};
 use std::collections::BTreeMap;
 
-/// Build a canonical manifest from an unordered entry list.
-pub fn build(mut entries: Vec<FileEntry>, base_commit: &str, baseline: bool) -> Manifest {
+/// Build a canonical single-root manifest from an unordered entry list.
+pub fn build(entries: Vec<FileEntry>, base_commit: &str, baseline: bool) -> Manifest {
+    build_multi(entries, base_commit, baseline, "", Vec::new())
+}
+
+/// Build a manifest that may span several local directories (§multi-root).
+///
+/// Entry paths are relative to the *anchor* — the deepest common ancestor of
+/// every root — so one flat entry list describes the whole tree and every
+/// existing consumer keeps working unchanged. With a single root the anchor is
+/// that root, `anchor_mount` is empty, and the paths are byte-identical to what
+/// this has always produced; `root_hash` therefore does not move and cached
+/// results stay valid.
+pub fn build_multi(
+    mut entries: Vec<FileEntry>,
+    base_commit: &str,
+    baseline: bool,
+    anchor_mount: &str,
+    roots: Vec<crate::pb::RootInfo>,
+) -> Manifest {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     entries.dedup_by(|a, b| a.path == b.path);
     let root_hash = root_hash(&entries);
@@ -18,6 +36,8 @@ pub fn build(mut entries: Vec<FileEntry>, base_commit: &str, baseline: bool) -> 
         root_hash,
         base_commit: base_commit.to_string(),
         baseline,
+        anchor_mount: anchor_mount.to_string(),
+        roots,
     }
 }
 
@@ -109,6 +129,12 @@ pub fn is_safe_relative_path(path: &str) -> bool {
         .any(|c| c == ".." || c == "." || c.is_empty())
 }
 
+/// Whether an anchor-relative path lies inside `mount`. An empty mount is the
+/// anchor itself and contains everything.
+pub fn under_mount(path: &str, mount: &str) -> bool {
+    mount.is_empty() || path.strip_prefix(mount).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Validate an incoming manifest before it is allowed to touch a worker.
 pub fn validate(m: &Manifest) -> Result<(), String> {
     for e in &m.entries {
@@ -139,6 +165,57 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
     let conflicts = find_case_conflicts(&m.entries);
     if let Some((a, b)) = conflicts.first() {
         return Err(format!("case-conflicting paths: {a} vs {b}"));
+    }
+    // Mounts become directory prefixes on the worker, so they are held to the
+    // same standard as entry paths. Empty means "the anchor itself", which is
+    // what a single-root sync always uses.
+    if !m.anchor_mount.is_empty() && !is_safe_relative_path(&m.anchor_mount) {
+        return Err(format!("unsafe anchor mount: {}", m.anchor_mount));
+    }
+    for root in &m.roots {
+        if !root.mount.is_empty() && !is_safe_relative_path(&root.mount) {
+            return Err(format!("unsafe root mount: {}", root.mount));
+        }
+    }
+    if !m.roots.is_empty() {
+        let primaries = m.roots.iter().filter(|r| r.primary).count();
+        if primaries != 1 {
+            return Err(format!("manifest declares {primaries} primary roots, expected exactly 1"));
+        }
+        let primary = m.roots.iter().find(|r| r.primary).expect("checked above");
+        if primary.mount != m.anchor_mount {
+            return Err(format!(
+                "anchor mount `{}` disagrees with the primary root's mount `{}`",
+                m.anchor_mount, primary.mount
+            ));
+        }
+        // The L1 baseline is extracted under the primary's mount, so entries
+        // belonging to any other root must not claim to come from it — the
+        // worker would skip fetching their content from the CAS and then find
+        // nothing on disk.
+        //
+        // Ownership is by *longest* matching mount, not by the anchor: when the
+        // primary is itself the anchor its mount is empty and matches
+        // everything, so a nested root's entries would otherwise pass.
+        for e in &m.entries {
+            if !e.in_baseline {
+                continue;
+            }
+            let owner = m
+                .roots
+                .iter()
+                .filter(|r| under_mount(&e.path, &r.mount))
+                .max_by_key(|r| r.mount.len());
+            match owner {
+                Some(r) if r.primary => {}
+                _ => {
+                    return Err(format!(
+                        "entry {} does not belong to the primary root but claims the git baseline",
+                        e.path
+                    ))
+                }
+            }
+        }
     }
     let expect = root_hash(&m.entries);
     if expect != m.root_hash {
@@ -218,6 +295,89 @@ mod tests {
         // baseline unusable => every entry must travel through the CAS
         let m = build(entries, "", false);
         assert_eq!(blobs_to_reconcile(&m).len(), 2);
+    }
+
+    fn root_info(mount: &str, primary: bool) -> crate::pb::RootInfo {
+        crate::pb::RootInfo {
+            mount: mount.into(),
+            local_path: format!("/local/{mount}"),
+            primary,
+            bytes: 0,
+            files: 0,
+        }
+    }
+
+    #[test]
+    fn an_extra_roots_entry_cannot_claim_the_primarys_git_baseline() {
+        // The worker extracts the baseline only under the primary's mount, so
+        // a baseline claim elsewhere means content that is fetched from nowhere.
+        let mut theirs = file("lib/src/a.rs", &"a".repeat(64));
+        theirs.in_baseline = true;
+        let m = build_multi(
+            vec![theirs],
+            "abc",
+            true,
+            "app",
+            vec![root_info("app", true), root_info("lib", false)],
+        );
+        let err = validate(&m).unwrap_err();
+        assert!(err.contains("claims the git baseline"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_root_cannot_claim_the_baseline_even_when_the_primary_is_the_anchor() {
+        // The primary's mount is empty here, so a naive prefix test would say
+        // every path belongs to it. Ownership has to go to the longest match.
+        let mut theirs = file("vendor/foo/src/a.rs", &"a".repeat(64));
+        theirs.in_baseline = true;
+        let m = build_multi(
+            vec![theirs],
+            "abc",
+            true,
+            "",
+            vec![root_info("", true), root_info("vendor/foo", false)],
+        );
+        assert!(validate(&m).is_err());
+    }
+
+    #[test]
+    fn the_primarys_own_entries_may_ride_the_baseline() {
+        let mut mine = file("app/src/a.rs", &"a".repeat(64));
+        mine.in_baseline = true;
+        let m = build_multi(
+            vec![mine],
+            "abc",
+            true,
+            "app",
+            vec![root_info("app", true), root_info("lib", false)],
+        );
+        validate(&m).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_must_declare_exactly_one_primary_root() {
+        let m = build_multi(
+            vec![file("app/a.rs", &"a".repeat(64))],
+            "",
+            false,
+            "app",
+            vec![root_info("app", true), root_info("lib", true)],
+        );
+        assert!(validate(&m).unwrap_err().contains("primary roots"));
+    }
+
+    #[test]
+    fn an_unsafe_mount_is_refused() {
+        for evil in ["../etc", "/etc", "a/../b"] {
+            let m = build_multi(
+                vec![file("a.rs", &"a".repeat(64))],
+                "",
+                false,
+                evil,
+                vec![root_info(evil, true)],
+            );
+            assert!(validate(&m).is_err(), "`{evil}` must not pass as a mount");
+        }
     }
 
     #[test]

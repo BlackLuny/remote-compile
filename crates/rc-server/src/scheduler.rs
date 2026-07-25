@@ -22,6 +22,8 @@ pub struct Candidate {
     /// Worktrees currently executing here — a second task for the same
     /// worktree would just block on cargo's file lock (§6.2).
     pub busy_worktrees: Vec<String>,
+    /// Optional features the worker reports on every heartbeat.
+    pub capabilities: Vec<String>,
 }
 
 /// What a task needs.
@@ -36,6 +38,8 @@ pub struct Demand {
     pub est_disk_gb: u64,
     /// Workers that already failed this task — a retry must land elsewhere.
     pub excluded: Vec<String>,
+    /// Capabilities without which this task cannot run correctly.
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +58,9 @@ pub enum Reject {
     InsufficientDisk,
     AlreadyTried,
     WorktreeBusy,
+    /// The worker predates something this task needs. Silently running it
+    /// anyway would corrupt the workspace rather than fail cleanly.
+    MissingCapability(String),
 }
 
 pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
@@ -65,6 +72,13 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
     }
     if d.excluded.iter().any(|w| w == &c.worker_id) {
         return Err(Reject::AlreadyTried);
+    }
+    if let Some(missing) = d
+        .required_capabilities
+        .iter()
+        .find(|need| !c.capabilities.iter().any(|has| has == *need))
+    {
+        return Err(Reject::MissingCapability(missing.clone()));
     }
     if c.free_slots == 0 {
         return Err(Reject::NoFreeSlot);
@@ -157,6 +171,7 @@ mod tests {
             arch: "x86_64".into(),
             est_disk_gb: 20,
             excluded: vec![],
+            required_capabilities: vec![],
         }
     }
 
@@ -193,6 +208,40 @@ mod tests {
         let idle = worker("b");
         assert_eq!(pick(&[busy.clone(), idle], &demand(), &p).unwrap().worker_id, "b");
         assert_eq!(evaluate(&busy, &demand(), &p), Err(Reject::WorktreeBusy));
+    }
+
+    #[test]
+    fn a_worker_that_cannot_do_multi_root_is_never_given_a_multi_root_task() {
+        // It would not fail cleanly: it would extract the git baseline one
+        // directory too high and produce a tree that looks like CAS corruption.
+        let p = Policy::default();
+        let old = worker("a");
+        let mut new = worker("b");
+        new.capabilities = vec!["multi-root".into()];
+
+        let mut d = demand();
+        d.required_capabilities = vec!["multi-root".into()];
+        assert_eq!(
+            evaluate(&old, &d, &p),
+            Err(Reject::MissingCapability("multi-root".into()))
+        );
+        assert_eq!(pick(&[old.clone(), new], &d, &p).unwrap().worker_id, "b");
+
+        // Ordinary tasks still go anywhere.
+        assert!(evaluate(&old, &demand(), &p).is_ok());
+    }
+
+    #[test]
+    fn a_task_needing_a_capability_nobody_has_stays_queued_with_a_reason() {
+        let p = Policy::default();
+        let mut d = demand();
+        d.required_capabilities = vec!["multi-root".into()];
+        let only = worker("a");
+        assert!(pick(std::slice::from_ref(&only), &d, &p).is_none());
+        assert_eq!(
+            explain(&[only], &d, &p),
+            vec![("a".to_string(), Reject::MissingCapability("multi-root".into()))]
+        );
     }
 
     #[test]

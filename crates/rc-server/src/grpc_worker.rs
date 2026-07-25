@@ -231,7 +231,7 @@ async fn handle_event(app: &Arc<App>, worker_id: &str, event: WorkerEvent) -> an
         worker_event::Body::Heartbeat(hb) => {
             let stats = hb.stats.clone().unwrap_or_default();
             app.workers
-                .heartbeat(worker_id, stats.clone(), &hb.status, &hb.active_task_ids);
+                .heartbeat(worker_id, stats.clone(), &hb.status, &hb.active_task_ids, &hb.capabilities);
             // Only a cheap timestamp reaches SQLite; the stats stay in memory
             // (§15.1, risk #28).
             app.store.touch_worker(worker_id, &hb.status).ok();

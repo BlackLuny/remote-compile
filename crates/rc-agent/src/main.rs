@@ -6,9 +6,11 @@
 
 mod client;
 mod config;
+mod consent;
 mod engine;
 mod index;
 mod mcp;
+mod multiroot;
 mod scanner;
 
 use anyhow::Result;
@@ -111,7 +113,10 @@ fn main() -> Result<()> {
                 no_cache,
             }))?;
             println!("{}", outcome.text);
-            if !rc_core::TaskState::parse_or_default(&outcome.status).is_terminal() {
+            // Some outcomes never became a task at all — nothing was submitted,
+            // so there is nothing to poll and no task id to offer.
+            let no_task = outcome.task_id.is_empty();
+            if !no_task && !rc_core::TaskState::parse_or_default(&outcome.status).is_terminal() {
                 eprintln!(
                     "still running (status={}); poll with: rc-agent check --wait-secs 60, or get_result(task_id=\"{}\")",
                     outcome.status, outcome.task_id

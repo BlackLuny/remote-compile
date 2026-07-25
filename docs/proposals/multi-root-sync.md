@@ -1,12 +1,11 @@
-# 提案：多根同步（multi-root sync）v2
+# 多根同步（multi-root sync）v3
 
-状态：**提案，未实现**。v1 经 gpt-5.6-sol(high) 对抗评审判定 REDESIGN，本文是重写版。
-评审记录见 §15。
+状态：**已实现**。v1 经 gpt-5.6-sol(high) 对抗评审判定 REDESIGN → v2 重写 →
+v2 的实现再次经同一评审判定 REDESIGN → 逐条修复后为 v3。两轮评审记录见 §15。
 关联：§3.1、§4.1、§4.2、§4.3、§5.1、§7.1、§7.3、§16。
 
-> **先读 §14**：评审过程中发现了 6 个与本提案无关的**现网既有 bug**，其中一个
-> （symlink 全部损坏）严重程度高于本提案本身。**它们已经全部修复并合入**，
-> 多根同步本身仍未实现。
+> **先读 §14**：第一轮评审顺带查出 6 个与本提案无关的**现网既有 bug**，
+> 其中一个（symlink 全部损坏）严重程度高于本提案本身。均已修复。
 
 ## 1. 问题
 
@@ -64,16 +63,19 @@ anchor 只是坐标系，**不被扫描**；中间目录在 worker 上建成空�
 
 **深度上限**：相对深度 > 8 直接拒绝，不静默生成 `/work/Users/lulin/...`。
 
-**根必须提升到 git top-level**。cargo 报告的 path 指向 *package* 目录，可能是某个仓库的
-子目录（`/shared/crates/foo`，git 根是 `/shared`）。若直接把 package 目录当根：
-`git ls-files` 给出的是 package 相对路径，`git rev-parse HEAD` 给出的是**整个仓库**的 HEAD，
-worker 会把整个仓库 archive 进 `foo` 的挂载点——文件全部落错位置。
-所以每个发现到的路径先 `git_root()` 提升，anchor 在提升后的根之上计算。
-主根本来就这么做（`engine.rs:resolve_root`），保持一致。
+**根必须提升到 cargo workspace 根**。cargo 报告的 path 指向 *package* 目录，
+而 package 可能是更大 workspace 的成员（`/shared/crates/foo`，workspace 根是 `/shared`）。
+只同步 package 目录，容器里就没有它 `workspace = ...` 继承的那份清单，cargo 直接报错。
+所以每个发现到的路径用 `cargo metadata` 的 `workspace_root` 提升，anchor 在提升后的根上计算。
+（v2 写的是"提升到 git top-level"——不对：cargo 要的是 workspace 清单，
+git 边界与它并不一定重合。）
 
-**拒绝符号链接根**。scanner 会 `canonicalize` 根路径，而 cargo 按字面量解析：
-`/ws/lib -> /opt/lib` 时 cargo 要的是 `/work/ws/lib`，canonical 化会挂到 `/work/opt/lib`，
-不变量被打破。构造 alias 链接的机器不值当，直接拒绝并说明原因。
+**拒绝符号链接根**。cargo 按字面量解析 `../lib`，我们扫描和挂载的是 canonical 路径。
+两者通常只差一个共同前缀（macOS 上 `/var -> /private/var` 会让所有根一起平移，没有影响），
+真正破坏不变量的是**根与根之间**的符号链接：`/ws/lib -> /opt/lib` 会挂到 `/work/opt/lib`，
+而 cargo 仍然找 `../lib`。所以比较的是**偏移量**而非路径本身——
+`relative_path(dir, lexical(candidate))` 与 `relative_path(canonical_dir, canonical)`
+不一致才拒绝。
 
 ## 4. 一个扁平 manifest（v1 的多 manifest 方案已废弃）
 
@@ -125,9 +127,12 @@ message RootInfo {
 `FingerprintInput`（`fingerprint.rs:13`）目前只有 manifest_root_hash / image_digest /
 toolchain / profile_canonical，没有任何执行器版本维度。
 
-修法：加 `executor_abi: &'static str`，值随布局/执行语义的每次变更递增（`"l2"`）。
-同时给本地 `results.sqlite` 加版本前缀，服务端旧结果按 abi 失效。
-目标卷也换命名空间，避免旧 `path` 语义留下的 `target/` 被复用。
+修法：加 `EXECUTOR_ABI`（当前 `"abi2"`），随布局/执行语义的每次变更递增。
+
+**第二轮评审补充**：光有全局 ABI 还不够，因为它对同一版本内的所有任务都是同一个值。
+`anchor_mount` 必须**逐任务**进指纹——一个本就包含 `app/` 与 `lib/` 的单根仓库，
+和把两者并列挂载的多根布局，条目完全相同（`root_hash` 相同），
+但一个在 `/work` 构建、另一个在 `/work/app`。两者都已加入 `FingerprintInput`。
 
 ## 6. 发现机制
 
@@ -364,6 +369,51 @@ v2：
 
 ## 15. 评审记录
 
+### 第二轮：对 v2 实现的评审
+
+同一评审者对写完的代码再次判定 **REDESIGN**（3 critical、10 major）。已全部处理：
+
+**critical**
+
+1. **基线展开跟随符号链接逃出工作区。** 展开发生在按 manifest 清理**之前**，
+   而多根下 `<workspace>/<anchor_mount>` 是构建可以替换的目录——
+   `git archive | tar -C` 会顺着链接把整个基线写到 worker 的 CAS 里。
+   这是本次改动**新引入**的（单根时目标是工作区根本身，构建替换不了）。
+   修复：`workspace::ensure_real_dir` 在展开前把每一层挂载点坐实为真目录。
+2. **布局没有进指纹。** 一个本来就包含 `app/` 和 `lib/` 的单根仓库，
+   与把两者并列挂载的多根布局，条目列表完全相同 → `root_hash` 相同 → 指纹相同，
+   但前者在 `/work` 构建、后者在 `/work/app`。修复：`anchor_mount` 进指纹输入。
+3. **仓库内被 ignore 的根未经同意就上传。** 判据原本是"路径是否在仓库外"，
+   而一个被 `.gitignore` 的 crate 在仓库内、却不在仓库的枚举里——它照样会被
+   单独扫描并上传。修复：这类根在上传前单独走一次同意闸门。
+
+**major（择要）**
+
+4. 发现到的是 **package** 目录而非 **workspace** 目录，同步它会丢掉它继承的
+   workspace 清单 → 改为提升到 `cargo metadata` 报告的 `workspace_root`。
+5. 符号链接根未拒绝：`/ws/lib -> /opt/lib` 会挂到 `/work/opt/lib`，而 cargo 仍找
+   `../lib`。修复：比较**词法偏移**与**规范偏移**（而非路径本身，否则 macOS 的
+   `/var -> /private/var` 会误报），不一致即拒绝。
+6. 扁平合并会静默丢弃路径冲突（`build` 按 path 去重）→ 改为报错；跨根大小写冲突
+   原本只有服务端才发现，那时已经传完了 → 改为在 agent 合并后立即检测。
+7. 嵌套根"已覆盖"的判据是"该子树下有任意一个文件被枚举到"，一个 README 就能让整个
+   crate 被跳过 → 改为以 `Cargo.toml` 是否被外层枚举为准。
+8. **cargo 会把 workspace 自己的成员也报成 path 依赖**，于是普通单仓库项目也会带上
+   十几个嵌套根、被判成多根、进而要求 `multi-root` worker 能力——文件布局根本没变。
+   修复：`single` 以**实际扫描过**的根数为准，而非布局考虑过的根数。
+9. 跨根撕裂防护只重新 stat 已知路径，扫描期间**新建**的文件仍然看不见 →
+   改为扫描结束后重新枚举所有根。
+10. `extra_roots = []` 文档写的是"不同步仓库外目录"，实现却是永久阻塞（自带的测试还
+    把这个矛盾固化了）→ 改为放行且不带任何外部根。
+11. 无可用 worker 时任务无限排队，agent 只看到"仍在执行" → 改为准入即拒绝并说明原因；
+    但**空集群不算**（机器可能正在启动），只有"集群在线却都不支持"才拒。
+12. 存量输入反序列化失败会退化成"无能力要求"，任务可能派给老 worker →
+    改为直接判 infra_error。
+13. `under_mount(_, "")` 恒真，主根就是 anchor 时无法判断 `in_baseline` 归属 →
+    改为按**最长 mount** 归属。
+
+### 第一轮：对 v1 设计的评审
+
 gpt-5.6-sol（reasoning effort: high）对 v1 的裁决为 **REDESIGN**，
 4 项 critical、9 项 major。本文采纳的主要意见：
 
@@ -385,15 +435,22 @@ anchor 坐标系本身的相对路径不变量成立。
 该弱点是既有设计的自觉取舍（§4.4），多根只是扩大了影响面，
 建议作为独立议题处理，不绑进本提案。
 
-## 16. 工作量
+## 16. 实现落点
 
-前置条件（§14 的既有 bug、§5 的 ABI 版本、§8 的挂载修复）**已完成**。
-剩下的本体集中在 rc-agent（发现、anchor、多根扫描、上传定位）与 rc-worker（多根重建）；
-rc-server 只有校验与能力刷新两处——迁移机制已经就位。
-proto 只加字段；单根请求的线上形态不变。
+| 位置 | 内容 |
+|---|---|
+| `rc-core/src/roots.rs` | anchor 计算、mount、嵌套判定、相对路径 |
+| `rc-core/src/discover.rs` | cargo metadata + `[patch]`/`[replace]` + config patch，失败关闭 |
+| `rc-core/src/manifest.rs` | `build_multi`、mount 校验、baseline 归属（最长 mount）|
+| `rc-core/src/fingerprint.rs` | `EXECUTOR_ABI` + `anchor_mount` 进指纹 |
+| `rc-agent/src/multiroot.rs` | 多根扫描合并、覆盖判定、冲突检测、跨根撕裂防护 |
+| `rc-agent/src/consent.rs` | 上传前阻塞与可粘贴的配置片段 |
+| `rc-agent/src/scanner.rs` | `Enumeration::Standalone`、`enumerate` |
+| `rc-server/src/{app,scheduler,workers}.rs` | 能力协商、准入拒绝、输入失败关闭 |
+| `rc-worker/src/runner.rs` | `anchor_mount` 下的基线展开与 workdir |
 
-## 17. 待用户决策
+## 17. 已决策
 
-1. §12 默认策略：默认需确认（**已选定**）；
-2. §14 的既有 bug 先单独修掉（**已选定，已完成**）；
-3. `exclude` 字段并入还是独立——已确认独立于本提案，尚未实现。
+1. §12 默认策略：**默认需确认**；
+2. §14 的既有 bug：**先单独修掉，已完成**；
+3. `exclude` 字段：独立于本提案，**尚未实现**。

@@ -137,6 +137,10 @@ pub fn heartbeat_event(stats: WorkerStats, status: &str, active: Vec<String>) ->
             stats: Some(stats),
             active_task_ids: active,
             status: status.to_string(),
+            // On every heartbeat, not just at enrollment: enrollment happens
+            // once, so a worker upgraded in place would otherwise be judged
+            // forever by what it could do the day it joined.
+            capabilities: rc_core::CAPABILITIES.iter().map(|c| c.to_string()).collect(),
         })),
     }
 }

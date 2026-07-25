@@ -217,7 +217,73 @@ echo "$STORAGE" | grep -q '"pinned":0'
 check $? "a clean worktree needs no CAS blobs at all (pure L1 baseline)" "$STORAGE"
 
 echo
+[ "$FAIL" -eq 0 ]
+
+echo "== 8. multi-root sync =="
+# A cargo `path` dependency pointing outside the repository. The literal
+# `../sibling` in Cargo.toml has to keep meaning the same thing on the worker,
+# which is what the anchor layout is for.
+SIBLING="$RUN/sibling"
+mkdir -p "$SIBLING/src"
+cat > "$SIBLING/Cargo.toml" <<'EOF'
+[package]
+name = "sibling"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo 'pub fn shared() {}' > "$SIBLING/src/lib.rs"
+git -C "$SIBLING" init -q -b main
+git -C "$SIBLING" config user.email t@example.com
+git -C "$SIBLING" config user.name t
+git -C "$SIBLING" add -A
+git -C "$SIBLING" commit -qm init
+
+cat >> "$PROJECT/Cargo.toml" <<'EOF'
+
+[dependencies]
+sibling = { path = "../sibling" }
+EOF
+
+# Nothing may leave the machine before the repository says it may.
+CHECK_BLOCK=$(mcp "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$PROJECT\",\"wait_secs\":1}}}")
+echo "$CHECK_BLOCK" | grep -q '需要确认'
+check $? "an unapproved external root blocks before any upload" "$CHECK_BLOCK"
+echo "$CHECK_BLOCK" | grep -q 'extra_roots'
+check $? "the block names the exact config to add" "$CHECK_BLOCK"
+
+BLOBS_BEFORE_MR=$(find "$RUN/server/cas/blobs" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+# Approve it the way the message says to.
+echo 'extra_roots = ["../sibling"]' >> "$PROJECT/.remote-compile.toml"
+CHECK_MR=$(mcp "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$PROJECT\",\"wait_secs\":1}}}")
+echo "$CHECK_MR" | grep -q 'task_id=t-'
+check $? "an approved external root is admitted" "$CHECK_MR"
+
+BLOBS_AFTER_MR=$(find "$RUN/server/cas/blobs" -type f 2>/dev/null | wc -l | tr -d ' ')
+[ "${BLOBS_AFTER_MR:-0}" -gt "${BLOBS_BEFORE_MR:-0}" ]
+check $? "the sibling's content is uploaded (L2 only, $BLOBS_BEFORE_MR -> $BLOBS_AFTER_MR)" ""
+
+# The manifest must place both roots under a common anchor, with the repository
+# itself one level down so `../sibling` resolves.
+MR_TASK=$(curl -s -b "$RUN/cookies" "http://127.0.0.1:$HTTP/api/tasks" | grep -o '"id":"t-[^"]*"' | head -1 | cut -d'"' -f4)
+MR_DETAIL=$(curl -s -b "$RUN/cookies" "http://127.0.0.1:$HTTP/api/tasks/$MR_TASK")
+echo "$MR_DETAIL" | grep -q '"anchor_mount":"demo"'
+check $? "the repository is anchored one level down (anchor_mount=demo)" "$MR_DETAIL"
+echo "$MR_DETAIL" | grep -q '"mount":"sibling"'
+check $? "the sibling is mounted beside it, so ../sibling still resolves" "$MR_DETAIL"
+echo "$MR_DETAIL" | grep -q '"mount":"demo","primary":true'
+check $? "the repository is recorded as the primary root" "$MR_DETAIL"
+
+# Editing the sibling must invalidate the fingerprint: a cached result computed
+# against the old dependency source would be wrong.
+FP_BEFORE=$(echo "$MR_DETAIL" | grep -o '"fingerprint":"[^"]*"' | head -1 | cut -d'"' -f4)
+echo 'pub fn shared() { let _x = 1; }' > "$SIBLING/src/lib.rs"
+mcp "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$PROJECT\",\"wait_secs\":1}}}" >/dev/null
+MR_TASK2=$(curl -s -b "$RUN/cookies" "http://127.0.0.1:$HTTP/api/tasks" | grep -o '"id":"t-[^"]*"' | head -1 | cut -d'"' -f4)
+FP_AFTER=$(curl -s -b "$RUN/cookies" "http://127.0.0.1:$HTTP/api/tasks/$MR_TASK2" | grep -o '"fingerprint":"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$FP_BEFORE" ] && [ "$FP_BEFORE" != "$FP_AFTER" ]
+check $? "editing the external root changes the fingerprint" "$FP_BEFORE vs $FP_AFTER"
+
 echo "=================================="
 echo " passed: $PASS   failed: $FAIL"
 echo "=================================="
-[ "$FAIL" -eq 0 ]

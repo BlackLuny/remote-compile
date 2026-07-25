@@ -22,6 +22,10 @@ pub struct WorkerConn {
     pub stats: WorkerStats,
     pub last_hb_ms: i64,
     pub connected_at: i64,
+    /// Optional features this worker reports, refreshed on every heartbeat.
+    /// Enrollment happens once, so a worker upgraded in place would never
+    /// update a capability list recorded there.
+    pub capabilities: HashSet<String>,
     tx: CmdSender,
     /// Tasks the scheduler has handed to this worker but which have not yet
     /// reported a terminal state.
@@ -68,6 +72,9 @@ impl WorkerRegistry {
                 stats: WorkerStats::default(),
                 last_hb_ms: now,
                 connected_at: now,
+                // Empty until a heartbeat says otherwise, so a worker whose
+                // capabilities are not yet known is treated as having none.
+                capabilities: HashSet::new(),
                 tx,
                 assigned: HashSet::new(),
             },
@@ -81,12 +88,20 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
-    pub fn heartbeat(&self, id: &str, stats: WorkerStats, status: &str, active: &[String]) {
+    pub fn heartbeat(
+        &self,
+        id: &str,
+        stats: WorkerStats,
+        status: &str,
+        active: &[String],
+        capabilities: &[String],
+    ) {
         let mut g = self.inner.lock();
         if let Some(w) = g.get_mut(id) {
             w.stats = stats;
             w.status = status.to_string();
             w.last_hb_ms = rc_core::now_ms();
+            w.capabilities = capabilities.iter().cloned().collect();
             // Reconcile against what the worker says it is actually running:
             // a task the worker has forgotten must not hold a slot forever.
             let active: HashSet<String> = active.iter().cloned().collect();
@@ -203,10 +218,24 @@ mod tests {
         let (r, _rx) = registry_with("w1", 4);
         r.note_assigned("w1", "t1");
         r.note_assigned("w1", "ghost");
-        r.heartbeat("w1", WorkerStats::default(), "online", &["t1".into()]);
+        r.heartbeat("w1", WorkerStats::default(), "online", &["t1".into()], &[]);
         let w = r.get("w1").unwrap();
         assert!(w.assigned.contains("t1"));
         assert!(!w.assigned.contains("ghost"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_arrive_with_the_heartbeat_and_are_replaced_each_time() {
+        // Enrollment happens once, so a worker upgraded in place must be able
+        // to announce what it can do now — and a downgrade must be seen too.
+        let (r, _rx) = registry_with("w1", 4);
+        assert!(r.get("w1").unwrap().capabilities.is_empty());
+
+        r.heartbeat("w1", WorkerStats::default(), "online", &[], &["multi-root".into()]);
+        assert!(r.get("w1").unwrap().capabilities.contains("multi-root"));
+
+        r.heartbeat("w1", WorkerStats::default(), "online", &[], &[]);
+        assert!(r.get("w1").unwrap().capabilities.is_empty());
     }
 
     #[tokio::test]
