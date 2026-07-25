@@ -25,24 +25,35 @@ pub struct RebuildPlan {
 pub fn plan(root: &Path, manifest: &Manifest) -> Result<RebuildPlan> {
     let mut plan = RebuildPlan::default();
     let mut wanted: HashSet<String> = HashSet::new();
+    // Split out, because "this path is wanted" is not enough to decide it is
+    // *correct*: a directory the manifest implies must be a real directory.
+    let mut wanted_dirs: HashSet<String> = HashSet::new();
+    let mut wanted_entries: HashSet<String> = HashSet::new();
 
     for entry in &manifest.entries {
         if !rc_core::manifest::is_safe_relative_path(&entry.path) {
             return Err(anyhow!("manifest contains an unsafe path: {}", entry.path));
         }
         wanted.insert(entry.path.clone());
+        wanted_entries.insert(entry.path.clone());
         // Directories implied by a file must not be reported as strays.
         let mut cursor = PathBuf::from(&entry.path);
         while let Some(parent) = cursor.parent() {
             if parent.as_os_str().is_empty() {
                 break;
             }
-            wanted.insert(parent.to_string_lossy().replace('\\', "/"));
+            let rel = parent.to_string_lossy().replace('\\', "/");
+            wanted.insert(rel.clone());
+            wanted_dirs.insert(rel);
             cursor = parent.to_path_buf();
         }
 
         if entry.r#type == EntryType::EntrySymlink as i32 {
-            plan.symlinks.push((entry.path.clone(), entry.hash.clone()));
+            // `hash` is blake3 of the target, not the target: using it here
+            // builds a link pointing at a 64-hex string (§4.4).
+            if !symlink_matches_on_disk(root, entry) {
+                plan.symlinks.push((entry.path.clone(), entry.symlink_target.clone()));
+            }
             continue;
         }
         if !matches_on_disk(root, entry)? {
@@ -50,8 +61,20 @@ pub fn plan(root: &Path, manifest: &Manifest) -> Result<RebuildPlan> {
         }
     }
 
-    for existing in walk_relative(root)? {
+    for (existing, kind) in walk_relative(root)? {
         if !wanted.contains(&existing) {
+            plan.delete.push(existing);
+            continue;
+        }
+        // A directory the manifest implies, but which is a symlink on disk, is
+        // how a build escapes the workspace: the next task's `create_dir_all` +
+        // write would follow it and land wherever it points — the worker's CAS,
+        // for instance. `wanted` alone said "keep", so this used to survive.
+        // The same applies to a file entry sitting on top of a real directory,
+        // which no write can replace.
+        let wrong_kind = (wanted_dirs.contains(&existing) && kind != DiskKind::Dir)
+            || (wanted_entries.contains(&existing) && kind == DiskKind::Dir);
+        if wrong_kind {
             plan.delete.push(existing);
         }
     }
@@ -59,6 +82,18 @@ pub fn plan(root: &Path, manifest: &Manifest) -> Result<RebuildPlan> {
     // Deepest paths first so directories empty out before they are removed.
     plan.delete.reverse();
     Ok(plan)
+}
+
+/// A symlink is correct when it *is* a symlink and points where the manifest
+/// says. Anything else (missing, a real file, a stale target) needs rewriting.
+fn symlink_matches_on_disk(root: &Path, entry: &FileEntry) -> bool {
+    let path = root.join(&entry.path);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_symlink() => std::fs::read_link(&path)
+            .map(|t| t.to_string_lossy() == entry.symlink_target.as_str())
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn matches_on_disk(root: &Path, entry: &FileEntry) -> Result<bool> {
@@ -84,7 +119,16 @@ fn matches_on_disk(root: &Path, entry: &FileEntry) -> Result<bool> {
     Ok(rc_core::cas::hash_file(&path).map(|h| h == entry.hash).unwrap_or(false))
 }
 
-fn walk_relative(root: &Path) -> Result<Vec<String>> {
+/// What a path actually is on disk, by `lstat` — a symlink is a symlink, never
+/// whatever it points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskKind {
+    Dir,
+    Symlink,
+    File,
+}
+
+fn walk_relative(root: &Path) -> Result<Vec<(String, DiskKind)>> {
     let mut out = Vec::new();
     if !root.is_dir() {
         return Ok(out);
@@ -105,8 +149,18 @@ fn walk_relative(root: &Path) -> Result<Vec<String>> {
                 continue;
             }
             let Ok(ft) = e.file_type() else { continue };
-            out.push(rel);
-            if ft.is_dir() && !ft.is_symlink() {
+            // Order matters: a symlink to a directory reports `is_dir()` false
+            // here (file_type is lstat-based), but being explicit keeps it that
+            // way if this is ever rewritten against metadata().
+            let kind = if ft.is_symlink() {
+                DiskKind::Symlink
+            } else if ft.is_dir() {
+                DiskKind::Dir
+            } else {
+                DiskKind::File
+            };
+            out.push((rel, kind));
+            if kind == DiskKind::Dir {
                 stack.push(path);
             }
         }
@@ -191,6 +245,13 @@ pub fn verify(root: &Path, manifest: &Manifest) -> Result<()> {
             remaining.delete[0]
         ));
     }
+    if !remaining.symlinks.is_empty() {
+        return Err(anyhow!(
+            "workspace verification failed: {} symlink(s) still wrong, first is {}",
+            remaining.symlinks.len(),
+            remaining.symlinks[0].0
+        ));
+    }
     Ok(())
 }
 
@@ -212,6 +273,7 @@ mod tests {
             r#type: EntryType::EntryFile as i32,
             executable,
             in_baseline: false,
+            symlink_target: String::new(),
         }
     }
 
@@ -297,22 +359,143 @@ mod tests {
         assert!(p.delete.is_empty(), "implied parent dirs are wanted");
     }
 
+    /// Built exactly the way the scanner builds one: `hash` is the blake3 of
+    /// the target, `symlink_target` is the target itself. The old version of
+    /// this fixture put the target string straight into `hash` — a manifest the
+    /// scanner can never produce — which is why the bug below survived.
+    fn symlink_entry(path: &str, target: &str) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            size: target.len() as u64,
+            hash: rc_core::manifest::symlink_hash(target),
+            r#type: EntryType::EntrySymlink as i32,
+            executable: false,
+            in_baseline: false,
+            symlink_target: target.into(),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn symlinks_are_recreated_from_their_target_string() {
-        // §4.4: never followed; the target text is the content.
+    fn symlinks_are_recreated_from_their_target_not_their_hash() {
+        // §4.4: never followed; the target text is the content. Reconstructing
+        // from `hash` yields a link pointing at 64 hex characters.
         let root = scratch("symlink");
-        let mut link = entry("link", b"", false);
-        link.r#type = EntryType::EntrySymlink as i32;
-        link.hash = "../outside/target".into();
-        let m = manifest_of(vec![link]);
+        let m = manifest_of(vec![symlink_entry("link", "../outside/target")]);
         let p = plan(&root, &m).unwrap();
         assert_eq!(p.symlinks, vec![("link".to_string(), "../outside/target".to_string())]);
-        write_symlink(&root, "link", "../outside/target").unwrap();
-        assert_eq!(
-            std::fs::read_link(root.join("link")).unwrap().to_string_lossy(),
-            "../outside/target"
+
+        write_symlink(&root, &p.symlinks[0].0, &p.symlinks[0].1).unwrap();
+        let written = std::fs::read_link(root.join("link")).unwrap();
+        assert_eq!(written.to_string_lossy(), "../outside/target");
+        assert!(
+            !written.to_string_lossy().chars().all(|c| c.is_ascii_hexdigit()),
+            "a link named after a hash is the bug this test exists for"
         );
+        verify(&root, &m).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pointing_the_wrong_way_is_repaired_and_verify_catches_it() {
+        let root = scratch("symlink-stale");
+        let m = manifest_of(vec![symlink_entry("link", "new/target")]);
+        write_symlink(&root, "link", "stale/target").unwrap();
+
+        assert!(verify(&root, &m).is_err(), "a wrong link must not pass verification");
+        let p = plan(&root, &m).unwrap();
+        assert_eq!(p.symlinks.len(), 1);
+        write_symlink(&root, "link", &p.symlinks[0].1).unwrap();
+        verify(&root, &m).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_correct_symlink_is_left_alone() {
+        let root = scratch("symlink-stable");
+        let m = manifest_of(vec![symlink_entry("link", "real/target")]);
+        write_symlink(&root, "link", "real/target").unwrap();
+        assert!(plan(&root, &m).unwrap().symlinks.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_symlink_is_removed_before_anything_is_written() {
+        // The build runs as the worker's uid inside the workspace, so it can
+        // replace `src/` with a link to somewhere outside. Left in place, the
+        // next task's create_dir_all + write follows it and writes there.
+        let root = scratch("escape");
+        let outside = scratch("outside");
+        std::fs::write(outside.join("victim.rs"), b"do not touch").unwrap();
+
+        std::os::unix::fs::symlink(&outside, root.join("src")).unwrap();
+        let e = entry("src/main.rs", b"fn main(){}", false);
+        let m = manifest_of(vec![e.clone()]);
+
+        let p = plan(&root, &m).unwrap();
+        assert!(
+            p.delete.contains(&"src".to_string()),
+            "the swapped directory must be scheduled for removal, got {:?}",
+            p.delete
+        );
+
+        // The order below is the fix, and it is the order the runner uses:
+        // deletions before writes. Reversed, `write_file` would create_dir_all
+        // through the still-present symlink and write outside the workspace,
+        // which no later deletion can undo.
+        apply_deletions(&root, &p).unwrap();
+        write_file(&root, &e, b"fn main(){}").unwrap();
+
+        assert!(!root.join("src").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.rs")).unwrap(),
+            "do not touch",
+            "nothing may be written outside the workspace"
+        );
+        assert!(!outside.join("main.rs").exists());
+        verify(&root, &m).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_before_deleting_is_what_the_escape_needs() {
+        // Pins *why* the runner deletes first. If this ever stops escaping,
+        // the ordering constraint has moved and the comment above is stale.
+        let root = scratch("escape-order");
+        let outside = scratch("outside-order");
+        std::os::unix::fs::symlink(&outside, root.join("src")).unwrap();
+
+        let e = entry("src/main.rs", b"x", false);
+        write_file(&root, &e, b"x").unwrap();
+        assert!(
+            outside.join("main.rs").exists(),
+            "with the swap still in place, the write lands outside — hence deletions first"
+        );
+    }
+
+    #[test]
+    fn a_file_entry_sitting_on_a_directory_is_cleared_out_of_the_way() {
+        let root = scratch("filedir");
+        std::fs::create_dir_all(root.join("thing")).unwrap();
+        let e = entry("thing", b"now a file", false);
+        let m = manifest_of(vec![e.clone()]);
+
+        let p = plan(&root, &m).unwrap();
+        assert!(p.delete.contains(&"thing".to_string()));
+        apply_deletions(&root, &p).unwrap();
+        write_file(&root, &e, b"now a file").unwrap();
+        verify(&root, &m).unwrap();
+    }
+
+    #[test]
+    fn a_symlink_without_a_target_is_refused_before_it_reaches_a_worker() {
+        // An agent predating `symlink_target`: rebuilding from `hash` would
+        // produce a dangling link, so the manifest is rejected instead.
+        let mut link = symlink_entry("link", "../elsewhere");
+        link.symlink_target = String::new();
+        let m = manifest_of(vec![link]);
+        let err = rc_core::manifest::validate(&m).unwrap_err();
+        assert!(err.contains("no target"), "{err}");
     }
 
     #[test]

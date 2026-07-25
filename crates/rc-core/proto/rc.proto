@@ -17,6 +17,10 @@ message FileEntry {
   // 该内容可由 L1 基线 (git archive base_commit) 直接得到，无需 CAS blob。
   // 基线不可用时（§4.1 降级链第 4 步）全部为 false，退化为全 L2 同步。
   bool in_baseline = 6;
+  // symlink 的目标字符串原文。`hash` 是它的 blake3，用于身份与去重，
+  // **不能**拿来重建链接——那样建出的是一条指向 64 位十六进制串的死链。
+  // 仅当 type == ENTRY_SYMLINK 时有意义。
+  string symlink_target = 7;
 }
 
 // L2 dirty layer: the authoritative description of the workspace.

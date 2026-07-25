@@ -201,7 +201,7 @@ and Slack all accept.
 ## Development
 
 ```bash
-cargo test --workspace        # 263 unit tests
+cargo test --workspace        # 282 unit tests
 cargo clippy --workspace --all-targets
 ./scripts/smoke.sh            # 36 end-to-end checks against real binaries
 

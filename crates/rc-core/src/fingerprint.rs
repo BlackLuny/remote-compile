@@ -44,6 +44,20 @@ impl std::fmt::Display for FingerprintError {
 
 impl std::error::Error for FingerprintError {}
 
+/// How the worker turns a (manifest, profile) pair into a running build:
+/// where the workspace is mounted, what the working directory ends up being,
+/// how the command is invoked.
+///
+/// None of that is visible in the manifest or the profile, so without a version
+/// here a change to it reuses results computed under the *old* semantics. That
+/// is not hypothetical: `abi2` exists because mounting the workspace at `/work`
+/// instead of at the sub-project path changes which `Cargo.toml` a build with
+/// `path = "crates/backend"` actually compiles, while leaving every hashed
+/// input identical.
+///
+/// **Bump this whenever execution semantics change**, even when no type does.
+pub const EXECUTOR_ABI: &str = "abi2";
+
 /// True when an image reference names an immutable digest.
 pub fn is_digest_ref(image: &str) -> bool {
     match image.split_once("@") {
@@ -63,6 +77,7 @@ pub fn compute(input: FingerprintInput<'_>) -> Result<String, FingerprintError> 
     let mut h = blake3::Hasher::new();
     // Length-prefixed so no concatenation of two fields can mimic another.
     for part in [
+        EXECUTOR_ABI,
         input.manifest_root_hash,
         input.image_digest,
         input.toolchain,

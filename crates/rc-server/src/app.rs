@@ -137,6 +137,15 @@ impl App {
             .ok_or_else(|| anyhow!("submit without a resolved profile"))?;
 
         manifest::validate(manifest).map_err(|e| anyhow!("{e}"))?;
+        // Both of these end up as path components on the worker (`<mirrors>/
+        // <project_id>.git`, `<work>/<worktree_id>`), so their shape is checked
+        // here rather than trusted from the wire.
+        if !ids::is_valid_project_id(&req.project_id) {
+            return Err(anyhow!("malformed project_id: {}", req.project_id));
+        }
+        if !ids::is_valid_worktree_id(&req.worktree_id) {
+            return Err(anyhow!("malformed worktree_id: {}", req.worktree_id));
+        }
         self.check_image_admissible(&profile.image, &policy)?;
 
         // The server computes the fingerprint itself. Trusting the client's
@@ -749,6 +758,10 @@ mod tests {
     }
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    // Well-formed on purpose: submit refuses ids that could escape a directory
+    // once the worker joins them into a path.
+    const TEST_PROJECT: &str = "p-0123456789abcdef";
+    const TEST_WORKTREE: &str = "w-0123456789abcdef";
 
     fn image_ref() -> String {
         format!("reg/env/rust@{DIGEST}")
@@ -764,6 +777,7 @@ mod tests {
                 r#type: EntryType::EntryFile as i32,
                 executable: false,
                 in_baseline: false,
+                symlink_target: String::new(),
             }],
             "",
             false,
@@ -776,8 +790,8 @@ mod tests {
             ..Default::default()
         };
         pb::SubmitTaskReq {
-            project_id: "p1".into(),
-            worktree_id: "w1".into(),
+            project_id: TEST_PROJECT.into(),
+            worktree_id: TEST_WORKTREE.into(),
             agent_session: session.into(),
             task_type: task_type.into(),
             manifest: Some(m),

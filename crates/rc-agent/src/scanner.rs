@@ -89,16 +89,30 @@ pub fn scan(root: &Path, excludes: &[&str], index: &mut StatIndex) -> Result<Sca
             ignore_listing(&root, excludes)?
         };
 
-        let before = stat_all(&root, &listing.paths);
+        let before = stat_all(&root, &listing.paths, excludes);
         let (entries, hashed, reused) = hash_entries(&root, &listing, excludes, index)?;
-        let after = stat_all(&root, &listing.paths);
+        // Re-enumerate rather than re-stat the paths we started with: a file
+        // *created* during the scan is absent from `listing` altogether, so
+        // comparing only known paths cannot see it — and a manifest missing a
+        // file that exists locally is precisely the §4.3 divergence.
+        let after_listing = if is_git {
+            git_listing(&root)?
+        } else {
+            ignore_listing(&root, excludes)?
+        };
+        let after = stat_all(&root, &after_listing.paths, excludes);
 
         // §4.2: anything that moved while we were reading is a torn snapshot.
-        let changed: Vec<String> = before
-            .iter()
-            .filter(|(path, stat)| after.get(*path) != Some(stat))
-            .map(|(path, _)| path.clone())
+        // Comparing over the union catches all three cases — appeared,
+        // disappeared, and modified in place.
+        let mut changed: Vec<String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .cloned()
             .collect();
+        changed.sort();
+        changed.dedup();
         if !changed.is_empty() {
             if attempts >= MAX_SCAN_ATTEMPTS {
                 return Err(ScanError::Unstable { attempts, changed });
@@ -261,6 +275,8 @@ fn hash_entries(
                 r#type: EntryType::EntrySymlink as i32,
                 executable: false,
                 in_baseline: false,
+                // The hash identifies the link; only this carries what it points at.
+                symlink_target: target,
             });
             continue;
         }
@@ -288,6 +304,7 @@ fn hash_entries(
             r#type: EntryType::EntryFile as i32,
             executable: is_executable(&meta),
             in_baseline: listing.clean.contains(path),
+            symlink_target: String::new(),
         });
     }
 
@@ -295,9 +312,14 @@ fn hash_entries(
     Ok((entries, hashed, reused))
 }
 
-fn stat_all(root: &Path, paths: &[String]) -> HashMap<String, (u64, i64)> {
+/// Stat everything that will actually end up in the manifest. Excluded paths
+/// are skipped deliberately: `target/` churns constantly while a local build
+/// runs, and letting that count as instability would reject scans over a
+/// workspace that is perfectly stable in every way that matters.
+fn stat_all(root: &Path, paths: &[String], excludes: &[&str]) -> HashMap<String, (u64, i64)> {
     paths
         .iter()
+        .filter(|p| !is_excluded(p, excludes))
         .filter_map(|p| {
             let meta = std::fs::symlink_metadata(root.join(p)).ok()?;
             Some((p.clone(), (meta.len(), mtime_nanos(&meta))))
@@ -605,6 +627,32 @@ mod tests {
             .expect("symlink present");
         assert_eq!(link.r#type, EntryType::EntrySymlink as i32);
         assert_eq!(link.hash, rc_core::manifest::symlink_hash("real.rs"));
+        // The hash identifies the link; only this says where it points. The
+        // worker rebuilds from this field — rebuilding from `hash` produced a
+        // link named after 64 hex characters.
+        assert_eq!(link.symlink_target, "real.rs");
+        rc_core::manifest::validate(&s.manifest).expect("a scanned manifest must validate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_symlink_escaping_the_repo_keeps_its_literal_target() {
+        // §4.4: the target is never resolved, so `../sibling` stays `../sibling`
+        // and means whatever it means where the workspace is rebuilt.
+        let d = repo("symlink-escape");
+        std::os::unix::fs::symlink("../sibling/crate", d.join("vendor")).unwrap();
+        run_git(&d, &["add", "-A"]);
+        commit_all(&d);
+
+        let s = scan_repo(&d);
+        let link = s
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == "vendor")
+            .expect("dangling symlink is still an entry");
+        assert_eq!(link.symlink_target, "../sibling/crate");
+        assert_eq!(link.hash, rc_core::manifest::symlink_hash("../sibling/crate"));
     }
 
     #[cfg(unix)]
@@ -705,6 +753,7 @@ mod tests {
                 r#type: EntryType::EntryFile as i32,
                 executable: false,
                 in_baseline: false,
+                symlink_target: String::new(),
             });
         }
         assert_eq!(rc_core::manifest::find_case_conflicts(&entries).len(), 1);
@@ -712,6 +761,58 @@ mod tests {
         let err = ScanError::CaseConflict("src/Main.rs".into(), "src/main.rs".into());
         assert!(err.to_string().contains("differ only by case"));
         let _ = scan(&d, &[], &mut idx);
+    }
+
+    #[test]
+    fn a_file_that_appears_during_the_scan_is_detected() {
+        // §4.2: the check used to re-stat only the paths enumerated *before*
+        // hashing, so a file created mid-scan was invisible — and the manifest
+        // silently omitted a file the local build can see (§4.3).
+        let d = repo("appeared");
+        write(&d, "a.rs", "one");
+        commit_all(&d);
+
+        let before = stat_all(&d, &["a.rs".to_string()], &[]);
+        write(&d, "b.rs", "appeared mid-scan");
+        let after = stat_all(&d, &["a.rs".to_string(), "b.rs".to_string()], &[]);
+
+        let changed: Vec<&String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|p| before.get(*p) != after.get(*p))
+            .collect();
+        assert_eq!(changed, vec!["b.rs"], "the new file must register as movement");
+    }
+
+    #[test]
+    fn a_file_that_vanishes_during_the_scan_is_detected() {
+        let d = repo("vanished");
+        write(&d, "a.rs", "one");
+        write(&d, "b.rs", "two");
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let before = stat_all(&d, &paths, &[]);
+        std::fs::remove_file(d.join("b.rs")).unwrap();
+        let after = stat_all(&d, &paths, &[]);
+
+        let changed: Vec<&String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|p| before.get(*p) != after.get(*p))
+            .collect();
+        assert_eq!(changed, vec!["b.rs"]);
+    }
+
+    #[test]
+    fn build_output_churn_does_not_count_as_instability() {
+        // A local `cargo build` writing into target/ while we scan is normal,
+        // and those files never reach the manifest anyway.
+        let d = repo("churn");
+        write(&d, "target/debug/thing", "v1");
+        let paths = vec!["target/debug/thing".to_string()];
+        let before = stat_all(&d, &paths, &["target"]);
+        write(&d, "target/debug/thing", "v2 is a different length");
+        let after = stat_all(&d, &paths, &["target"]);
+        assert!(before.is_empty() && after.is_empty(), "excluded paths are not watched");
     }
 
     #[test]

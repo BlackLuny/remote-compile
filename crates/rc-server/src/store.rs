@@ -16,7 +16,52 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA_VERSION: i64 = 1;
+/// Ordered migration steps. `MIGRATIONS[i]` takes a database at
+/// `user_version == i` to `i + 1`, so **append only, never edit or reorder** —
+/// a deployed database has already run the earlier entries.
+///
+/// Statements must be safe to apply to a database that already holds data.
+/// SQLite's `ALTER TABLE ... ADD COLUMN` needs a non-`NULL` default when the
+/// column is `NOT NULL`, and there is no `IF NOT EXISTS` for columns.
+///
+/// Step 0 is the initial schema, which `schema.sql` creates outright.
+const MIGRATIONS: &[&str] = &[""];
+
+const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Bring one database from `from_version` to `steps.len()`, atomically.
+///
+/// `base_schema` is `CREATE TABLE IF NOT EXISTS ...`, so it fills in anything
+/// absent and leaves existing tables untouched; `steps` carry the changes that
+/// existing tables need.
+fn apply_migrations(
+    conn: &Connection,
+    base_schema: &str,
+    steps: &[&str],
+    from_version: i64,
+) -> Result<()> {
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch(base_schema)?;
+        for step in steps.iter().skip(from_version.max(0) as usize) {
+            conn.execute_batch(step)?;
+        }
+        conn.pragma_update(None, "user_version", steps.len() as i64)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        // Half a migration is worse than none: a partially altered table is
+        // not a state any code knows how to read.
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
 
 // --------------------------------------------------------------------------
 // Row types. These are serialized straight onto the admin REST API, so field
@@ -240,8 +285,20 @@ impl Store {
         if version >= SCHEMA_VERSION {
             return Ok(());
         }
-        conn.execute_batch(include_str!("schema.sql"))?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+
+        // schema.sql is `CREATE TABLE IF NOT EXISTS` throughout, so on an
+        // existing database it creates whatever is missing and is a no-op for
+        // everything else. That makes it the right tool for a fresh install and
+        // the wrong one for evolving a populated database: adding a column to a
+        // table that already exists does nothing at all, and every later
+        // insert then fails with "no such column".
+        //
+        // So each version gets an explicit step, applied in order and inside a
+        // transaction, and `user_version` records how far a database has come.
+        apply_migrations(&conn, include_str!("schema.sql"), MIGRATIONS, version)?;
+        if version > 0 {
+            tracing::info!(from = version, to = SCHEMA_VERSION, "database schema migrated");
+        }
         Ok(())
     }
 
@@ -1800,6 +1857,69 @@ mod tests {
         s.requeue("t1", "w-a", "docker daemon gone").unwrap();
         assert_eq!(s.attempted_workers("t1").unwrap(), vec!["w-a"]);
         assert_eq!(s.get_task("t1").unwrap().unwrap().status, "queued");
+    }
+
+    #[test]
+    fn a_migration_step_alters_a_table_that_already_holds_rows() {
+        // Re-running `CREATE TABLE IF NOT EXISTS` cannot add a column: on a
+        // populated database it is a silent no-op, and every later query then
+        // fails with "no such column". This is the mechanism that makes adding
+        // one actually work.
+        let conn = Connection::open_in_memory().unwrap();
+        let base = "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, a TEXT NOT NULL DEFAULT '');";
+        apply_migrations(&conn, base, &[""], 0).unwrap();
+        conn.execute("INSERT INTO t (id, a) VALUES ('x', 'kept')", []).unwrap();
+
+        // A later release adds a column and backfills it.
+        let steps: &[&str] = &[
+            "",
+            "ALTER TABLE t ADD COLUMN b TEXT NOT NULL DEFAULT '';\n\
+             UPDATE t SET b = 'backfilled' WHERE b = '';",
+        ];
+        apply_migrations(&conn, base, steps, 1).unwrap();
+
+        let (a, b): (String, String) = conn
+            .query_row("SELECT a, b FROM t WHERE id = 'x'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(a, "kept", "existing data survives");
+        assert_eq!(b, "backfilled");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn a_failing_migration_leaves_the_database_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        let base = "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY);";
+        apply_migrations(&conn, base, &[""], 0).unwrap();
+        conn.execute("INSERT INTO t (id) VALUES ('x')", []).unwrap();
+
+        let steps: &[&str] = &[
+            "",
+            "ALTER TABLE t ADD COLUMN b TEXT NOT NULL DEFAULT '';",
+            "THIS IS NOT SQL;",
+        ];
+        assert!(apply_migrations(&conn, base, steps, 1).is_err());
+
+        // Neither the partial change nor the version bump may survive.
+        assert!(
+            conn.query_row("SELECT b FROM t", [], |r| r.get::<_, String>(0)).is_err(),
+            "the rolled-back column must be gone"
+        );
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, 1, "a half-applied migration must not claim success");
+    }
+
+    #[test]
+    fn reopening_a_populated_database_is_a_no_op() {
+        let path = std::env::temp_dir().join(format!("rc-store-{}.sqlite", ulid::Ulid::generate()));
+        let s = Store::open(&path).unwrap();
+        s.insert_task(&task("t1", "f", "k", "s", "queued"), "{}", "{}", "").unwrap();
+        drop(s);
+
+        let again = Store::open(&path).unwrap();
+        assert_eq!(again.get_task("t1").unwrap().unwrap().status, "queued");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

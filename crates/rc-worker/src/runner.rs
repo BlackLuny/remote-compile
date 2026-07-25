@@ -15,16 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-/// Per-worktree mutual exclusion.
+/// Mutual exclusion keyed by an arbitrary id, one lock per distinct key.
 #[derive(Default)]
-pub struct WorktreeLocks {
+pub struct KeyedLocks {
     inner: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
-impl WorktreeLocks {
-    pub async fn get(&self, worktree_id: &str) -> Arc<Mutex<()>> {
+impl KeyedLocks {
+    pub async fn get(&self, key: &str) -> Arc<Mutex<()>> {
         let mut map = self.inner.lock().await;
-        map.entry(worktree_id.to_string())
+        map.entry(key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -39,7 +39,19 @@ pub struct Runner {
     /// Only one task per worktree runs at a time on this worker: they share a
     /// target volume and would otherwise just block on cargo's file lock
     /// (§6.2, risk #8).
-    worktree_locks: WorktreeLocks,
+    worktree_locks: KeyedLocks,
+    /// Git mirrors are keyed by *project*, so two different worktrees of one
+    /// project — which the worktree lock deliberately lets run in parallel —
+    /// drive the same bare repository at once. `Mirror::open`'s "is HEAD there,
+    /// else init" and `ensure_commit`'s fetch/import/check sequence are both
+    /// multi-step and neither is atomic, so concurrent tasks can collide on
+    /// git's ref locks and report the baseline as unavailable. That is not
+    /// fatal — it degrades to full L2 — but it is slow and it looks like a bug.
+    ///
+    /// This covers one worker process, which is the situation that actually
+    /// arises; two rc-worker processes sharing a data dir would still need a
+    /// lockfile.
+    project_locks: KeyedLocks,
     /// Whether a host sccache daemon is available for the UDS mount (§7.2).
     pub sccache_available: bool,
     /// Environment builds currently running here. A duplicate order for one
@@ -58,7 +70,8 @@ impl Runner {
             sandbox,
             cas,
             proxy,
-            worktree_locks: WorktreeLocks::default(),
+            worktree_locks: KeyedLocks::default(),
+            project_locks: KeyedLocks::default(),
             sccache_available,
             building: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -102,6 +115,15 @@ impl Runner {
             .clone()
             .ok_or_else(|| anyhow!("assignment has no resolved profile"))?;
         rc_core::manifest::validate(&manifest).map_err(|e| anyhow!(e))?;
+        // The server checks these too; repeating it here is deliberate, because
+        // this is where they become paths and volume names, and a worker must
+        // not depend on the control plane having been careful.
+        if !rc_core::ids::is_valid_project_id(&assignment.project_id) {
+            return Err(anyhow!("malformed project_id: {}", assignment.project_id));
+        }
+        if !rc_core::ids::is_valid_worktree_id(&assignment.worktree_id) {
+            return Err(anyhow!("malformed worktree_id: {}", assignment.worktree_id));
+        }
 
         let sync_started = std::time::Instant::now();
         let _ = events
@@ -117,6 +139,10 @@ impl Runner {
             let bundles = self
                 .materialize_bundles(&assignment.bundle_blobs, client)
                 .await?;
+            // Everything touching this project's bare mirror is serialized.
+            let project_lock = self.project_locks.get(&assignment.project_id).await;
+            let _mirror_guard = project_lock.lock().await;
+
             let mirror = Mirror::open(&self.cfg.mirror_dir(), &assignment.project_id)?;
             let source = mirror.ensure_commit(
                 &manifest.base_commit,
@@ -136,6 +162,14 @@ impl Runner {
 
         // ---- L2 content-addressed layer ----
         let plan = workspace::plan(&root, &manifest)?;
+
+        // Deletions come first, before anything is written. The previous task's
+        // build could have replaced a directory with a symlink pointing outside
+        // the workspace; writing into it before clearing it would follow that
+        // link. §7.3 wants these strays gone regardless, so the only question
+        // was ordering — and "after the writes" was the wrong answer.
+        workspace::apply_deletions(&root, &plan)?;
+
         let mut missing = Vec::new();
         let mut bytes_synced = 0u64;
         for entry in &plan.fetch {
@@ -158,8 +192,7 @@ impl Runner {
         for (path, target) in &plan.symlinks {
             workspace::write_symlink(&root, path, target)?;
         }
-        // §7.3: the manifest is the whole truth, so anything not in it goes.
-        workspace::apply_deletions(&root, &plan)?;
+        // §7.3: the manifest is the whole truth, and `verify` is what says so.
         workspace::verify(&root, &manifest)?;
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
@@ -285,12 +318,11 @@ impl Runner {
         env.push("HOME=/rc/home".to_string());
         env.push("TERM=dumb".to_string());
 
-        // A sub-project inside a monorepo builds from its own directory.
-        let workdir = if profile.path.is_empty() {
-            "/work".to_string()
-        } else {
-            format!("/work/{}", profile.path.trim_matches('/'))
-        };
+        // A sub-project inside a monorepo builds from its own directory inside
+        // the mounted workspace (§3.2). The path comes from the agent, so it is
+        // checked rather than trusted: `../..` here would put the build's cwd
+        // outside the workspace entirely.
+        let workdir = subproject_workdir(&profile.path)?;
 
         // pre_commands generate code, so they run inside the same sandbox and
         // are part of the fingerprint (§5.1).
@@ -356,7 +388,16 @@ impl Runner {
                     tracing::warn!(%hash, "bundle blob is gone; continuing without it");
                     continue;
                 };
-                std::fs::write(&path, &data)?;
+                // Write somewhere unique, then rename: the final path is shared
+                // between concurrent tasks, and a half-written bundle at it
+                // would be handed to `git bundle list-heads` as if it were
+                // complete.
+                let tmp = dir.join(format!(".{hash}.{}.part", ulid::Ulid::generate()));
+                std::fs::write(&tmp, &data)?;
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
             }
             out.push(path);
         }
@@ -458,6 +499,21 @@ impl Runner {
         }
         Ok(reclaimed)
     }
+}
+
+/// Absolute working directory for a build, given the profile's sub-project
+/// path. Empty means the workspace root.
+fn subproject_workdir(path: &str) -> Result<String> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(docker::WORKSPACE_MOUNT.to_string());
+    }
+    if !rc_core::manifest::is_safe_relative_path(trimmed) {
+        return Err(anyhow!(
+            "profile path `{path}` is not a safe relative path; refusing to run outside the workspace"
+        ));
+    }
+    Ok(format!("{}/{trimmed}", docker::WORKSPACE_MOUNT))
 }
 
 /// Whether to wire the shared compilation cache into builds (§7.2).
@@ -563,16 +619,37 @@ mod tests {
 
     #[test]
     fn a_subproject_path_becomes_the_working_directory() {
-        let profile = pb::ResolvedProfile {
-            path: "crates/backend".into(),
-            ..Default::default()
-        };
-        let workdir = if profile.path.is_empty() {
-            "/work".to_string()
-        } else {
-            format!("/work/{}", profile.path.trim_matches('/'))
-        };
-        assert_eq!(workdir, "/work/crates/backend");
+        assert_eq!(subproject_workdir("crates/backend").unwrap(), "/work/crates/backend");
+        assert_eq!(subproject_workdir("/crates/backend/").unwrap(), "/work/crates/backend");
+        assert_eq!(subproject_workdir("").unwrap(), "/work");
+    }
+
+    #[test]
+    fn the_workspace_mounts_at_the_root_never_at_the_subproject_path() {
+        // The bind used to be `workspace:{workdir}`, which aliased the whole
+        // repository onto the sub-project's pathname: a build with
+        // `path = "crates/backend"` compiled the entire workspace while the
+        // real sub-project sat at `/work/crates/backend/crates/backend`.
+        let workdir = subproject_workdir("crates/backend").unwrap();
+        assert_eq!(docker::WORKSPACE_MOUNT, "/work");
+        assert_ne!(workdir, docker::WORKSPACE_MOUNT);
+        assert!(
+            workdir.starts_with(&format!("{}/", docker::WORKSPACE_MOUNT)),
+            "the workdir must live inside the mount, not replace it"
+        );
+    }
+
+    #[test]
+    fn a_traversing_subproject_path_is_refused() {
+        for evil in ["../..", "crates/../../etc", "a/./b", "a//b", "..", "C:/win"] {
+            assert!(
+                subproject_workdir(evil).is_err(),
+                "`{evil}` must not become a working directory"
+            );
+        }
+        // A leading slash is a typo, not an escape: it is trimmed and stays
+        // inside the mount.
+        assert_eq!(subproject_workdir("/etc").unwrap(), "/work/etc");
     }
 
     #[test]
@@ -601,7 +678,7 @@ mod tests {
     async fn one_lock_per_worktree_and_it_is_shared() {
         // §6.2: two tasks for the same worktree must serialize; different
         // worktrees must not block each other.
-        let locks = WorktreeLocks::default();
+        let locks = KeyedLocks::default();
         let a1 = locks.get("w-a").await;
         let a2 = locks.get("w-a").await;
         let b = locks.get("w-b").await;
@@ -613,5 +690,26 @@ mod tests {
         assert!(b.try_lock().is_ok(), "an unrelated worktree proceeds");
         drop(held);
         assert!(a2.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn two_worktrees_of_one_project_still_serialize_on_the_mirror() {
+        // The worktree lock deliberately lets them run in parallel, but they
+        // share `<mirrors>/<project_id>.git`, whose init and fetch sequences
+        // are not atomic.
+        let worktrees = KeyedLocks::default();
+        let projects = KeyedLocks::default();
+        assert!(
+            !Arc::ptr_eq(&worktrees.get("w-a").await, &worktrees.get("w-b").await),
+            "different worktrees run concurrently"
+        );
+
+        let p1 = projects.get("p-same").await;
+        let p2 = projects.get("p-same").await;
+        assert!(Arc::ptr_eq(&p1, &p2), "but they meet at the project mirror");
+        let held = p1.lock().await;
+        assert!(p2.try_lock().is_err());
+        drop(held);
+        assert!(p2.try_lock().is_ok());
     }
 }

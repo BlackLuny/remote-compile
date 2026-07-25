@@ -55,6 +55,26 @@ pub fn worktree_id(abs_path: &Path, first_base_commit: &str) -> String {
     )
 }
 
+/// Ids arrive from the agent and are then joined into filesystem paths —
+/// `<mirror_dir>/<project_id>.git`, `<work_dir>/<worktree_id>` — and into
+/// docker volume names. A value like `../../etc` would place both outside the
+/// directory that is supposed to contain them, so the shape is checked rather
+/// than assumed.
+fn has_shape(id: &str, prefix: &str) -> bool {
+    match id.strip_prefix(prefix) {
+        Some(body) => body.len() == 16 && body.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+pub fn is_valid_project_id(id: &str) -> bool {
+    has_shape(id, "p-")
+}
+
+pub fn is_valid_worktree_id(id: &str) -> bool {
+    has_shape(id, "w-")
+}
+
 /// Supersede scope: same worktree, same agent session, same task type (§5.2).
 /// Crucially *not* cross-session and *not* cross-type.
 pub fn supersede_key(worktree_id: &str, agent_session: &str, task_type: &str) -> String {
@@ -120,6 +140,24 @@ mod tests {
         let a = project_id(None, Path::new("/tmp/a"));
         let b = project_id(None, Path::new("/tmp/b"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn generated_ids_pass_their_own_shape_check() {
+        assert!(is_valid_project_id(&project_id(Some("git@github.com:o/r.git"), Path::new("/tmp/a"))));
+        assert!(is_valid_project_id(&project_id(None, Path::new("/tmp/a"))));
+        assert!(is_valid_worktree_id(&worktree_id(Path::new("/tmp/a"), "abc123")));
+    }
+
+    #[test]
+    fn ids_that_would_escape_their_directory_are_rejected() {
+        // These get joined into `<mirror_dir>/<id>.git` and `<work_dir>/<id>`.
+        for evil in ["../../etc", "p-../../etc", "p-", "", "p-zzzzzzzzzzzzzzzz", "w-0123456789abcde"] {
+            assert!(!is_valid_project_id(evil), "{evil} must not pass as a project id");
+            assert!(!is_valid_worktree_id(evil), "{evil} must not pass as a worktree id");
+        }
+        // The prefixes are not interchangeable.
+        assert!(!is_valid_worktree_id(&project_id(None, Path::new("/tmp/a"))));
     }
 
     #[test]

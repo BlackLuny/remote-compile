@@ -34,6 +34,11 @@ pub const OWNER_VALUE: &str = "remote-compile";
 /// allowlist proxy listens — is the only reachable address.
 pub const EGRESS_NETWORK: &str = "rc-egress";
 
+/// Where the reconstructed workspace is mounted inside the container. The
+/// build's working directory is derived from this plus the profile's
+/// sub-project `path`; see `Sandbox::run`.
+pub const WORKSPACE_MOUNT: &str = "/work";
+
 pub struct Sandbox {
     docker: Docker,
 }
@@ -200,10 +205,17 @@ impl Sandbox {
         let mut labels = Self::base_labels();
         labels.extend(spec.labels.clone());
 
+        // The workspace is the tree named by the manifest, so it mounts at the
+        // workspace root — never at `spec.workdir`. Mounting it at the workdir
+        // aliased the repository root onto the sub-project's pathname, so
+        // `path = "crates/backend"` compiled the whole workspace from a
+        // directory that merely *looked* like the sub-project, and the real one
+        // sat at `/work/crates/backend/crates/backend`. `workdir` selects where
+        // the command runs inside that tree; it does not decide the mount.
         let mut binds: Vec<String> = vec![format!(
             "{}:{}",
             spec.workspace.to_string_lossy(),
-            spec.workdir
+            WORKSPACE_MOUNT
         )];
         for (name, path) in &spec.volumes {
             binds.push(format!("{name}:{path}"));

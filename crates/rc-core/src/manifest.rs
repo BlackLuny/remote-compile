@@ -118,6 +118,23 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
         if e.r#type == EntryType::EntryFile as i32 && e.hash.len() != 64 {
             return Err(format!("bad blob hash for {}: {}", e.path, e.hash));
         }
+        if e.r#type == EntryType::EntrySymlink as i32 {
+            // An agent predating `symlink_target` sends nothing here, and the
+            // worker used to fall back to `hash` — producing a link pointing at
+            // a 64-hex string. Refusing is far better than rebuilding that.
+            if e.symlink_target.is_empty() {
+                return Err(format!(
+                    "symlink {} carries no target; the agent is too old to sync symlinks correctly",
+                    e.path
+                ));
+            }
+            if e.hash != symlink_hash(&e.symlink_target) {
+                return Err(format!(
+                    "symlink {} has a hash that does not match its target",
+                    e.path
+                ));
+            }
+        }
     }
     let conflicts = find_case_conflicts(&m.entries);
     if let Some((a, b)) = conflicts.first() {
@@ -145,6 +162,7 @@ mod tests {
             r#type: EntryType::EntryFile as i32,
             executable: false,
             in_baseline: false,
+            symlink_target: String::new(),
         }
     }
 
