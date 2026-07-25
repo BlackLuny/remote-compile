@@ -359,6 +359,17 @@ agent 提交的代码不可信（build.rs / proc-macro 执行任意代码）。�
 
 **sccache 连通性**：构建容器 `--network=none`，容器内直连 Redis/S3 不可行（Redis 协议也过不了 HTTP 代理）。方案：sccache server 常驻 worker host，容器内只跑 client，经挂载的 unix socket（`SCCACHE_SERVER_UDS`）通信；远端缓存后端由 host 侧访问，**后端凭据不进入不可信容器**。
 
+> **⚠ 上述方案行不通，共享 sccache 当前关闭。** 调用编译器的是 sccache
+> server，而它拿到的编译器路径（`/usr/local/rustup/toolchains/…/bin/rustc`）
+> 只存在于容器镜像里——host 上没有这套 toolchain，每个编译请求都在
+> server 侧失败并断开连接。凭据隔离这个出发点是对的，但 client/server 的职责
+> 边界与之矛盾：要共享缓存，就得让 server 和编译器待在一起。
+>
+> 可行的修法是把 sccache 整个放进容器，`SCCACHE_DIR` 指向挂载卷——代价是放弃
+> 本节想要的凭据隔离，且不可信构建代码能写入跨项目共享的缓存（投毒面）。这个
+> 取舍尚未拍板，因此 rc-worker 默认不启用（`RC_ENABLE_SCCACHE=1` 可强开），
+> 本地 crate 仍由 per-worktree target volume 缓存。
+
 **rust-toolchain.toml 漂移**：指纹含 toolchain；镜像内置 rustup + 常用 toolchain，缺失时在容器内经白名单代理安装（rustup.rs 加入白名单）。
 
 ### 7.3 工作区重建

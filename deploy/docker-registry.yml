@@ -25,9 +25,10 @@ services:
     volumes:
       - registry-data:/var/lib/registry
 
-  # Shared sccache backend (§7.2). The sccache *server* runs on each worker
-  # host and talks to this; build containers only ever see a unix socket, so
-  # these credentials never reach untrusted code.
+  # Shared sccache backend (§7.2) — currently unused: the shared compilation
+  # cache is off because §7.2's host-daemon split cannot work (see the README's
+  # Status section). Kept because whatever replaces it will still want a
+  # backend; drop this service if you do not intend to revisit that.
   redis:
     image: redis:7-alpine
     container_name: rc-sccache-redis

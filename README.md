@@ -222,3 +222,13 @@ Implements the v0.3 design. Not yet built:
 - **Postgres** — SQLite only; the storage layer is a single module to swap.
 - **TLS in-process** — reverse proxy instead, see above.
 - **gVisor / firecracker** isolation (§7.1).
+- **Shared compilation cache** — off, and not merely unconfigured: §7.2 puts the
+  sccache *server* on the worker host so that cache credentials stay out of
+  untrusted containers, but the server is the half that invokes the compiler,
+  and the toolchain path it is handed exists only inside the build image. Every
+  compile fails. Fixing it means running sccache inside the container with
+  `SCCACHE_DIR` on a mounted volume — which gives up that credential isolation
+  and lets build code poison a cache shared across projects, so it is left as a
+  decision rather than a patch. `RC_ENABLE_SCCACHE=1` forces the old path back
+  on. Local crates are still cached by the per-worktree target volume, which is
+  where most of the benefit was.

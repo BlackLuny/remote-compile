@@ -52,12 +52,7 @@ pub struct Runner {
 impl Runner {
     pub fn new(cfg: WorkerConfig, sandbox: Arc<Sandbox>, proxy: Option<String>) -> Result<Self> {
         let cas = FsCas::open(cfg.cas_dir())?;
-        let sccache_available = which("sccache").is_some();
-        if !sccache_available {
-            tracing::warn!(
-                "sccache is not on PATH; builds will run without the shared compilation cache"
-            );
-        }
+        let sccache_available = sccache_enabled();
         Ok(Runner {
             cfg,
             sandbox,
@@ -454,6 +449,43 @@ impl Runner {
             }
         }
         Ok(reclaimed)
+    }
+}
+
+/// Whether to wire the shared compilation cache into builds (§7.2).
+///
+/// Off unless `RC_ENABLE_SCCACHE=1`, because §7.2 as designed does not work:
+/// the sccache *server* runs on the worker host, but it is the server that
+/// invokes the compiler, and the path it is handed
+/// (`/usr/local/rustup/toolchains/.../bin/rustc`) exists only inside the build
+/// container. Every compile then dies on a dropped connection.
+///
+/// Keying this off "is the binary on PATH", as it used to, means an unrelated
+/// `cargo install sccache` silently breaks every build on the machine. The
+/// plumbing below is left intact for whoever fixes the design — most likely by
+/// running sccache inside the container with `SCCACHE_DIR` on a mounted volume,
+/// which trades the credential isolation §7.2 was protecting for a cache that
+/// untrusted build code can write to.
+fn sccache_enabled() -> bool {
+    if std::env::var("RC_ENABLE_SCCACHE").as_deref() != Ok("1") {
+        tracing::info!(
+            "shared sccache is off (set RC_ENABLE_SCCACHE=1 to force it on); \
+             per-worktree target volumes still cache local crates"
+        );
+        return false;
+    }
+    match which("sccache") {
+        Some(_) => {
+            tracing::warn!(
+                "RC_ENABLE_SCCACHE=1: mounting the host sccache socket, which only works if \
+                 this host has the container's toolchain at the same path"
+            );
+            true
+        }
+        None => {
+            tracing::warn!("RC_ENABLE_SCCACHE=1 but sccache is not on PATH; leaving it off");
+            false
+        }
     }
 }
 
