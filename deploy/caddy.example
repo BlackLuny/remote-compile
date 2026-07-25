@@ -1,0 +1,22 @@
+# TLS termination for the control plane (§16).
+#
+# rc-server itself speaks plain HTTP/h2c: TLS, certificate rotation and client
+# certificates are deployment concerns handled here rather than reimplemented
+# in the binary. Both ports need fronting — the admin console *and* the gRPC
+# endpoint that agents and workers connect to.
+
+rc.example.com {
+    encode gzip
+    # Console, REST API and /metrics.
+    reverse_proxy 127.0.0.1:7700
+}
+
+grpc.rc.example.com {
+    # gRPC needs HTTP/2 end to end.
+    reverse_proxy h2c://127.0.0.1:7701
+}
+
+# Keep /metrics off the public internet; it is unauthenticated by design so
+# Prometheus can scrape it (§15.1).
+# @metrics path /metrics
+# handle @metrics { @denied not remote_ip 10.0.0.0/8; respond @denied 403 }

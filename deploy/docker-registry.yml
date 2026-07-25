@@ -1,0 +1,43 @@
+# Internal registry for environment images (§8.2).
+#
+# Workers push here after building an environment image and pull from here at
+# task time.
+# It is deliberately plain HTTP behind the reverse proxy that already fronts
+# rc-server: exposing an unauthenticated registry to the internet would let
+# anyone plant an image that later gets approved by digest.
+#
+#   docker compose -f deploy/docker-registry.yml up -d
+#
+# On every worker, trust it explicitly (/etc/docker/daemon.json):
+#   { "insecure-registries": ["rc-registry:5000"] }
+# — or terminate TLS at the proxy and skip that.
+
+services:
+  registry:
+    image: registry:2
+    container_name: rc-registry
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_HTTP_ADDR: "0.0.0.0:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+  # Shared sccache backend (§7.2). The sccache *server* runs on each worker
+  # host and talks to this; build containers only ever see a unix socket, so
+  # these credentials never reach untrusted code.
+  redis:
+    image: redis:7-alpine
+    container_name: rc-sccache-redis
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "16gb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - sccache-data:/data
+
+volumes:
+  registry-data:
+  sccache-data:

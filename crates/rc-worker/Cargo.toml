@@ -1,0 +1,20 @@
+[package]
+name = "rc-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rc-core = { path = "../rc-core" }
+bollard = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "fs", "io-util", "signal"] }
+futures = "0.3"
+anyhow = "1"
+tracing = "0.1"
+ulid = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tonic = { version = "0.14", features = ["channel", "transport"] }
+tokio-stream = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

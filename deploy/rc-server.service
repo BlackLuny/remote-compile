@@ -1,0 +1,25 @@
+[Unit]
+Description=remote-compile control plane
+After=network-online.target
+
+[Service]
+Type=simple
+User=rc-server
+Group=rc-server
+Environment=RUST_LOG=rc_server=info
+# The console, REST API and /metrics live on 7700; agents and workers on 7701.
+ExecStart=/usr/local/bin/rc-server --data-dir /var/lib/rc-server serve \
+  --http-addr 127.0.0.1:7700 \
+  --grpc-addr 0.0.0.0:7701
+Restart=always
+RestartSec=5
+# SQLite plus the CAS: everything the control plane owns is under one directory.
+StateDirectory=rc-server
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/rc-server
+
+[Install]
+WantedBy=multi-user.target

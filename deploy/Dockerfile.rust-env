@@ -1,0 +1,38 @@
+# Reference build environment (§8.2).
+#
+# What a usable rc environment image must provide:
+#   * the toolchain and any system libraries the project's build scripts need;
+#   * the `sccache` *client* binary — the worker sets RUSTC_WRAPPER=sccache and
+#     mounts the host daemon's unix socket at /rc/sccache (§7.2);
+#   * writable /rc/cargo and /rc/target mount points, because the container
+#     root filesystem is read-only (§7.1).
+#
+# Build and push it, then approve the resulting digest in the console:
+#   docker build -f deploy/Dockerfile.rust-env -t rc-registry:5000/env/rust:1 .
+#   docker push rc-registry:5000/env/rust:1
+
+FROM docker.io/library/rust:1-bookworm
+
+# Common build-script dependencies. Adding one here is far cheaper than every
+# agent discovering it through a failed build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        cmake \
+        libclang-dev \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The client half of the shared compilation cache. Without this binary the
+# worker strips RUSTC_WRAPPER rather than failing every compile.
+RUN cargo install sccache --locked --root /usr/local && rm -rf "$CARGO_HOME"/registry
+
+# Mount points supplied by the worker; the rest of the filesystem is read-only.
+RUN mkdir -p /rc/cargo /rc/target /rc/sccache /rc/home /work
+ENV CARGO_HOME=/rc/cargo \
+    CARGO_TARGET_DIR=/rc/target \
+    HOME=/rc/home
+
+WORKDIR /work

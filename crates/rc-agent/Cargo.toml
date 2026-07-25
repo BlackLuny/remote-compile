@@ -1,0 +1,23 @@
+[package]
+name = "rc-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rc-core = { path = "../rc-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "process"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", features = ["channel", "transport"] }
+prost = "0.14"
+rusqlite = { version = "0.37", features = ["bundled"] }
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+blake3 = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "3"

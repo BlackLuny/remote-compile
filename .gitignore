@@ -1,0 +1,6 @@
+/target
+/rc-data
+/rc-worker-data
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo

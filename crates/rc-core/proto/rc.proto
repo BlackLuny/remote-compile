@@ -1,0 +1,390 @@
+syntax = "proto3";
+package rc.v1;
+
+// ============================ common ============================
+
+enum EntryType {
+  ENTRY_FILE = 0;
+  ENTRY_SYMLINK = 1;
+}
+
+message FileEntry {
+  string path = 1;          // repo-relative, '/' separated
+  uint64 size = 2;
+  string hash = 3;          // blake3 hex; symlink => hash of target string
+  EntryType type = 4;
+  bool executable = 5;
+  // 该内容可由 L1 基线 (git archive base_commit) 直接得到，无需 CAS blob。
+  // 基线不可用时（§4.1 降级链第 4 步）全部为 false，退化为全 L2 同步。
+  bool in_baseline = 6;
+}
+
+// L2 dirty layer: the authoritative description of the workspace.
+message Manifest {
+  repeated FileEntry entries = 1;
+  string root_hash = 2;        // blake3 over canonical entry list
+  string base_commit = 3;      // "" when no git baseline
+  bool baseline = 4;           // true => worker should materialize L1 from git mirror
+}
+
+message ResolvedProfile {
+  string adapter = 1;
+  string image = 2;            // MUST be a digest ref by the time it is hashed
+  string path = 3;             // sub-project path inside the repo
+  map<string, string> env = 4;
+  repeated string features = 5;
+  string target = 6;
+  repeated string pre_commands = 7;
+  map<string, string> tasks = 8;
+  uint32 timeout_secs = 9;
+  string toolchain = 10;
+  string canonical = 11;       // canonical text form; hashed into the fingerprint
+  string source = 12;          // explicit | repo | server | detected
+}
+
+message Diagnostic {
+  string level = 1;            // error | warning | note
+  string code = 2;
+  string message = 3;
+  string file = 4;
+  uint32 line = 5;
+  uint32 column = 6;
+  string rendered = 7;
+}
+
+message TaskStats {
+  uint64 queue_ms = 1;
+  uint64 sync_ms = 2;
+  uint64 build_ms = 3;
+  uint64 upload_ms = 4;
+  double cache_hit_rate = 5;
+  uint64 bytes_synced = 6;
+}
+
+message TaskResult {
+  string kind = 1;             // success|compile_error|env_error|infra_error|timeout
+  repeated Diagnostic diagnostics = 2;
+  uint32 error_count = 3;
+  uint32 warning_count = 4;
+  string log_ref = 5;
+  TaskStats stats = 6;
+  string summary = 7;
+  int32 exit_code = 8;
+  uint32 truncated_diagnostics = 9;
+}
+
+message Empty {}
+
+// ============================ agent api ============================
+
+message CheckBlobsReq {
+  repeated string hashes = 1;
+  string agent_session = 2;
+}
+message CheckBlobsResp {
+  repeated string missing = 1;   // subset the agent must upload
+}
+
+message BlobChunk {
+  string hash = 1;               // set on every chunk of a blob
+  bytes data = 2;
+  bool last = 3;
+  uint64 total_size = 4;
+}
+message UploadBlobsResp {
+  uint32 accepted = 1;
+  repeated string rejected = 2;  // hash mismatch
+}
+
+message BaselineReq {
+  string project_id = 1;
+  string base_commit = 2;
+}
+message BaselineResp {
+  bool have = 1;                 // server/mirror already has this commit
+  repeated string known_commits = 2;  // bundle基点候选，用于 `git bundle create --not`
+  bool upstream_public = 3;
+}
+
+message BundleUpload {
+  string project_id = 1;
+  string base_commit = 2;
+  string blob_hash = 3;          // bundle already uploaded through UploadBlobs
+  repeated string base_commits = 4;  // 该 bundle 的基点（--not 参数）
+}
+
+message SubmitTaskReq {
+  string project_id = 1;
+  string project_root = 2;       // canonical local root or repo url
+  string repo_url = 3;
+  string worktree_id = 4;
+  string worktree_label = 5;
+  string agent_session = 6;
+  string task_type = 7;          // check|build|test|clippy|custom
+  string command_override = 8;
+  Manifest manifest = 9;
+  ResolvedProfile profile = 10;
+  string fingerprint = 11;
+  string bundle_blob = 12;       // optional git bundle blob for the baseline layer
+  bool no_cache = 13;
+}
+
+message TaskHandle {
+  string task_id = 1;
+  string status = 2;
+  bool cache_hit = 3;
+  TaskResult result = 4;         // present when cache_hit
+  // 服务端仍缺的 blob：agent 需补传后重新提交（§4.7 自愈路径）。
+  repeated string missing_blobs = 5;
+  bool subscribed = 6;           // 挂到了已有的同指纹任务上，而非新建
+  string message = 7;
+}
+
+message TaskQuery {
+  string task_id = 1;
+  uint32 wait_secs = 2;          // long-poll window
+}
+
+message TaskPhase {
+  string phase = 1;
+  int64 at_ms = 2;
+  string worker_id = 3;
+  string detail = 4;
+}
+
+message TaskStatus {
+  string task_id = 1;
+  string status = 2;             // pending|syncing|queued|running|uploading|done|failed|canceled|superseded
+  TaskResult result = 3;
+  repeated TaskPhase timeline = 4;
+  uint32 attempt = 5;
+  string worker_id = 6;
+  int64 created_at = 7;
+  int64 finished_at = 8;
+  repeated string missing_blobs = 9;  // server asks the agent to re-upload
+  string superseded_by = 10;
+}
+
+message LogQuery {
+  string task_id = 1;
+  uint64 offset = 2;             // line offset
+  uint32 limit = 3;
+  string grep = 4;
+  bool tail = 5;
+}
+message LogChunk {
+  repeated string lines = 1;
+  uint64 offset = 2;
+  uint64 total_lines = 3;
+  bool truncated = 4;
+}
+
+message GetProfileReq {
+  string project_id = 1;
+  string path = 2;
+}
+message ProfileHealth {
+  int64 last_success_at = 1;
+  uint32 success_count = 2;
+  uint32 total_count = 3;
+  string created_by = 4;
+}
+message ProfileResp {
+  bool found = 1;
+  string config_toml = 2;
+  ProfileHealth health = 3;
+  string image_status = 4;
+  string message = 5;
+  // agent 必须用 digest 形式的镜像构造 ResolvedProfile（§5.1），
+  // 这里给出控制面认为可用的那一个；为空表示还没有可用环境。
+  string resolved_image = 6;
+  string adapter = 7;
+}
+message UpsertProfileReq {
+  string project_id = 1;
+  string path = 2;
+  string config_toml = 3;
+  string agent_session = 4;
+}
+
+message ListEnvsReq {
+  string query = 1;
+  string arch = 2;
+  string target = 3;
+}
+message EnvHealth {
+  int64 last_success_at = 1;
+  double success_rate_7d = 2;
+  uint32 total_runs = 3;
+}
+message EnvImage {
+  string env_id = 1;
+  string image_ref = 2;
+  string digest = 3;
+  string status = 4;
+  repeated string arch = 5;
+  repeated string targets = 6;
+  EnvHealth health = 7;
+  repeated string used_by = 8;
+  int64 built_at = 9;
+  string description = 10;
+}
+message ListEnvsResp { repeated EnvImage envs = 1; }
+
+message PrepareEnvReq {
+  string dockerfile = 1;
+  string image_ref = 2;          // upstream image instead of a Dockerfile
+  string project_id = 3;
+  string reason = 4;
+  string agent_session = 5;
+  string description = 6;
+}
+message EnvQuery { string env_id = 1; }
+message EnvStatus {
+  string env_id = 1;
+  string status = 2;
+  string message = 3;
+  string image_ref = 4;
+  string digest = 5;
+  string build_log_ref = 6;
+  EnvHealth health = 7;
+}
+
+message WorkerBrief {
+  string worker_id = 1;
+  string status = 2;
+  double cpu_load = 3;
+  uint64 disk_free_gb = 4;
+  uint32 running_tasks = 5;
+  uint32 max_parallel = 6;
+  string arch = 7;
+  string version = 8;
+  int64 last_heartbeat = 9;
+}
+message ListWorkersResp {
+  repeated WorkerBrief workers = 1;
+  uint32 queue_depth = 2;
+  uint32 running = 3;
+}
+
+service AgentApi {
+  rpc CheckBlobs(CheckBlobsReq) returns (CheckBlobsResp);
+  rpc UploadBlobs(stream BlobChunk) returns (UploadBlobsResp);
+  rpc RegisterBundle(BundleUpload) returns (Empty);
+  rpc GetBaseline(BaselineReq) returns (BaselineResp);
+  rpc SubmitTask(SubmitTaskReq) returns (TaskHandle);
+  rpc GetTask(TaskQuery) returns (TaskStatus);
+  rpc GetLog(LogQuery) returns (LogChunk);
+  rpc GetProfile(GetProfileReq) returns (ProfileResp);
+  rpc UpsertProfile(UpsertProfileReq) returns (ProfileResp);
+  rpc ListEnvs(ListEnvsReq) returns (ListEnvsResp);
+  rpc PrepareEnv(PrepareEnvReq) returns (EnvStatus);
+  rpc GetEnvStatus(EnvQuery) returns (EnvStatus);
+  rpc ListWorkers(Empty) returns (ListWorkersResp);
+}
+
+// ============================ worker api ============================
+
+message EnrollReq {
+  string enrollment_token = 1;
+  string worker_id = 2;
+  string version = 3;
+  string arch = 4;
+  uint32 cpu = 5;
+  uint64 mem_gb = 6;
+  uint64 disk_gb = 7;
+  uint32 max_parallel = 8;
+  map<string, string> labels = 9;
+}
+message EnrollResp {
+  string worker_id = 1;
+  string worker_token = 2;
+}
+
+message WorkerStats {
+  double cpu_load = 1;
+  uint64 disk_free_gb = 2;
+  uint32 running_tasks = 3;
+  repeated string cached_worktrees = 4;
+  repeated string cached_projects = 5;
+  repeated string cached_images = 6;
+  double sccache_hit_rate = 7;
+  uint32 gc_runs = 8;
+  uint64 gc_reclaimed_mb = 9;
+}
+
+message Heartbeat {
+  WorkerStats stats = 1;
+  repeated string active_task_ids = 2;
+  string status = 3;             // online|draining
+}
+
+message TaskProgress {
+  string task_id = 1;
+  string phase = 2;
+  string detail = 3;
+}
+
+message TaskDone {
+  string task_id = 1;
+  TaskResult result = 2;
+  string log_blob = 3;           // zstd-compressed log uploaded to CAS
+  uint64 log_lines = 4;
+  repeated string missing_blobs = 5;  // triggers blob_missing self-heal
+}
+
+message ImageBuildDone {
+  string env_id = 1;
+  bool ok = 2;
+  string digest = 3;
+  string message = 4;
+  string log_blob = 5;
+}
+
+message WorkerEvent {
+  oneof body {
+    Heartbeat heartbeat = 1;
+    TaskProgress progress = 2;
+    TaskDone done = 3;
+    ImageBuildDone image_done = 4;
+  }
+}
+
+message TaskAssignment {
+  string task_id = 1;
+  string project_id = 2;
+  string repo_url = 3;
+  string worktree_id = 4;
+  string task_type = 5;
+  string command = 6;
+  Manifest manifest = 7;
+  ResolvedProfile profile = 8;
+  repeated string bundle_blobs = 9;
+}
+
+message ImageBuildOrder {
+  string env_id = 1;
+  string dockerfile = 2;
+  string image_ref = 3;
+  string pull_ref = 4;
+}
+
+message ServerCmd {
+  oneof body {
+    TaskAssignment assign = 1;
+    string cancel_task_id = 2;
+    Empty drain = 3;
+    ImageBuildOrder build_image = 4;
+    Empty ping = 5;
+  }
+}
+
+message BlobReq { string hash = 1; }
+message PutBlobResp { string hash = 1; uint64 size = 2; }
+
+service WorkerApi {
+  rpc Enroll(EnrollReq) returns (EnrollResp);
+  rpc Channel(stream WorkerEvent) returns (stream ServerCmd);
+  rpc FetchBlob(BlobReq) returns (stream BlobChunk);
+  rpc PutBlob(stream BlobChunk) returns (PutBlobResp);
+}
