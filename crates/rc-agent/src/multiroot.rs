@@ -225,6 +225,13 @@ fn scan_once(
     // multi-root, demand the `multi-root` worker capability, and lock the
     // project out of every older worker — for a file layout that did not change
     // at all.
+    // Several roots produce the same root-level warning — the exclusion notice,
+    // for one — and repeating it once per directory buries whatever else the
+    // scan had to say. First occurrence wins, so the order stays meaningful;
+    // `Vec::dedup` would only catch runs.
+    let mut seen_warnings: HashSet<String> = HashSet::new();
+    warnings.retain(|w| seen_warnings.insert(w.clone()));
+
     let single = scanned.len() == 1 && layout.anchor_mount().is_empty();
     let manifest = rc_core::manifest::build_multi(
         entries,
@@ -517,6 +524,30 @@ mod tests {
             err.to_string().contains("both provide"),
             "a collision must be reported, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_warning_shared_by_every_root_is_said_once() {
+        let base = scratch("dedup-warn");
+        let app = repo(&base, "app");
+        let lib = repo(&base, "lib");
+        write(&app, "a.rs", "x");
+        write(&lib, "b.rs", "y");
+        commit(&app);
+        commit(&lib);
+
+        let app = app.canonicalize().unwrap();
+        let lib = lib.canonicalize().unwrap();
+        let layout = roots::compute(&app, std::slice::from_ref(&lib)).unwrap();
+        let excl = Excludes::new(&[], &["*.pem".to_string()]).unwrap();
+        let scan = scan_all(&layout, &excl, indexes()).unwrap();
+
+        let baseline_notes = scan
+            .warnings
+            .iter()
+            .filter(|w| w.contains("turns off the git baseline"))
+            .count();
+        assert_eq!(baseline_notes, 1, "said once, not once per root: {:?}", scan.warnings);
     }
 
     #[test]
