@@ -12,6 +12,7 @@
 //! the first time and nothing after that, and it avoids having to reason about
 //! several git mirrors materialising into one tree.
 
+use crate::excludes::Excludes;
 use crate::index::StatIndex;
 use crate::scanner::{self, Scan, ScanError};
 use rc_core::pb::{FileEntry, Manifest, RootInfo};
@@ -46,7 +47,7 @@ pub struct MultiScan {
 /// what happens to a path dependency sitting in a `.gitignore`d directory.
 pub fn scan_all(
     layout: &Layout,
-    excludes: &[&str],
+    excludes: &Excludes,
     mut open_index: impl FnMut(&Path) -> anyhow::Result<StatIndex>,
 ) -> Result<MultiScan, ScanError> {
     for attempt in 1..=scanner::MAX_SCAN_ATTEMPTS {
@@ -74,7 +75,7 @@ struct Once {
 
 fn scan_once(
     layout: &Layout,
-    excludes: &[&str],
+    excludes: &Excludes,
     open_index: &mut impl FnMut(&Path) -> anyhow::Result<StatIndex>,
 ) -> Result<Once, ScanError> {
     let mut entries: Vec<FileEntry> = Vec::new();
@@ -301,6 +302,10 @@ mod tests {
         git(dir, &["commit", "--quiet", "-m", "wip"]);
     }
 
+    fn ex(dirs: &[&str]) -> Excludes {
+        Excludes::structural(dirs)
+    }
+
     fn indexes() -> impl FnMut(&Path) -> anyhow::Result<StatIndex> {
         |_: &Path| StatIndex::open_memory()
     }
@@ -320,10 +325,10 @@ mod tests {
 
         let app = app.canonicalize().unwrap();
         let layout = roots::compute(&app, &[]).unwrap();
-        let multi = scan_all(&layout, &["target"], indexes()).unwrap();
+        let multi = scan_all(&layout, &ex(&["target"]), indexes()).unwrap();
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let single = scanner::scan(&app, &["target"], &mut idx).unwrap();
+        let single = scanner::scan(&app, &ex(&["target"]), &mut idx).unwrap();
 
         assert_eq!(paths(&multi.manifest), paths(&single.manifest));
         assert_eq!(multi.manifest.root_hash, single.manifest.root_hash);
@@ -344,7 +349,7 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let lib = lib.canonicalize().unwrap();
         let layout = roots::compute(&app, std::slice::from_ref(&lib)).unwrap();
-        let scan = scan_all(&layout, &["target"], indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&["target"]), indexes()).unwrap();
 
         assert_eq!(scan.manifest.anchor_mount, "app");
         let p = paths(&scan.manifest);
@@ -372,7 +377,7 @@ mod tests {
             &[lib.canonicalize().unwrap()],
         )
         .unwrap();
-        let scan = scan_all(&layout, &[], indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
 
         let by_path: HashMap<&str, &FileEntry> =
             scan.manifest.entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -396,7 +401,7 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let inner = app.join("vendor/inner");
         let layout = roots::compute(&app, &[inner]).unwrap();
-        let scan = scan_all(&layout, &[], indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
 
         assert_eq!(scan.scanned.len(), 1, "the outer scan already covers it");
         let p = paths(&scan.manifest);
@@ -419,7 +424,7 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let plain = {
             let mut idx = StatIndex::open_memory().unwrap();
-            scanner::scan(&app, &[], &mut idx).unwrap()
+            scanner::scan(&app, &ex(&[]), &mut idx).unwrap()
         };
         assert!(
             !paths(&plain.manifest).iter().any(|p| p.contains("local-crates")),
@@ -427,7 +432,7 @@ mod tests {
         );
 
         let layout = roots::compute(&app, &[app.join("local-crates/foo")]).unwrap();
-        let scan = scan_all(&layout, &[], indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
 
         assert_eq!(scan.scanned.len(), 2, "it has to be picked up on its own");
         assert!(
@@ -453,10 +458,10 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let lib = lib.canonicalize().unwrap();
         let layout = roots::compute(&app, std::slice::from_ref(&lib)).unwrap();
-        let first = scan_all(&layout, &[], indexes()).unwrap();
+        let first = scan_all(&layout, &ex(&[]), indexes()).unwrap();
 
         write(&lib, "b.rs", "after");
-        let second = scan_all(&layout, &[], indexes()).unwrap();
+        let second = scan_all(&layout, &ex(&[]), indexes()).unwrap();
         assert_ne!(first.manifest.root_hash, second.manifest.root_hash);
     }
 
@@ -480,7 +485,7 @@ mod tests {
         let layout = roots::compute(&app, &[app.join("a"), app.join("b")]).unwrap();
         assert_eq!(layout.roots.len(), 3, "all three are considered");
 
-        let scan = scan_all(&layout, &[], indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
         assert_eq!(scan.scanned.len(), 1, "but only the repository is scanned");
         assert_eq!(scan.manifest.anchor_mount, "");
         assert!(
@@ -505,7 +510,7 @@ mod tests {
         let layout = roots::compute(&app, &[app.join("src")]).unwrap();
         // `src` has no Cargo.toml, so it is treated as uncovered and scanned
         // standalone — which re-reads main.rs and collides.
-        let Err(err) = scan_all(&layout, &[], indexes()) else {
+        let Err(err) = scan_all(&layout, &ex(&[]), indexes()) else {
             panic!("a collision must not resolve silently");
         };
         assert!(

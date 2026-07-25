@@ -33,6 +33,12 @@ pub struct BuildProfile {
     /// is not encrypted at rest (§16), so it is not something to infer. Absent,
     /// the agent reports what it found and waits.
     pub extra_roots: Option<ExtraRoots>,
+    /// Paths that must not leave this machine, gitignore-style.
+    ///
+    /// `.gitignore` is the only other lever, and it cannot help with a file git
+    /// already tracks — a key committed years ago is synced on every check
+    /// (§4.3 deliberately syncs what git sees). This is how to keep one back.
+    pub exclude: Option<Vec<String>>,
 }
 
 /// What the repository permits beyond its own root.
@@ -107,6 +113,7 @@ const KNOWN_KEYS: &[&str] = &[
     "env",
     "tasks",
     "extra_roots",
+    "exclude",
 ];
 
 pub fn parse_toml(text: &str) -> Result<ParsedProfile, String> {
@@ -134,7 +141,11 @@ impl BuildProfile {
         macro_rules! fill {
             ($($f:ident),+) => { $( if self.$f.is_none() { self.$f = lower.$f.clone(); } )+ };
         }
-        fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands, extra_roots);
+        // `exclude` and `extra_roots` are deliberately absent: both decide what
+        // leaves the developer's machine, and only the repository's own file
+        // may answer that. Inheriting either from a fleet-learned profile would
+        // let one project's stored config change another's disclosure.
+        fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands);
         for (k, v) in &lower.env {
             self.env.entry(k.clone()).or_insert_with(|| v.clone());
         }

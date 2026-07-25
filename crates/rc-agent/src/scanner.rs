@@ -6,6 +6,7 @@
 //! produce the worst class of bug: builds that fail remotely and pass locally,
 //! with nothing in the diff to explain it (§4.3).
 
+use crate::excludes::Excludes;
 use crate::index::{Stat, StatIndex};
 use anyhow::{anyhow, Result};
 use rc_core::pb::{EntryType, FileEntry, Manifest};
@@ -83,13 +84,13 @@ pub enum Enumeration {
 }
 
 /// Enumerate, hash and package a worktree.
-pub fn scan(root: &Path, excludes: &[&str], index: &mut StatIndex) -> Result<Scan, ScanError> {
+pub fn scan(root: &Path, excludes: &Excludes, index: &mut StatIndex) -> Result<Scan, ScanError> {
     scan_with(root, excludes, index, Enumeration::Auto)
 }
 
 pub fn scan_with(
     root: &Path,
-    excludes: &[&str],
+    excludes: &Excludes,
     index: &mut StatIndex,
     mode: Enumeration,
 ) -> Result<Scan, ScanError> {
@@ -161,7 +162,23 @@ pub fn scan_with(
             }
         };
 
-        let baseline = is_git && !listing.base_commit.is_empty();
+        // The baseline travels as a git bundle, and a bundle carries reachable
+        // *history* — not just the tree at `base_commit`. Leaving a path out of
+        // the manifest therefore withholds nothing from it, and no check over
+        // the current index can prove otherwise: the file may be staged for
+        // deletion, or deleted several commits ago, and still be in the pack.
+        // So any exclusion at all costs this root its baseline.
+        let mut baseline = is_git && !listing.base_commit.is_empty();
+        if baseline && excludes.forbids_baseline() {
+            baseline = false;
+            warnings.push(format!(
+                "exclude ({}) turns off the git baseline for this directory: the baseline is a \
+                 git bundle and carries reachable history, which no per-file check can vouch for. \
+                 Every file travels individually instead, which is slower until the \
+                 content-addressed store warms up.",
+                excludes.user_patterns().join(", ")
+            ));
+        }
         let manifest = rc_core::manifest::build(entries, &listing.base_commit, baseline);
         index.set_meta("base_commit", &listing.base_commit).ok();
         index.set_meta("root_hash", &manifest.root_hash).ok();
@@ -197,7 +214,7 @@ fn git_listing(root: &Path) -> Result<Listing, ScanError> {
 
     // `--recurse-submodules` is what pulls submodule *contents* in; without it
     // git reports only the gitlink and the worker ends up missing files.
-    let tracked = git_nul(root, &["ls-files", "-z", "--recurse-submodules"])?;
+    let tracked_list = git_nul(root, &["ls-files", "-z", "--recurse-submodules"])?;
     let mut untracked = git_nul(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
 
     let submodule_prefixes = submodule_paths(root);
@@ -216,7 +233,7 @@ fn git_listing(root: &Path) -> Result<Listing, ScanError> {
 
     let mut clean = HashSet::new();
     let mut paths = Vec::new();
-    for path in tracked {
+    for path in tracked_list {
         let in_submodule = submodule_prefixes
             .iter()
             .any(|s| path.starts_with(&format!("{s}/")));
@@ -233,7 +250,7 @@ fn git_listing(root: &Path) -> Result<Listing, ScanError> {
 }
 
 /// Degraded enumeration for non-git directories (§4.3 fallback).
-fn ignore_listing(root: &Path, excludes: &[&str], standalone: bool) -> Result<Listing, ScanError> {
+fn ignore_listing(root: &Path, excludes: &Excludes, standalone: bool) -> Result<Listing, ScanError> {
     let mut paths = Vec::new();
     let mut walker = ignore::WalkBuilder::new(root);
     walker
@@ -250,7 +267,7 @@ fn ignore_listing(root: &Path, excludes: &[&str], standalone: bool) -> Result<Li
             continue;
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        if rel.is_empty() || is_excluded(&rel, excludes) {
+        if rel.is_empty() || excludes.matches(&rel) {
             continue;
         }
         let Some(ft) = entry.file_type() else { continue };
@@ -270,7 +287,7 @@ fn ignore_listing(root: &Path, excludes: &[&str], standalone: bool) -> Result<Li
 fn hash_entries(
     root: &Path,
     listing: &Listing,
-    excludes: &[&str],
+    excludes: &Excludes,
     index: &mut StatIndex,
 ) -> Result<(Vec<FileEntry>, usize, usize), ScanError> {
     let mut entries = Vec::with_capacity(listing.paths.len());
@@ -278,7 +295,7 @@ fn hash_entries(
     let (mut hashed, mut reused) = (0usize, 0usize);
 
     for path in &listing.paths {
-        if is_excluded(path, excludes) {
+        if excludes.matches(path) {
             continue;
         }
         if !rc_core::manifest::is_safe_relative_path(path) {
@@ -345,7 +362,7 @@ fn hash_entries(
 
 /// Enumerate a root the same way `scan` would, without hashing anything.
 /// Used to re-check the whole root set after a multi-root sweep.
-pub fn enumerate(root: &Path, excludes: &[&str], mode: Enumeration) -> Result<Vec<String>, ScanError> {
+pub fn enumerate(root: &Path, excludes: &Excludes, mode: Enumeration) -> Result<Vec<String>, ScanError> {
     let root = root
         .canonicalize()
         .map_err(|e| ScanError::Other(anyhow!("canonicalize {}: {e}", root.display())))?;
@@ -357,24 +374,25 @@ pub fn enumerate(root: &Path, excludes: &[&str], mode: Enumeration) -> Result<Ve
     Ok(listing
         .paths
         .into_iter()
-        .filter(|p| !is_excluded(p, excludes))
+        .filter(|p| !excludes.matches(p))
         .collect())
 }
 
 /// Stat a set of paths relative to `base`. Used across roots, where the base
 /// is the anchor and the paths are anchor-relative.
 pub fn stat_entries(base: &Path, paths: &[String]) -> HashMap<String, (u64, i64)> {
-    stat_all(base, paths, &[])
+    // Already-selected manifest paths: nothing left to filter out.
+    stat_all(base, paths, &Excludes::structural(&[]))
 }
 
 /// Stat everything that will actually end up in the manifest. Excluded paths
 /// are skipped deliberately: `target/` churns constantly while a local build
 /// runs, and letting that count as instability would reject scans over a
 /// workspace that is perfectly stable in every way that matters.
-fn stat_all(root: &Path, paths: &[String], excludes: &[&str]) -> HashMap<String, (u64, i64)> {
+fn stat_all(root: &Path, paths: &[String], excludes: &Excludes) -> HashMap<String, (u64, i64)> {
     paths
         .iter()
-        .filter(|p| !is_excluded(p, excludes))
+        .filter(|p| !excludes.matches(p))
         .filter_map(|p| {
             let meta = std::fs::symlink_metadata(root.join(p)).ok()?;
             Some((p.clone(), (meta.len(), mtime_nanos(&meta))))
@@ -401,19 +419,6 @@ fn is_executable(meta: &std::fs::Metadata) -> bool {
         let _ = meta;
         false
     }
-}
-
-/// Build-output directories are excluded even when git tracks them: syncing a
-/// multi-gigabyte `target/` defeats the point of the whole system.
-pub fn is_excluded(path: &str, excludes: &[&str]) -> bool {
-    let first = path.split('/').next().unwrap_or("");
-    if rc_core::ALWAYS_EXCLUDE.contains(&first) {
-        return true;
-    }
-    excludes.iter().any(|e| {
-        let e = e.trim_end_matches('/');
-        first == e || path.split('/').any(|c| c == e)
-    })
 }
 
 pub fn git_root(dir: &Path) -> Option<PathBuf> {
@@ -535,9 +540,14 @@ mod tests {
         std::fs::write(p, content).unwrap();
     }
 
+    fn ex(patterns: &[&str]) -> Excludes {
+        let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+        Excludes::new(&["target"], &owned).unwrap()
+    }
+
     fn scan_repo(dir: &Path) -> Scan {
         let mut idx = StatIndex::open_memory().unwrap();
-        scan(dir, &["target"], &mut idx).expect("scan should succeed")
+        scan(dir, &ex(&[]), &mut idx).expect("scan should succeed")
     }
 
     fn paths(s: &Scan) -> Vec<String> {
@@ -586,6 +596,148 @@ mod tests {
         let p = paths(&scan_repo(&d));
         assert!(!p.iter().any(|x| x.starts_with("target/")));
         assert!(p.contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn an_excluded_untracked_file_never_enters_the_manifest() {
+        let d = repo("exclude-untracked");
+        write(&d, "src/main.rs", "fn main() {}");
+        commit_all(&d);
+        write(&d, "local.pem", "-----BEGIN PRIVATE KEY-----");
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        let p = paths(&s);
+        assert!(!p.contains(&"local.pem".to_string()), "{p:?}");
+        assert!(p.contains(&"src/main.rs".to_string()));
+        // Even here the baseline goes: the pattern cannot be shown to be
+        // absent from reachable history, so nothing is claimed about it.
+        assert!(!s.manifest.baseline);
+    }
+
+    #[test]
+    fn excluding_a_tracked_file_turns_the_baseline_off() {
+        // The exclusion would otherwise be theatre: `git bundle` packs the whole
+        // tree at base_commit, so the key reaches the control plane inside the
+        // pack having never appeared in a manifest.
+        let d = repo("exclude-tracked");
+        write(&d, "src/main.rs", "fn main() {}");
+        write(&d, "private.pem", "-----BEGIN PRIVATE KEY-----");
+        commit_all(&d);
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+
+        assert!(!paths(&s).contains(&"private.pem".to_string()));
+        assert!(
+            !s.manifest.baseline,
+            "a tracked exclusion must disable the baseline, or the bundle carries it anyway"
+        );
+        assert!(
+            s.warnings.iter().any(|w| w.contains("*.pem") && w.contains("baseline")),
+            "and it must say so: {:?}",
+            s.warnings
+        );
+        // With no baseline every remaining file has to travel through the CAS,
+        // and the excluded one is not among them.
+        let reconcile = rc_core::manifest::blobs_to_reconcile(&s.manifest);
+        assert_eq!(reconcile.len(), paths(&s).len(), "everything else goes L2");
+    }
+
+    #[test]
+    fn a_secret_staged_for_deletion_still_costs_the_baseline() {
+        // `git ls-files` reads the index, so a staged deletion removes the path
+        // from every listing while HEAD — and therefore the bundle — still has
+        // it. Deciding per-path would have re-enabled the baseline here.
+        let d = repo("exclude-staged-delete");
+        write(&d, "src/main.rs", "fn main() {}");
+        write(&d, "private.pem", "-----BEGIN PRIVATE KEY-----");
+        commit_all(&d);
+        run_git(&d, &["rm", "-q", "--cached", "private.pem"]);
+        std::fs::remove_file(d.join("private.pem")).unwrap();
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        assert!(
+            !s.manifest.baseline,
+            "HEAD still carries the secret, so the bundle would too"
+        );
+    }
+
+    #[test]
+    fn a_secret_deleted_in_an_earlier_commit_still_costs_the_baseline() {
+        // The strongest case: absent from the index, absent from HEAD, absent
+        // from the working tree — and still reachable in the pack a bundle
+        // builds. No inspection of the current tree can see this.
+        let d = repo("exclude-history");
+        write(&d, "private.pem", "-----BEGIN PRIVATE KEY-----");
+        commit_all(&d);
+        run_git(&d, &["rm", "-q", "private.pem"]);
+        run_git(&d, &["commit", "--quiet", "-m", "remove the key"]);
+        write(&d, "src/main.rs", "fn main() {}");
+        commit_all(&d);
+
+        assert!(!d.join("private.pem").exists());
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        assert!(
+            !s.manifest.baseline,
+            "history still reaches the secret, so the baseline cannot be used"
+        );
+    }
+
+    #[test]
+    fn a_pattern_matching_nothing_today_still_costs_the_baseline() {
+        // Whether it matches now says nothing about what the object graph
+        // holds, so the guarantee cannot be conditioned on it.
+        let d = repo("exclude-nomatch");
+        write(&d, "src/main.rs", "fn main() {}");
+        commit_all(&d);
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        assert!(!s.manifest.baseline);
+    }
+
+    #[test]
+    fn a_directory_exclusion_keeps_its_files_out_of_the_manifest() {
+        let d = repo("exclude-dir");
+        write(&d, "src/main.rs", "fn main() {}");
+        write(&d, "secrets/prod/token", "hunter2");
+        write(&d, "secrets/readme.md", "notes");
+        commit_all(&d);
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["secrets"]), &mut idx).unwrap();
+        let p = paths(&s);
+        assert!(!p.iter().any(|x| x.starts_with("secrets/")), "{p:?}");
+        assert!(p.contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn without_exclusions_the_baseline_is_untouched() {
+        let d = repo("exclude-none");
+        write(&d, "private.pem", "-----BEGIN PRIVATE KEY-----");
+        commit_all(&d);
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&[]), &mut idx).unwrap();
+        assert!(s.manifest.baseline);
+        assert!(paths(&s).contains(&"private.pem".to_string()));
+    }
+
+    #[test]
+    fn an_exclusion_changes_the_root_hash_so_results_are_not_reused() {
+        // The manifest is a different manifest; a cached result computed while
+        // the file was still synced must not answer for one without it.
+        let d = repo("exclude-hash");
+        write(&d, "src/main.rs", "fn main() {}");
+        write(&d, "secret.txt", "sensitive");
+        commit_all(&d);
+
+        let mut a = StatIndex::open_memory().unwrap();
+        let with = scan(&d, &ex(&[]), &mut a).unwrap();
+        let mut b = StatIndex::open_memory().unwrap();
+        let without = scan(&d, &ex(&["secret.txt"]), &mut b).unwrap();
+        assert_ne!(with.manifest.root_hash, without.manifest.root_hash);
     }
 
     #[test]
@@ -747,17 +899,17 @@ mod tests {
         commit_all(&d);
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let first = scan(&d, &["target"], &mut idx).unwrap();
+        let first = scan(&d, &ex(&[]), &mut idx).unwrap();
         assert_eq!(first.hashed, 10);
         assert_eq!(first.reused, 0);
 
-        let second = scan(&d, &["target"], &mut idx).unwrap();
+        let second = scan(&d, &ex(&[]), &mut idx).unwrap();
         assert_eq!(second.reused, 10, "nothing changed, so nothing is re-hashed");
         assert_eq!(second.hashed, 0);
         assert_eq!(first.manifest.root_hash, second.manifest.root_hash);
 
         write(&d, "f3.rs", "edited content");
-        let third = scan(&d, &["target"], &mut idx).unwrap();
+        let third = scan(&d, &ex(&[]), &mut idx).unwrap();
         assert_eq!(third.hashed, 1, "only the edited file is re-hashed");
         assert_ne!(second.manifest.root_hash, third.manifest.root_hash);
     }
@@ -771,12 +923,12 @@ mod tests {
         commit_all(&d);
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let first = scan(&d, &[], &mut idx).unwrap();
+        let first = scan(&d, &Excludes::structural(&[]), &mut idx).unwrap();
         assert!(!first.first_base_commit.is_empty());
 
         write(&d, "a.rs", "v2");
         commit_all(&d);
-        let second = scan(&d, &[], &mut idx).unwrap();
+        let second = scan(&d, &Excludes::structural(&[]), &mut idx).unwrap();
 
         assert_ne!(
             first.manifest.base_commit, second.manifest.base_commit,
@@ -815,7 +967,7 @@ mod tests {
         // The scanner surfaces it as a typed error rather than a silent merge.
         let err = ScanError::CaseConflict("src/Main.rs".into(), "src/main.rs".into());
         assert!(err.to_string().contains("differ only by case"));
-        let _ = scan(&d, &[], &mut idx);
+        let _ = scan(&d, &Excludes::structural(&[]), &mut idx);
     }
 
     #[test]
@@ -827,9 +979,9 @@ mod tests {
         write(&d, "a.rs", "one");
         commit_all(&d);
 
-        let before = stat_all(&d, &["a.rs".to_string()], &[]);
+        let before = stat_all(&d, &["a.rs".to_string()], &Excludes::structural(&[]));
         write(&d, "b.rs", "appeared mid-scan");
-        let after = stat_all(&d, &["a.rs".to_string(), "b.rs".to_string()], &[]);
+        let after = stat_all(&d, &["a.rs".to_string(), "b.rs".to_string()], &Excludes::structural(&[]));
 
         let changed: Vec<&String> = before
             .keys()
@@ -845,9 +997,9 @@ mod tests {
         write(&d, "a.rs", "one");
         write(&d, "b.rs", "two");
         let paths = vec!["a.rs".to_string(), "b.rs".to_string()];
-        let before = stat_all(&d, &paths, &[]);
+        let before = stat_all(&d, &paths, &Excludes::structural(&[]));
         std::fs::remove_file(d.join("b.rs")).unwrap();
-        let after = stat_all(&d, &paths, &[]);
+        let after = stat_all(&d, &paths, &Excludes::structural(&[]));
 
         let changed: Vec<&String> = before
             .keys()
@@ -864,9 +1016,9 @@ mod tests {
         let d = repo("churn");
         write(&d, "target/debug/thing", "v1");
         let paths = vec!["target/debug/thing".to_string()];
-        let before = stat_all(&d, &paths, &["target"]);
+        let before = stat_all(&d, &paths, &ex(&[]));
         write(&d, "target/debug/thing", "v2 is a different length");
-        let after = stat_all(&d, &paths, &["target"]);
+        let after = stat_all(&d, &paths, &ex(&[]));
         assert!(before.is_empty() && after.is_empty(), "excluded paths are not watched");
     }
 
@@ -929,10 +1081,11 @@ mod tests {
 
     #[test]
     fn exclusion_matches_directories_at_any_depth() {
-        assert!(is_excluded("target/debug/foo", &["target"]));
-        assert!(is_excluded("crates/a/target/foo", &["target"]));
-        assert!(is_excluded(".git/config", &[]));
-        assert!(is_excluded("node_modules/x", &[]));
-        assert!(!is_excluded("src/target_helper.rs", &["target"]));
+        let e = ex(&[]);
+        assert!(e.matches("target/debug/foo"));
+        assert!(e.matches("crates/a/target/foo"));
+        assert!(e.matches(".git/config"));
+        assert!(e.matches("node_modules/x"));
+        assert!(!e.matches("src/target_helper.rs"));
     }
 }

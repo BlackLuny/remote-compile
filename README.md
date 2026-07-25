@@ -133,6 +133,7 @@ env = { RUSTFLAGS = "-C target-cpu=native" }
 features = ["ssr"]
 pre_commands = ["cargo run -p xtask codegen"]
 extra_roots = ["../private_tun"]                     # see below
+exclude = ["*.pem", "secrets/**"]                    # see below
 
 [tasks]
 check  = "cargo check --workspace --all-targets"
@@ -170,6 +171,43 @@ Discovery covers path dependencies (including ones inherited from
 repository, and `[patch]`/`[replace]` entries in the workspace manifest and
 `.cargo/config.toml`. When it cannot promise a complete answer it refuses to
 build rather than compiling against a guess.
+
+### Keeping files off the wire
+
+§4.3 makes git the source of truth for enumeration, so everything git tracks is
+synced. That is the right default — an ignored-but-load-bearing file breaking
+only on the worker is the bug the rule exists to prevent — but it leaves no way
+to withhold a credential the repository already tracks. `.gitignore` cannot help
+with a file that is already committed.
+
+```toml
+exclude = ["*.pem", "secrets/**", "fixtures/customer-data.json"]
+```
+
+gitignore syntax, including `!` to re-admit. Patterns are matched against paths
+relative to each root.
+
+Setting `exclude` at all turns the L1 git baseline off for that repository, and
+says so. It has to: the baseline ships as a `git bundle`, and a bundle carries
+**reachable history**, not just the tree at that commit. A key staged for
+deletion is already gone from `git ls-files` while still in `HEAD`; one deleted
+three commits ago is gone from both and still in the pack. No check over the
+current tree can vouch for an object graph, so none is attempted. The remaining
+files travel individually, which is slower until the CAS warms up — that is the
+price of the exclusion meaning something.
+
+A directory name excludes everything beneath it, as in git, and a negation
+cannot reopen an excluded directory. Patterns apply to **every** synced root,
+not just the primary: a key is a key wherever it sits. That errs towards
+withholding, and withholding too much breaks the build loudly rather than
+leaking quietly.
+
+Two things it does not do. It does not retroactively remove anything already
+uploaded; a key synced before the exclusion needs the server's CAS and the
+worker's git mirror cleaned out by hand. And it does not make the build work
+without the file — if the build reads it, the build fails remotely and passes
+locally, which is exactly the divergence §4.3 warns about. Every result names
+the active patterns for that reason.
 
 ## Admin console
 
@@ -229,9 +267,9 @@ and Slack all accept.
 ## Development
 
 ```bash
-cargo test --workspace        # 338 unit tests
+cargo test --workspace        # 358 unit tests
 cargo clippy --workspace --all-targets
-./scripts/smoke.sh            # 44 end-to-end checks against real binaries
+./scripts/smoke.sh            # 52 end-to-end checks against real binaries
 
 cd web && npm run dev         # console with hot reload, proxying to :7700
 ```

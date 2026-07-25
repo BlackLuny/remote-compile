@@ -3,6 +3,7 @@
 
 use crate::client::AgentClient;
 use crate::consent;
+use crate::excludes;
 use crate::multiroot;
 use crate::config::AgentConfig;
 use crate::index::{KnownBlobs, ResultCache, StatIndex};
@@ -66,7 +67,24 @@ impl Engine {
             client_profile.adapter.clone()
         };
         let adapter = rc_core::adapter::for_name(&adapter_name);
-        let excludes = adapter.default_exclude().to_vec();
+        // The adapter's structural exclusions plus whatever the repository asked
+        // to withhold. A bad pattern stops here rather than silently matching
+        // nothing — which would look exactly like a working exclusion until the
+        // file turned up on the server.
+        let excludes = match excludes::Excludes::new(adapter.default_exclude(), &self.repo_excludes(&root)) {
+            Ok(e) => e,
+            Err(message) => {
+                return Ok(Outcome {
+                    task_id: String::new(),
+                    kind: None,
+                    status: "config_error".into(),
+                    text: format!(
+                        "✗ {} 的 exclude 配置有问题: {message}\n改好再试；控制面不会猜测它的含义。",
+                        rc_core::profile::REPO_CONFIG_FILE
+                    ),
+                })
+            }
+        };
 
         self.cfg.ensure_dirs()?;
 
@@ -153,15 +171,25 @@ impl Engine {
             rc_core::fingerprint::compute_for(&scan.manifest.root_hash, &profile_pb, &scan.manifest.anchor_mount)
             .map_err(|e| anyhow!("{e}"))?;
 
+        // Withheld files change what the build can see, so this belongs on
+        // every answer — including the ones that never reach the network. A
+        // remote-only failure caused by an exclusion is otherwise indorsable
+        // from an ordinary compile error.
+        let exclude_note = describe_exclusions(&self.repo_excludes(&root));
+
         // ---- local result cache: answer without touching the network ----
         let results = ResultCache::open(&self.cfg.results_path())?;
         if !req.no_cache {
             if let Some((task_id, summary)) = results.get(&fingerprint, rc_core::TASK_CACHE_TTL_SECS) {
+                let text = with_note(
+                    format!("{summary}\n(本地指纹缓存命中，未重新编译；task_id={task_id})"),
+                    &exclude_note,
+                );
                 return Ok(Outcome {
                     task_id: task_id.clone(),
                     kind: Some(rc_core::ResultKind::parse_or_default(&summary)),
                     status: "done".into(),
-                    text: format!("{summary}\n(本地指纹缓存命中，未重新编译；task_id={task_id})"),
+                    text,
                 });
             }
         }
@@ -237,6 +265,7 @@ impl Engine {
             let result = handle.result.clone().unwrap_or_default();
             let mut text = format_result(&handle.task_id, &result, self.cfg.max_diagnostics, true, bytes);
             text = with_note(text, &root_note);
+            text = with_note(text, &exclude_note);
             text = with_warnings(text, &scan.warnings);
             results.put(&fingerprint, &handle.task_id, &result.kind).ok();
             return Ok(Outcome {
@@ -252,6 +281,7 @@ impl Engine {
         let status = client.get_task(&handle.task_id, wait).await?;
         let mut outcome = self.render(&status, bytes);
         outcome.text = with_note(outcome.text, &root_note);
+        outcome.text = with_note(outcome.text, &exclude_note);
         // §4.3: a degraded enumeration is exactly the situation where a
         // remote/local divergence appears, so never hide it.
         outcome.text = with_warnings(outcome.text, &scan.warnings);
@@ -421,6 +451,17 @@ impl Engine {
                  cargo 却要用它们构建。）"
             )),
         }
+    }
+
+    /// `exclude` as declared by the repository itself. Like `extra_roots`, only
+    /// the repo file counts: a pattern learned from the fleet deciding what does
+    /// or does not leave this machine would be exactly backwards.
+    fn repo_excludes(&self, root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join(rc_core::profile::REPO_CONFIG_FILE))
+            .ok()
+            .and_then(|text| rc_core::profile::parse_toml(&text).ok())
+            .and_then(|p| p.profile.exclude)
+            .unwrap_or_default()
     }
 
     /// `extra_roots` as declared by the repository itself. Only the repo file
@@ -697,6 +738,19 @@ fn describe_roots(scan: &multiroot::MultiScan) -> String {
         .map(|r| r.mount.clone())
         .collect();
     format!("同步了 {} 个目录，除主仓库外还有: {}", scan.scanned.len(), others.join(", "))
+}
+
+/// Named on every result, not just the first: an excluded file the build turns
+/// out to need fails remotely and passes locally, and the diagnostics for that
+/// look like an ordinary missing-file error with no hint of the cause.
+fn describe_exclusions(patterns: &[String]) -> String {
+    if patterns.is_empty() {
+        return String::new();
+    }
+    format!(
+        "已按 exclude 排除 ({})：这些文件没有同步，若构建需要它们，远程会失败而本地不会。",
+        patterns.join(", ")
+    )
 }
 
 fn with_note(text: String, note: &str) -> String {

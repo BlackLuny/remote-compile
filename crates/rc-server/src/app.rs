@@ -215,7 +215,17 @@ impl App {
             .upsert_project(&req.project_id, &req.repo_url, &req.project_root)?;
         self.store
             .upsert_worktree(&req.worktree_id, &req.project_id, &req.worktree_label)?;
-        self.store.note_known_commit(&req.project_id, &manifest.base_commit)?;
+        // Only a submission that actually uses the baseline may claim the
+        // commit is known. `note_known_commit` feeds `GetBaseline`, which tells
+        // the next agent it need not build a bundle — and a submission that ran
+        // with `baseline = false` uploaded no bundle at all. Recording it
+        // regardless leaves the fleet believing it can materialise a commit
+        // nothing ever delivered, and for a private repository the worker has
+        // no other way to get it. (A repo that excludes files runs this way on
+        // every check, so this is not a corner case.)
+        if manifest.baseline && !manifest.base_commit.is_empty() {
+            self.store.note_known_commit(&req.project_id, &manifest.base_commit)?;
+        }
 
         // Blobs the worker will need but the CAS does not hold.
         let needed = manifest::blobs_to_reconcile(manifest);

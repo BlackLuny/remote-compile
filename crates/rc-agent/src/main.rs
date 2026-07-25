@@ -8,6 +8,7 @@ mod client;
 mod config;
 mod consent;
 mod engine;
+mod excludes;
 mod index;
 mod mcp;
 mod multiroot;

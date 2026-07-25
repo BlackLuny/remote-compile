@@ -284,6 +284,115 @@ FP_AFTER=$(curl -s -b "$RUN/cookies" "http://127.0.0.1:$HTTP/api/tasks/$MR_TASK2
 [ -n "$FP_BEFORE" ] && [ "$FP_BEFORE" != "$FP_AFTER" ]
 check $? "editing the external root changes the fingerprint" "$FP_BEFORE vs $FP_AFTER"
 
+
+PROJECT2="$RUN/badpattern"
+mkdir -p "$PROJECT2/src"
+printf '[package]\nname = "bad"\nversion = "0.1.0"\nedition = "2021"\n' > "$PROJECT2/Cargo.toml"
+echo 'fn main() {}' > "$PROJECT2/src/main.rs"
+printf 'exclude = ["{unclosed"]\n' > "$PROJECT2/.remote-compile.toml"
+git -C "$PROJECT2" init -q -b main
+git -C "$PROJECT2" config user.email t@example.com
+git -C "$PROJECT2" config user.name t
+git -C "$PROJECT2" add -A
+git -C "$PROJECT2" commit -qm init
+
+echo "== 9. exclude =="
+# `.gitignore` cannot withhold a file git already tracks, and §4.3 deliberately
+# syncs everything git sees. `exclude` is the only lever — and for a tracked
+# file it has to defeat the baseline bundle, which packs the whole tree.
+new_repo_with_secret() {
+  local dir="$1" secret="$2"
+  mkdir -p "$dir/src"
+  printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$(basename "$dir")" > "$dir/Cargo.toml"
+  echo 'fn main() {}' > "$dir/src/main.rs"
+  echo "$secret" > "$dir/private.pem"
+  git -C "$dir" init -q -b main
+  git -C "$dir" config user.email t@example.com
+  git -C "$dir" config user.name t
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm init
+}
+
+# Baseline behaviour, on a project the server has never seen: the tracked secret
+# does reach it — inside the bundle, without ever appearing in a manifest.
+SECRET_A="rc-smoke-secret-aaaaaaaa"
+new_repo_with_secret "$RUN/secret-plain" "$SECRET_A"
+mcp "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$RUN/secret-plain\",\"wait_secs\":1}}}" >/dev/null
+# A bundle is a git packfile, so the bytes are there but zlib-compressed and not
+# greppable. What is observable is that a bundle was uploaded at all: that is
+# the route by which a tracked file reaches the server without ever appearing
+# in a manifest.
+BUNDLES_PLAIN=$(sqlite3 "$RUN/server/rc-server.sqlite" "SELECT count(*) FROM project_bundles;" 2>/dev/null)
+[ "${BUNDLES_PLAIN:-0}" -gt 0 ]
+check $? "precondition: a tracked repo uploads a baseline bundle (count=$BUNDLES_PLAIN)" ""
+
+# Same shape, with the file excluded.
+SECRET_B="rc-smoke-secret-bbbbbbbb"
+new_repo_with_secret "$RUN/secret-excluded" "$SECRET_B"
+printf 'exclude = ["*.pem"]\n' > "$RUN/secret-excluded/.remote-compile.toml"
+CHECK_EX=$(mcp "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$RUN/secret-excluded\",\"wait_secs\":1}}}")
+echo "$CHECK_EX" | grep -q 'task_id=t-'
+check $? "a check still runs with the file excluded" "$CHECK_EX"
+
+echo "$CHECK_EX" | grep -q 'exclude' && echo "$CHECK_EX" | grep -q 'baseline'
+check $? "the exclusion and its cost are both reported, not silent" "$CHECK_EX"
+
+# The whole point: the bytes are nowhere on the server — not a CAS blob, and
+# not inside a baseline bundle either.
+# Nothing in the CAS carries it — the entry was never in a manifest, so no blob
+# was ever uploaded for it.
+! grep -rq "$SECRET_B" "$RUN/server/cas" 2>/dev/null
+check $? "no CAS blob carries the excluded secret" \
+  "$(grep -rl "$SECRET_B" "$RUN/server/cas" 2>/dev/null | head -3)"
+
+# And no bundle either: excluding a tracked file turns the baseline off, which
+# is the only reason the compressed pack cannot smuggle it across.
+EX_PROJECT=$(sqlite3 "$RUN/server/rc-server.sqlite" \
+  "SELECT id FROM projects WHERE root_path LIKE '%secret-excluded';" 2>/dev/null)
+EX_BUNDLES=$(sqlite3 "$RUN/server/rc-server.sqlite" \
+  "SELECT count(*) FROM project_bundles WHERE project_id='$EX_PROJECT';" 2>/dev/null)
+[ -n "$EX_PROJECT" ] && [ "${EX_BUNDLES:-1}" = "0" ]
+check $? "and no baseline bundle was uploaded for it (project=$EX_PROJECT bundles=$EX_BUNDLES)" ""
+
+# The case that decides the whole design: the secret is gone from the working
+# tree, gone from the index and gone from HEAD — but still reachable in the
+# pack a bundle would build.
+SECRET_C="rc-smoke-secret-cccccccc"
+HIST="$RUN/secret-history"
+new_repo_with_secret "$HIST" "$SECRET_C"
+git -C "$HIST" rm -q private.pem
+git -C "$HIST" commit -qm "remove the key"
+printf 'exclude = ["*.pem"]\n' > "$HIST/.remote-compile.toml"
+git -C "$HIST" add -A && git -C "$HIST" commit -qm "exclude it"
+mcp "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$HIST\",\"wait_secs\":1}}}" >/dev/null
+HIST_PROJECT=$(sqlite3 "$RUN/server/rc-server.sqlite" \
+  "SELECT id FROM projects WHERE root_path LIKE '%secret-history';" 2>/dev/null)
+HIST_BUNDLES=$(sqlite3 "$RUN/server/rc-server.sqlite" \
+  "SELECT count(*) FROM project_bundles WHERE project_id='$HIST_PROJECT';" 2>/dev/null)
+[ -n "$HIST_PROJECT" ] && [ "${HIST_BUNDLES:-1}" = "0" ]
+check $? "a secret surviving only in git history still suppresses the bundle" \
+  "project=$HIST_PROJECT bundles=$HIST_BUNDLES"
+
+# A directory pattern must work; `secrets/` matching nothing would be silent.
+DIRP="$RUN/secret-dir"
+mkdir -p "$DIRP/src" "$DIRP/secrets/prod"
+printf '[package]\nname = "secret-dir"\nversion = "0.1.0"\nedition = "2021"\n' > "$DIRP/Cargo.toml"
+echo 'fn main() {}' > "$DIRP/src/main.rs"
+echo "rc-smoke-secret-dddddddd" > "$DIRP/secrets/prod/token"
+printf 'exclude = ["secrets"]\n' > "$DIRP/.remote-compile.toml"
+git -C "$DIRP" init -q -b main
+git -C "$DIRP" config user.email t@example.com
+git -C "$DIRP" config user.name t
+git -C "$DIRP" add -A && git -C "$DIRP" commit -qm init
+mcp "{\"jsonrpc\":\"2.0\",\"id\":34,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$DIRP\",\"wait_secs\":1}}}" >/dev/null
+! grep -rq "rc-smoke-secret-dddddddd" "$RUN/server" 2>/dev/null
+check $? "a bare directory name excludes what is beneath it" \
+  "$(grep -rl "rc-smoke-secret-dddddddd" "$RUN/server" 2>/dev/null | head -3)"
+
+BAD=$(mcp "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"path\":\"$PROJECT2\",\"wait_secs\":1}}}")
+echo "$BAD" | grep -q 'exclude'
+check $? "an unparseable exclude pattern is refused with a reason" "$BAD"
+
 echo "=================================="
 echo " passed: $PASS   failed: $FAIL"
 echo "=================================="
