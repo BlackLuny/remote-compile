@@ -18,3 +18,4 @@ tonic = { version = "0.14", features = ["channel", "transport"] }
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"

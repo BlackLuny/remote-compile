@@ -109,7 +109,7 @@ impl Runner {
             .await;
 
         let root = docker::workspace_dir(&self.cfg.work_dir(), &assignment.worktree_id);
-        workspace::ensure_writable_dir(&root, &root)?;
+        std::fs::create_dir_all(&root)?;
 
         // ---- L1 baseline ----
         let mut baseline_note = String::new();
@@ -161,7 +161,6 @@ impl Runner {
         // §7.3: the manifest is the whole truth, so anything not in it goes.
         workspace::apply_deletions(&root, &plan)?;
         workspace::verify(&root, &manifest)?;
-        workspace::make_tree_writable(&root)?;
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
         // ---- execute ----

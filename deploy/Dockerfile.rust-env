@@ -2,10 +2,6 @@
 #
 # What a usable rc environment image must provide:
 #   * the toolchain and any system libraries the project's build scripts need;
-#   * the `sccache` client binary — unused while the shared cache is off (see
-#     the README's Status section), and kept only so that re-enabling it is a
-#     flag rather than a rebuild. It costs several minutes of image build time:
-#     drop this layer if you have decided against sccache for good;
 #   * writable /rc/cargo and /rc/target mount points, because the container
 #     root filesystem is read-only (§7.1).
 #
@@ -27,12 +23,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# The client half of the shared compilation cache. Without this binary the
-# worker strips RUSTC_WRAPPER rather than failing every compile.
-RUN cargo install sccache --locked --root /usr/local && rm -rf "$CARGO_HOME"/registry
+# No sccache client here: the shared compilation cache is off (see the README's
+# Status section) and building it from source cost several minutes of every
+# image build for a binary nothing invoked. An image for RC_ENABLE_SCCACHE=1
+# has to add it back.
 
 # Mount points supplied by the worker; the rest of the filesystem is read-only.
-RUN mkdir -p /rc/cargo /rc/target /rc/sccache /rc/home /work
+#
+# World-writable because the build does not run as root: rc-worker runs it as
+# rc-worker's own uid so that what a build leaves in the shared workspace can
+# still be cleaned up before the next task (§7.3). That uid is not known when
+# this image is built, and named volumes inherit these modes.
+RUN mkdir -p /rc/cargo /rc/target /rc/home /work && chmod 0777 /rc/cargo /rc/target /rc/home /work
 ENV CARGO_HOME=/rc/cargo \
     CARGO_TARGET_DIR=/rc/target \
     HOME=/rc/home

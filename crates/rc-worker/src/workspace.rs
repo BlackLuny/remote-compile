@@ -135,72 +135,11 @@ pub fn apply_deletions(root: &Path, plan: &RebuildPlan) -> Result<()> {
     Ok(())
 }
 
-/// Create `dir` and every component of it below `root`, writable by the build
-/// container.
-///
-/// The sandbox drops all capabilities (§7.1), so the container's root does not
-/// get the usual root exemption from file permissions. These directories belong
-/// to the worker's own user, which would leave `cargo` unable to create so much
-/// as a `Cargo.lock`. Opening them costs nothing: the contents came from the
-/// submitting agent to begin with, and the whole tree is throwaway.
-pub fn ensure_writable_dir(root: &Path, dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o777);
-        let mut cur = dir;
-        loop {
-            std::fs::set_permissions(cur, perms.clone())?;
-            if cur == root {
-                break;
-            }
-            match cur.parent() {
-                Some(p) if p.starts_with(root) => cur = p,
-                _ => break,
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = root;
-    Ok(())
-}
-
-/// Open up every directory in the materialised workspace, for the reason in
-/// [`ensure_writable_dir`].
-///
-/// `write_file` covers the directories the L2 layer creates, but the L1 git
-/// baseline is extracted wholesale and arrives with git's own modes — so a
-/// `pre_command` or a build script writing anywhere but the root would still
-/// hit EACCES without this pass.
-pub fn make_tree_writable(root: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o777);
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            std::fs::set_permissions(&dir, perms.clone())?;
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                // file_type() does not follow symlinks, so a link pointing out
-                // of the tree cannot drag us along with it.
-                if entry.file_type()?.is_dir() {
-                    stack.push(entry.path());
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = root;
-    Ok(())
-}
-
 /// Write one file's content with the manifest's mode.
 pub fn write_file(root: &Path, entry: &FileEntry, data: &[u8]) -> Result<()> {
     let path = root.join(&entry.path);
     if let Some(parent) = path.parent() {
-        ensure_writable_dir(root, parent)?;
+        std::fs::create_dir_all(parent)?;
     }
     // Replace rather than truncate-in-place: the old inode may be hard-linked
     // into a cache.
@@ -225,7 +164,7 @@ pub fn set_mode(path: &Path, executable: bool) -> Result<()> {
 pub fn write_symlink(root: &Path, rel: &str, target: &str) -> Result<()> {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
-        ensure_writable_dir(root, parent)?;
+        std::fs::create_dir_all(parent)?;
     }
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]

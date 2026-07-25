@@ -66,6 +66,24 @@ pub struct RunSpec {
     pub labels: HashMap<String, String>,
 }
 
+/// `uid:gid` the build runs as — this process's own.
+///
+/// The build shares a bind-mounted workspace with the worker across tasks, and
+/// §7.3 makes the worker responsible for deleting anything the manifest does
+/// not list. A build running as container-root leaves root-owned directories
+/// behind (rc-server's own `build.rs` writes `web/dist/` during a plain
+/// `cargo check`), and an unprivileged worker can neither chmod nor empty
+/// those — the next task on that worktree dies in `apply_deletions`.
+///
+/// Matching uids fixes that whole class, and dropping root inside the sandbox
+/// is worth having on its own (§7.1). The cost is that an environment image
+/// must keep its `/rc` mount points writable by an arbitrary uid; the reference
+/// Dockerfile does.
+pub fn build_user() -> String {
+    // Safe: getuid/getgid cannot fail and touch no shared state.
+    unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
+}
+
 #[derive(Debug, Default)]
 pub struct RunOutput {
     pub exit_code: i32,
@@ -241,6 +259,7 @@ impl Sandbox {
             // `cargo: not found`. Docker already gives the container the
             // image's environment.
             cmd: Some(vec!["/bin/sh".into(), "-c".into(), spec.command.clone()]),
+            user: Some(build_user()),
             env: Some(env),
             working_dir: Some(spec.workdir.clone()),
             labels: Some(labels),
