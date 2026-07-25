@@ -267,6 +267,7 @@ impl Runner {
                 summary: classification.summary,
                 exit_code: output.exit_code,
                 truncated_diagnostics: truncated,
+                env_hints: classification.env_hints,
             }),
             log_blob,
             log_lines: combined.lines().count() as u64,

@@ -161,14 +161,29 @@ impl ResultCache {
                 at          INTEGER NOT NULL
              );",
         )?;
+        // `summary` used to hold the bare result kind, which made a cache hit
+        // strictly less informative than the miss that produced it — an
+        // env_error replayed as the word "env_error", without the missing
+        // dependency the first answer named.
+        //
+        // The whole result is stored instead, as data rather than as rendered
+        // text: rendering at write time would freeze that invocation's
+        // `max_diagnostics` and its `synced=` byte count into an answer replayed
+        // later under different settings, by a hit that synced nothing.
+        // An older row has kind = '' and is read the old way.
+        let _ = conn.execute("ALTER TABLE results ADD COLUMN kind TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE results ADD COLUMN result TEXT NOT NULL DEFAULT ''", []);
         Ok(ResultCache { conn })
     }
 
-    pub fn put(&self, fingerprint: &str, task_id: &str, summary: &str) -> Result<()> {
+    pub fn put(&self, fingerprint: &str, task_id: &str, result: &rc_core::pb::TaskResult) -> Result<()> {
+        let json = serde_json::to_string(result).unwrap_or_default();
         self.conn.execute(
-            "INSERT INTO results (fingerprint, task_id, summary, at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(fingerprint) DO UPDATE SET task_id = ?2, summary = ?3, at = ?4",
-            params![fingerprint, task_id, summary, rc_core::now_secs()],
+            "INSERT INTO results (fingerprint, task_id, summary, kind, result, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(fingerprint) DO UPDATE SET
+                task_id = ?2, summary = ?3, kind = ?4, result = ?5, at = ?6",
+            params![fingerprint, task_id, &result.kind, &result.kind, json, rc_core::now_secs()],
         )?;
         Ok(())
     }
@@ -176,17 +191,39 @@ impl ResultCache {
     /// Entries older than the TTL are ignored: builds are not perfectly
     /// deterministic, so an unbounded cache can serve a stale "success"
     /// (§5.1, risk #16).
-    pub fn get(&self, fingerprint: &str, ttl_secs: i64) -> Option<(String, String)> {
+    ///
+    /// Returns the task id, the result kind, and the stored result when there
+    /// is one — a row written before the result was kept has only the kind.
+    pub fn get(
+        &self,
+        fingerprint: &str,
+        ttl_secs: i64,
+    ) -> Option<(String, String, Option<rc_core::pb::TaskResult>)> {
         let cutoff = rc_core::now_secs() - ttl_secs;
-        self.conn
+        let (task_id, summary, kind, json): (String, String, String, String) = self
+            .conn
             .query_row(
-                "SELECT task_id, summary FROM results WHERE fingerprint = ?1 AND at > ?2",
+                "SELECT task_id, summary, kind, result FROM results
+                 WHERE fingerprint = ?1 AND at > ?2",
                 params![fingerprint, cutoff],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .ok()
-            .flatten()
+            .flatten()?;
+        // Pre-upgrade row: `summary` held the kind and nothing else. That is
+        // all it ever had, so replaying it loses nothing.
+        if kind.is_empty() {
+            return Some((task_id, summary, None));
+        }
+        match serde_json::from_str(&json) {
+            Ok(result) => Some((task_id, kind, Some(result))),
+            // A row carrying a kind but no result comes from a build that
+            // stored pre-rendered text instead. Replaying just the kind would
+            // be worse than the miss it stands in for, so treat it as a miss
+            // and let the task run again.
+            Err(_) => None,
+        }
     }
 }
 
@@ -326,10 +363,70 @@ mod tests {
     #[test]
     fn the_result_cache_honours_its_ttl() {
         let cache = ResultCache::open_memory().unwrap();
-        cache.put("fp", "t1", "success").unwrap();
+        let ok = rc_core::pb::TaskResult { kind: "success".into(), ..Default::default() };
+        cache.put("fp", "t1", &ok).unwrap();
         assert_eq!(cache.get("fp", 3600).unwrap().0, "t1");
         // Risk #16: a stale success must expire rather than mislead.
         assert!(cache.get("fp", -1).is_none());
+    }
+
+    #[test]
+    fn a_cache_hit_replays_the_whole_verdict_not_just_its_kind() {
+        // The cached answer has to be as useful as the one it stands in for.
+        // An env_error replayed as the bare word "env_error" would drop the
+        // missing dependency the first answer named — right when the agent is
+        // retrying because of it.
+        //
+        // Stored as data, not as rendered text: rendering at write time freezes
+        // that call's `max_diagnostics` and its `synced=` byte count into an
+        // answer replayed later by a hit that synced nothing.
+        let cache = ResultCache::open_memory().unwrap();
+        let env = rc_core::pb::TaskResult {
+            kind: "env_error".into(),
+            summary: "环境错误（exit 101）".into(),
+            env_hints: vec!["  - pkg-config 模块 `librrd` 未找到".into()],
+            ..Default::default()
+        };
+        cache.put("fp", "t9", &env).unwrap();
+        let (task_id, kind, cached) = cache.get("fp", 3600).unwrap();
+        assert_eq!((task_id.as_str(), kind.as_str()), ("t9", "env_error"));
+        let cached = cached.expect("the result itself must come back");
+        assert_eq!(cached.env_hints.len(), 1);
+        assert!(cached.env_hints[0].contains("librrd"));
+    }
+
+    #[test]
+    fn a_row_written_before_the_new_columns_still_reads() {
+        // The cache predates both columns; an entry written by the older agent
+        // must not start reporting a bogus kind after an upgrade.
+        let cache = ResultCache::open_memory().unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO results (fingerprint, task_id, summary, at) VALUES ('fp','t1','success',?1)",
+                params![rc_core::now_secs()],
+            )
+            .unwrap();
+        let (task_id, kind, cached) = cache.get("fp", 3600).unwrap();
+        assert_eq!((task_id.as_str(), kind.as_str()), ("t1", "success"));
+        assert!(cached.is_none(), "an old row carries no result to replay");
+    }
+
+    #[test]
+    fn a_row_holding_only_rendered_text_is_treated_as_a_miss() {
+        // An intermediate build stored the rendered string and a kind but no
+        // result. Replaying just the kind would be less useful than the miss it
+        // stands in for, so the task runs again instead.
+        let cache = ResultCache::open_memory().unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO results (fingerprint, task_id, summary, kind, result, at)
+                 VALUES ('fp','t1','✗ 环境错误 … librrd-dev …','env_error','',?1)",
+                params![rc_core::now_secs()],
+            )
+            .unwrap();
+        assert!(cache.get("fp", 3600).is_none());
     }
 
     #[test]

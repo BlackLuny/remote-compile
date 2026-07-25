@@ -1933,4 +1933,40 @@ mod tests {
         assert_eq!(reaped, vec!["old"]);
         assert_eq!(s.get_task("fresh").unwrap().unwrap().status, "queued");
     }
+
+    #[test]
+    fn a_result_stored_before_a_proto_field_existed_still_loads() {
+        // `result()` swallows deserialisation errors, so a schema addition that
+        // broke old rows would not fail loudly — every historical task would
+        // just start rendering as if it had no result at all.
+        // Every field the previous schema wrote is present; only `env_hints`,
+        // which did not exist yet, is absent. A fixture missing more than that
+        // would pass for the wrong reason.
+        let row = TaskRow {
+            result_json: r#"{"kind":"env_error","diagnostics":[],"error_count":0,"warning_count":0,
+                "log_ref":"abc","stats":{"queue_ms":0,"sync_ms":348,"build_ms":8638,"upload_ms":0,
+                "cache_hit_rate":0.0,"bytes_synced":14537},"summary":"环境错误（exit 101）",
+                "exit_code":101,"truncated_diagnostics":0}"#
+                .into(),
+            ..Default::default()
+        };
+        let result = row.result().expect("an older row must still deserialise");
+        assert_eq!(result.kind, "env_error");
+        assert_eq!(result.exit_code, 101);
+        assert_eq!(result.stats.unwrap().build_ms, 8638);
+        assert!(result.env_hints.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_profile_still_fails_loudly_rather_than_defaulting() {
+        // `try_dispatch` fails a task whose stored profile is unreadable,
+        // because a profile silently emptied into defaults goes to a worker and
+        // builds something other than what was asked for. Blanket
+        // `#[serde(default)]` would have turned that failure into a success.
+        let partial = r#"{"image":"registry/env@sha256:abc"}"#;
+        assert!(
+            serde_json::from_str::<rc_core::pb::ResolvedProfile>(partial).is_err(),
+            "a profile missing its fields must not deserialise into defaults"
+        );
+    }
 }

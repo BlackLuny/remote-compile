@@ -9,6 +9,7 @@ pub mod ansi;
 pub mod cas;
 pub mod diag;
 pub mod discover;
+pub mod envdep;
 pub mod fingerprint;
 pub mod ids;
 pub mod manifest;

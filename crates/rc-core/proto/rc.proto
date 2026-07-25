@@ -90,6 +90,9 @@ message TaskResult {
   string summary = 7;
   int32 exit_code = 8;
   uint32 truncated_diagnostics = 9;
+  // Missing system dependencies lifted out of the build log, already rendered
+  // for an agent to read. Only ever populated for env_error.
+  repeated string env_hints = 10;
 }
 
 message Empty {}

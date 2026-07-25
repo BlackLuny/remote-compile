@@ -180,14 +180,24 @@ impl Engine {
         // ---- local result cache: answer without touching the network ----
         let results = ResultCache::open(&self.cfg.results_path())?;
         if !req.no_cache {
-            if let Some((task_id, summary)) = results.get(&fingerprint, rc_core::TASK_CACHE_TTL_SECS) {
+            if let Some((task_id, kind, cached)) =
+                results.get(&fingerprint, rc_core::TASK_CACHE_TTL_SECS)
+            {
+                // Rendered now, under this call's limits, and with no synced
+                // byte count: this hit moved nothing over the network.
+                let rendered = match &cached {
+                    Some(result) => {
+                        format_result(&task_id, result, self.cfg.max_diagnostics, true, 0)
+                    }
+                    None => kind.clone(),
+                };
                 let text = with_note(
-                    format!("{summary}\n(本地指纹缓存命中，未重新编译；task_id={task_id})"),
+                    format!("{rendered}\n(本地指纹缓存命中，未重新编译；task_id={task_id})"),
                     &exclude_note,
                 );
                 return Ok(Outcome {
                     task_id: task_id.clone(),
-                    kind: Some(rc_core::ResultKind::parse_or_default(&summary)),
+                    kind: Some(rc_core::ResultKind::parse_or_default(&kind)),
                     status: "done".into(),
                     text,
                 });
@@ -263,11 +273,13 @@ impl Engine {
 
         if handle.cache_hit {
             let result = handle.result.clone().unwrap_or_default();
-            let mut text = format_result(&handle.task_id, &result, self.cfg.max_diagnostics, true, bytes);
-            text = with_note(text, &root_note);
+            let rendered = format_result(&handle.task_id, &result, self.cfg.max_diagnostics, true, bytes);
+            // Only the result is cached. The notes below describe *this*
+            // invocation's scan, and are recomputed on every call.
+            results.put(&fingerprint, &handle.task_id, &result).ok();
+            let mut text = with_note(rendered, &root_note);
             text = with_note(text, &exclude_note);
             text = with_warnings(text, &scan.warnings);
-            results.put(&fingerprint, &handle.task_id, &result.kind).ok();
             return Ok(Outcome {
                 task_id: handle.task_id,
                 kind: Some(rc_core::ResultKind::parse_or_default(&result.kind)),
@@ -287,7 +299,7 @@ impl Engine {
         outcome.text = with_warnings(outcome.text, &scan.warnings);
         if let Some(result) = &status.result {
             if rc_core::TaskState::parse_or_default(&status.status).is_terminal() {
-                results.put(&fingerprint, &status.task_id, &result.kind).ok();
+                results.put(&fingerprint, &status.task_id, result).ok();
                 // Fleet learning (§3.2/§1.1 principle 4): the first agent to
                 // get a green build teaches every other agent how.
                 if result.kind == "success" && !client_profile.found {
@@ -832,6 +844,13 @@ pub fn format_result(
         out.push_str(kind.agent_hint());
         out.push('\n');
     }
+    // Named before the diagnostics, because for an env_error there are none —
+    // and this is the only thing in the result an agent can act on without
+    // paging the log.
+    for line in &result.env_hints {
+        out.push_str(line);
+        out.push('\n');
+    }
 
     let shown: Vec<&pb::Diagnostic> = result.diagnostics.iter().take(max_diagnostics).collect();
     if !shown.is_empty() {
@@ -947,6 +966,24 @@ mod tests {
             !text.contains("rendered text"),
             "the rendered block is pure token cost inline (§11)"
         );
+    }
+
+    #[test]
+    fn an_env_error_names_the_missing_dependency_inline() {
+        // An env_error carries no diagnostics, so without this the agent's only
+        // route to the cause is paging a multi-thousand-line log — the exact
+        // context spend the whole system exists to avoid (§11).
+        let result = pb::TaskResult {
+            kind: "env_error".into(),
+            summary: "环境错误（exit 101）：error: failed to run custom build command".into(),
+            env_hints: rc_core::envdep::hint_lines(&rc_core::envdep::analyze("Could not find librrd")),
+            exit_code: 101,
+            ..Default::default()
+        };
+        let text = format_result("t-1", &result, 10, false, 0);
+        assert!(text.contains("librrd"), "{text}");
+        assert!(text.contains("librrd-dev"), "{text}");
+        assert!(text.contains("prepare_env"), "{text}");
     }
 
     #[test]

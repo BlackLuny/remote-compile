@@ -127,7 +127,16 @@ export function TaskDetail({ role }: { role: Role }) {
 
         <Card title="诊断">
           {!result || result.diagnostics.length === 0 ? (
-            <Empty>{result?.summary || "没有结构化诊断。"}</Empty>
+            <div className="space-y-2">
+              <Empty>{result?.summary || "没有结构化诊断。"}</Empty>
+              {/* An env_error has no diagnostics by definition, so this is the
+                  only place the console can say what was actually missing. */}
+              {result?.env_hints?.length ? (
+                <pre className="whitespace-pre-wrap rounded border border-[var(--color-line-soft)] bg-[var(--color-surface)] p-2 text-[12px]">
+                  {result.env_hints.join("\n")}
+                </pre>
+              ) : null}
+            </div>
           ) : (
             <div className="space-y-2">
               <div className="text-[12px] text-[var(--color-ink-dim)]">{result.summary}</div>

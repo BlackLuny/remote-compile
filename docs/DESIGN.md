@@ -186,6 +186,31 @@ attempts: [{worker, started, ended, error}]
 | `infra_error` | worker 故障/磁盘满/拉镜像失败 | 无需动作，系统自动换机重试，重试耗尽才上报 |
 | `timeout` | 超时被杀 | 视情况拆分任务或调大超时 |
 
+**env_error 必须说清缺什么。** 分类正确只解决了一半问题：agent 知道不该改代码，
+却不知道该往镜像里加什么。原生依赖缺失是最常见的一类（`-sys` crate 包裹 C 库，
+中等规模项目动辄几十个），而点名那个库的一行往往埋在几千行日志的末尾——让 agent
+翻日志正是本系统要消除的 context 开销（§11）。因此在分类时就从日志里把证据提取
+出来随结果返回：pkg-config 探测失败、`cannot find -lfoo`、缺头文件、可执行文件
+不在 PATH。
+
+**库名是事实，包名是猜测，二者必须可区分。** `<x> → lib<x>-dev` 这个惯例对
+`librrd`、`zstd` 成立，对 `openssl`（`libssl-dev`）、`alsa`（`libasound2-dev`）
+不成立，所以已知映射表优先，落到惯例的一律标注为推测。映射表按"库/可执行文件"
+分开——`curl` 命令来自 `curl` 包，`curl` 库来自 `libcurl4-openssl-dev`，一张表
+必然把其中一个搞错还声称确定。不认识的可执行文件不给猜测（二进制名与包名之间
+没有命名规律，编一个 `libprotoc-dev` 比不说更糟）；失败的 `-sys` crate 同样不给
+——它因 vendored 源码、配置、自身 panic 而失败的概率不低于缺库。
+
+**猜测需要形状，不能只凭"没找到"。** "Could not find X" 是普通英语，cargo 自己
+的输出里到处都是。所以只在 X 是已知名字或形如 `lib…` 时才采信——用白名单挡，
+不用英文词黑名单挡，后者永远列不全。同一个名字有更强证据时以更强的为准。
+
+**缺头文件要改判。** `fatal error: openssl/ssl.h: No such file` 会被通用适配器
+（§10.3）解析成一条格式完好的 error 诊断，报成 `compile_error` 正是 risk #4：
+把 agent 支去改没错的代码。因此当所有 error 诊断都是这种形状时改判 env_error；
+只要混有真正的编译错误，就仍算代码问题——反向误判会把 agent 真正该修的诊断
+藏起来，更危险。
+
 ## 4. 代码同步
 
 ### 4.1 分层传输

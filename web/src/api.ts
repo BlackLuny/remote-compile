@@ -93,6 +93,8 @@ export interface TaskResult {
   summary: string;
   exit_code: number;
   truncated_diagnostics: number;
+  // Missing system dependencies read out of the build log; env_error only.
+  env_hints?: string[];
   stats?: {
     queue_ms: number;
     sync_ms: number;

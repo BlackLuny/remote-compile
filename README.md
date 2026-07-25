@@ -119,6 +119,50 @@ completely between them (§3.5):
 | `infra_error` | worker/disk/daemon failure | nothing — already retried on other machines |
 | `timeout` | killed by the hard limit | split the task or raise `timeout_secs` |
 
+### Missing system libraries
+
+Native dependencies are the common way a build fails on a machine that is not
+yours: crates ending in `-sys` wrap a C library that has to be installed
+separately, and a mid-size Rust project drags in dozens of them. The failure
+lands as `env_error`, which is the important part — the agent is not sent to
+edit source that was never wrong. But "the environment is missing something"
+is not actionable on its own, and the line that names the library is usually
+buried thousands of lines into the log.
+
+So `check` lifts it out and reports it inline:
+
+```
+✗ 环境错误（exit 101）：error: failed to run custom build command for `rrd-sys v0.1.3` [env_error]
+环境缺依赖：用 list_envs 找可用镜像，或 prepare_env 提交 Dockerfile。
+构建日志显示环境缺少以下依赖:
+  - pkg-config 模块 `librrd` 未找到 → 可能是 librrd-dev（按命名惯例推测，需核实）
+  安装建议: apt-get install -y librrd-dev
+```
+
+Recognised: failed pkg-config probes, `cannot find -lfoo`, missing headers,
+CMake's `Could NOT find X`, and executables that were not on `PATH`.
+
+Two rules keep it honest, because a wrong answer costs more than no answer —
+acting on one means asking a human to approve a Docker image that fixes nothing:
+
+- **The name is read from the log; the package is inferred.** A guessed package
+  says so. The convention `<x> → lib<x>-dev` is right for `librrd` and `zstd`
+  and wrong for `openssl` (`libssl-dev`) and `alsa` (`libasound2-dev`), so known
+  mappings come first and are kept separate for libraries and for programs —
+  `curl` the command is `curl`, `curl` the library is `libcurl4-openssl-dev`.
+  An unrecognised *executable* gets no guess at all, because nothing links a
+  binary name to the package that ships it. Neither does a failing `-sys` crate:
+  those fail over vendored sources and configuration at least as often as over a
+  missing library.
+- **A guess needs a shape, not just an absence.** "Could not find X" is ordinary
+  English that appears throughout cargo's own output, so X is believed only when
+  it is a name already known or is visibly a library.
+
+A missing header is also *reclassified*: `fatal error: openssl/ssl.h: No such
+file` parses as a compiler error, but it is not one an agent can fix by editing
+code, so it is reported as `env_error` — unless real compile errors appear
+alongside it, in which case the code problem wins.
+
 ## Per-repo configuration
 
 Drop `.remote-compile.toml` at the repo root to pin how it builds. It is
@@ -267,7 +311,7 @@ and Slack all accept.
 ## Development
 
 ```bash
-cargo test --workspace        # 358 unit tests
+cargo test --workspace        # 407 unit tests
 cargo clippy --workspace --all-targets
 ./scripts/smoke.sh            # 52 end-to-end checks against real binaries
 
