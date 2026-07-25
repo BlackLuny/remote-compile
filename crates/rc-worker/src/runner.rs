@@ -9,7 +9,7 @@ use crate::workspace;
 use anyhow::{anyhow, Result};
 use rc_core::cas::FsCas;
 use rc_core::model::TaskType;
-use rc_core::pb::{self, TaskAssignment, TaskDone, TaskResult, TaskStats};
+use rc_core::pb::{self, EntryType, TaskAssignment, TaskDone, TaskResult, TaskStats};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -177,6 +177,16 @@ impl Runner {
         let mut missing = Vec::new();
         let mut bytes_synced = 0u64;
         for entry in &plan.fetch {
+            // An empty file carries no content, and the agent deliberately does
+            // not upload one (`blobs_to_reconcile` skips `size == 0`) — there
+            // would be nothing in it. Asking the CAS for that blob finds
+            // nothing and reports the task as missing data forever. It used to
+            // be invisible because a tracked empty file arrives with the git
+            // baseline; a root that has no baseline has no such luck.
+            if entry.size == 0 && entry.r#type != EntryType::EntrySymlink as i32 {
+                workspace::write_file(&root, entry, &[])?;
+                continue;
+            }
             let data = match self.blob(&entry.hash, client).await? {
                 Some(d) => d,
                 None => {

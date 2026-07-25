@@ -526,6 +526,23 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_file_needs_no_blob_because_none_is_ever_uploaded() {
+        // `blobs_to_reconcile` skips zero-length entries — there is nothing to
+        // transfer — so the worker must materialise them itself. Waiting on the
+        // CAS for that blob means waiting forever.
+        let empty = entry("marker.txt", b"", false);
+        let m = manifest_of(vec![empty.clone()]);
+        assert!(
+            rc_core::manifest::blobs_to_reconcile(&m).is_empty(),
+            "an empty file is never uploaded, so the worker cannot fetch it"
+        );
+
+        let root = scratch("empty-file");
+        write_file(&root, &empty, b"").unwrap();
+        verify(&root, &m).unwrap();
+    }
+
+    #[test]
     fn a_symlink_without_a_target_is_refused_before_it_reaches_a_worker() {
         // An agent predating `symlink_target`: rebuilding from `hash` would
         // produce a dangling link, so the manifest is rejected instead.
