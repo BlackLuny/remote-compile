@@ -126,8 +126,9 @@ yours: crates ending in `-sys` wrap a C library that has to be installed
 separately, and a mid-size Rust project drags in dozens of them. The failure
 lands as `env_error`, which is the important part — the agent is not sent to
 edit source that was never wrong. But "the environment is missing something"
-is not actionable on its own, and the line that names the library is usually
-buried thousands of lines into the log.
+is not actionable on its own, and the one line that names the library sits at
+no predictable place in a log thousands of lines long. Grepping for it means
+already knowing the name you are trying to learn.
 
 So `check` lifts it out and reports it inline:
 
