@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS images (
   success_count          INTEGER NOT NULL DEFAULT 0,
   total_count            INTEGER NOT NULL DEFAULT 0,
   consecutive_env_errors INTEGER NOT NULL DEFAULT 0,
+  last_env_error_project TEXT NOT NULL DEFAULT '',
   built_at               INTEGER NOT NULL DEFAULT 0,
   created_at             INTEGER NOT NULL DEFAULT 0,
   build_log_ref          TEXT NOT NULL DEFAULT '',

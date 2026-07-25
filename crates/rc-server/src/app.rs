@@ -653,7 +653,14 @@ impl App {
         self.store.add_timeline(&task.id, "finished", &task.worker_id, &result.kind)?;
 
         let digest = task.image.split_once('@').map(|(_, d)| d).unwrap_or_default();
-        self.store.record_image_outcome(digest, &result.kind)?;
+        // An env_error that named what was missing is the project asking for a
+        // library, not the image failing to work (§8.5).
+        self.store.record_image_outcome(
+            digest,
+            &result.kind,
+            &task.project_id,
+            !result.env_hints.is_empty(),
+        )?;
         self.store
             .record_profile_outcome(&task.project_id, "", kind == ResultKind::Success)?;
 

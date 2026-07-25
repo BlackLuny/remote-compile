@@ -395,15 +395,22 @@ pub fn analyze_parts(parts: &[&str]) -> Vec<MissingDep> {
         r"(?:^|[\s:])([A-Za-z0-9_./+-]+\.h(?:pp)?): No such file|'([A-Za-z0-9_./+-]+\.h(?:pp)?)' file not found",
     )
     .expect("static regex");
+    // `bash: foo: command not found`. The name must not be a bare line number:
+    // zsh writes `zsh:1: command not found: foo`, where the token before the
+    // colon is the line, not the program.
     let re_cmd_notfound =
-        regex::Regex::new(r"(?:^|[:\s])([A-Za-z0-9_.+-]+): command not found").expect("static regex");
+        regex::Regex::new(r"(?:^|[:\s])([A-Za-z0-9_.+-]*[A-Za-z_.+-][A-Za-z0-9_.+-]*): command not found")
+            .expect("static regex");
+    // …and zsh's own form, which puts the name last.
+    let re_zsh_notfound =
+        regex::Regex::new(r"command not found: ([A-Za-z0-9_.+-]+)").expect("static regex");
     // Debian's `/bin/sh` is dash, which drops the word "command". `X: not
     // found` on its own is far too common in prose and in ordinary file
     // errors — `CMakeLists.txt: not found` is not a missing program — so this
-    // form is only believed with a shell's own prefix in front of it.
-    // `/bin/sh: 1: x: not found`, `sh: line 3: x: not found`.
+    // form is only believed with a shell's own prefix in front of it:
+    // `/bin/sh: 1: x: not found`, `sh: line 3: x: not found`, `/bin/ksh: x: not found`.
     let re_sh_notfound = regex::Regex::new(
-        r"(?:^|/)(?:ba|z|da)?sh: (?:(?:line )?\d+: )?([A-Za-z0-9_.+-]+): not found",
+        r"(?:^|/)(?:ba|z|da|k|mk|a)?sh: (?:(?:line )?\d+: )?([A-Za-z0-9_.+-]+): not found",
     )
     .expect("static regex");
     let re_is_installed = regex::Regex::new(r"Is [`']([^`']+)[`'] installed").expect("static regex");
@@ -490,6 +497,7 @@ pub fn analyze_parts(parts: &[&str]) -> Vec<MissingDep> {
         // ---- programs ----
         for (m, definite) in [
             (re_cmd_notfound.captures(line), true),
+            (re_zsh_notfound.captures(line), true),
             (re_sh_notfound.captures(line), true),
             (re_is_installed.captures(line), false),
             (re_failed_tool.captures(line), false),
@@ -836,11 +844,31 @@ error: failed to run custom build command for `libudev-sys v0.1.4`
     #[test]
     fn dash_reports_a_missing_command_differently_from_bash() {
         // Debian's /bin/sh is dash: `pkg-config: not found`, no "command".
-        for log in ["/bin/sh: 1: pkg-config: not found", "sh: line 3: pkg-config: not found"] {
+        // Each of the shells a build might actually run under words this
+        // differently, and zsh puts the name *after* the message — reading its
+        // line number as the program name reported a missing `1`.
+        for log in [
+            "/bin/sh: 1: pkg-config: not found",
+            "sh: line 3: pkg-config: not found",
+            "bash: line 12: pkg-config: command not found",
+            "zsh:1: command not found: pkg-config",
+            "/bin/ksh: pkg-config: not found",
+        ] {
             let deps = analyze(log);
             assert_eq!(deps[0].name, "pkg-config", "{log}");
             assert_eq!(deps[0].kind, DepKind::Program, "{log}");
             assert_eq!(deps[0].package.as_deref(), Some("pkg-config"), "{log}");
+        }
+    }
+
+    #[test]
+    fn a_missing_pkg_config_suppresses_modules_whatever_shell_reported_it() {
+        // The module names carried by probes that could not run are not
+        // evidence; recommending libssl-dev here fixes nothing.
+        for prefix in ["zsh:1: command not found: pkg-config", "/bin/ksh: pkg-config: not found"] {
+            let deps = analyze(&format!("{prefix}\nNo package 'openssl' found"));
+            assert_eq!(deps[0].name, "pkg-config", "{prefix}");
+            assert!(!deps.iter().any(|d| d.name == "openssl"), "{prefix}: {deps:?}");
         }
     }
 

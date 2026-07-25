@@ -25,7 +25,12 @@ pub struct Store {
 /// column is `NOT NULL`, and there is no `IF NOT EXISTS` for columns.
 ///
 /// Step 0 is the initial schema, which `schema.sql` creates outright.
-const MIGRATIONS: &[&str] = &[""];
+const MIGRATIONS: &[&str] = &[
+    "",
+    // Image health has to know *which* project an env_error came from, so that
+    // one project's missing native dependency stops being charged to the image.
+    "ALTER TABLE images ADD COLUMN last_env_error_project TEXT NOT NULL DEFAULT '';",
+];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -295,7 +300,22 @@ impl Store {
         //
         // So each version gets an explicit step, applied in order and inside a
         // transaction, and `user_version` records how far a database has come.
-        apply_migrations(&conn, include_str!("schema.sql"), MIGRATIONS, version)?;
+        //
+        // A database that does not exist yet is not at version 0 — it is at the
+        // current version the moment `schema.sql` runs, because that file is
+        // kept up to date. Running the steps over it too would try to add
+        // columns it was just created with. `user_version` cannot tell the two
+        // apart (both read 0), so the tables themselves are asked.
+        let fresh: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+            [],
+            |r| r.get(0),
+        )?;
+        let steps = if fresh == 0 { &MIGRATIONS[..0] } else { MIGRATIONS };
+        apply_migrations(&conn, include_str!("schema.sql"), steps, version)?;
+        // `apply_migrations` sets `user_version` to the number of steps it was
+        // given, which for a fresh database is none of them.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         if version > 0 {
             tracing::info!(from = version, to = SCHEMA_VERSION, "database schema migrated");
         }
@@ -904,21 +924,65 @@ impl Store {
     }
 
     /// Feed a task outcome back into image health (§8.5).
-    pub fn record_image_outcome(&self, digest: &str, kind: &str) -> Result<()> {
+    /// Fold one task outcome into an image's health (§8.5).
+    ///
+    /// `env_error` is a much weaker signal about an *image* than it looks. The
+    /// common case is a project needing a native library the image was never
+    /// asked to carry: `rrd-sys` wanting `librrd` says nothing about whether
+    /// the image builds anything else. Charging that to the image took the
+    /// fleet's only image out of rotation after three checks of one repository,
+    /// and nothing put it back, because the status only ever moved one way.
+    ///
+    /// So an `env_error` counts against the image only when it is not obviously
+    /// the project's own to fix:
+    ///
+    /// * `named_missing_dep` — the log named a library or program to install.
+    ///   That is a statement about the project's needs, never about the image.
+    /// * the same project failing again. One repository retrying its own
+    ///   missing dependency is one fact, not three.
+    ///
+    /// Consecutive failures across *different* projects are what suggest the
+    /// image itself is broken. And a success now restores `failing` to
+    /// `healthy`: whatever was wrong evidently is not any more.
+    pub fn record_image_outcome(
+        &self,
+        digest: &str,
+        kind: &str,
+        project_id: &str,
+        named_missing_dep: bool,
+    ) -> Result<()> {
         if digest.is_empty() {
             return Ok(());
         }
         let success = kind == "success" || kind == "compile_error";
-        let env_error = kind == "env_error";
+        let counts_against_image = kind == "env_error" && !named_missing_dep;
         self.conn.lock().execute(
-            "UPDATE images SET total_count = total_count + 1,
+            "UPDATE images SET
+                 total_count = total_count + 1,
                  success_count = success_count + ?2,
-                 last_success_at = CASE WHEN ?2 = 1 THEN ?4 ELSE last_success_at END,
-                 consecutive_env_errors = CASE WHEN ?3 = 1 THEN consecutive_env_errors + 1 ELSE 0 END,
-                 status = CASE WHEN ?3 = 1 AND consecutive_env_errors + 1 >= 3 AND status = 'healthy'
-                               THEN 'failing' ELSE status END
+                 last_success_at = CASE WHEN ?2 = 1 THEN ?5 ELSE last_success_at END,
+                 consecutive_env_errors = CASE
+                     WHEN ?2 = 1 THEN 0
+                     WHEN ?3 = 1 AND last_env_error_project != ?4 THEN consecutive_env_errors + 1
+                     ELSE consecutive_env_errors END,
+                 last_env_error_project = CASE
+                     WHEN ?2 = 1 THEN ''
+                     WHEN ?3 = 1 THEN ?4
+                     ELSE last_env_error_project END,
+                 status = CASE
+                     WHEN ?2 = 1 AND status = 'failing' THEN 'healthy'
+                     WHEN ?3 = 1 AND last_env_error_project != ?4
+                          AND consecutive_env_errors + 1 >= 3 AND status = 'healthy'
+                     THEN 'failing'
+                     ELSE status END
              WHERE digest = ?1",
-            params![digest, i64::from(success), i64::from(env_error), now_secs()],
+            params![
+                digest,
+                i64::from(success),
+                i64::from(counts_against_image),
+                project_id,
+                now_secs()
+            ],
         )?;
         Ok(())
     }
@@ -1789,10 +1853,72 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        for _ in 0..3 {
-            s.record_image_outcome("sha256:y", "env_error").unwrap();
+        // Different projects failing in a row is what suggests the image.
+        for p in ["p1", "p2", "p3"] {
+            s.record_image_outcome("sha256:y", "env_error", p, false).unwrap();
         }
         assert_eq!(s.get_image("e1").unwrap().unwrap().status, "failing");
+    }
+
+    #[test]
+    fn a_populated_v0_database_gains_the_new_column() {
+        // The deployed database predates the migration mechanism carrying any
+        // steps, so it reads as version 0 while already holding data. It has to
+        // take the ALTER; a fresh one must not, having been created with the
+        // column already.
+        let dir = std::env::temp_dir().join(format!("rc-migrate-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rc.sqlite");
+        {
+            // The real schema, wound back to the shape the deployed database
+            // actually has: the column dropped and the version reset.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("schema.sql")).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE images DROP COLUMN last_env_error_project;
+                 INSERT INTO images (id, digest) VALUES ('e1', 'd');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 0i64).unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+        // The pre-existing row survived, and the new column is usable.
+        s.record_image_outcome("d", "env_error", "p1", false).unwrap();
+        assert_eq!(s.get_image("e1").unwrap().unwrap().consecutive_env_errors, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_project_failing_repeatedly_does_not_condemn_the_image() {
+        // The failure that motivated this: three checks of one repository whose
+        // build needs a library the image never carried took the fleet's only
+        // image out of rotation for every other project.
+        let s = store();
+        s.upsert_image(&ImageRow { id: "e1".into(), digest: "d".into(), status: "healthy".into(), ..Default::default() })
+            .unwrap();
+        for _ in 0..5 {
+            s.record_image_outcome("d", "env_error", "p-zfc", false).unwrap();
+        }
+        let img = s.get_image("e1").unwrap().unwrap();
+        assert_eq!(img.status, "healthy");
+        assert_eq!(img.consecutive_env_errors, 1, "one project is one fact");
+    }
+
+    #[test]
+    fn an_env_error_that_names_its_missing_library_is_never_the_images_fault() {
+        // "install librrd-dev" is a statement about what the project needs. The
+        // image is working exactly as built.
+        let s = store();
+        s.upsert_image(&ImageRow { id: "e1".into(), digest: "d".into(), status: "healthy".into(), ..Default::default() })
+            .unwrap();
+        for p in ["p1", "p2", "p3", "p4"] {
+            s.record_image_outcome("d", "env_error", p, true).unwrap();
+        }
+        let img = s.get_image("e1").unwrap().unwrap();
+        assert_eq!(img.status, "healthy");
+        assert_eq!(img.consecutive_env_errors, 0);
+        assert_eq!(img.total_count, 4, "still counted as a run");
     }
 
     #[test]
@@ -1800,10 +1926,29 @@ mod tests {
         let s = store();
         s.upsert_image(&ImageRow { id: "e1".into(), digest: "d".into(), status: "healthy".into(), ..Default::default() })
             .unwrap();
-        s.record_image_outcome("d", "env_error").unwrap();
-        s.record_image_outcome("d", "success").unwrap();
-        s.record_image_outcome("d", "env_error").unwrap();
+        s.record_image_outcome("d", "env_error", "p1", false).unwrap();
+        s.record_image_outcome("d", "success", "p1", false).unwrap();
+        s.record_image_outcome("d", "env_error", "p2", false).unwrap();
         assert_eq!(s.get_image("e1").unwrap().unwrap().status, "healthy");
+    }
+
+    #[test]
+    fn a_success_brings_a_failing_image_back() {
+        // `failing` used to be a one-way door: the status only ever moved from
+        // healthy, so an image condemned by a since-fixed problem stayed out of
+        // rotation forever, even after builds started passing on it again.
+        let s = store();
+        s.upsert_image(&ImageRow { id: "e1".into(), digest: "d".into(), status: "healthy".into(), ..Default::default() })
+            .unwrap();
+        for p in ["p1", "p2", "p3"] {
+            s.record_image_outcome("d", "env_error", p, false).unwrap();
+        }
+        assert_eq!(s.get_image("e1").unwrap().unwrap().status, "failing");
+
+        s.record_image_outcome("d", "success", "p1", false).unwrap();
+        let img = s.get_image("e1").unwrap().unwrap();
+        assert_eq!(img.status, "healthy");
+        assert_eq!(img.consecutive_env_errors, 0);
     }
 
     #[test]

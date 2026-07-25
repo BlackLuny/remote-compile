@@ -195,14 +195,14 @@ fn diagnostic_evidence(d: &Diagnostic) -> String {
     for line in d.rendered.lines() {
         let t = line.trim_start();
         let starts_note = t.starts_with("= note:") || t.starts_with("= help:");
-        let quotes_source = t.starts_with("-->")
-            || t.starts_with('|')
-            || t.split_once('|').is_some_and(|(head, _)| {
-                !head.is_empty() && head.chars().all(|c| c.is_ascii_digit() || c == ' ')
-            });
+        // A source snippet is always introduced by `-->`, so that alone ends a
+        // note. Testing for the gutter (`|`, `12 | …`) instead would cut the
+        // note short on its own content: linker wrappers print tables, and the
+        // line that names the missing library often comes after one.
         if starts_note {
             in_note = true;
-        } else if quotes_source || t.starts_with('=') || !line.starts_with(char::is_whitespace) {
+        } else if t.starts_with("-->") || t.starts_with('=') || !line.starts_with(char::is_whitespace)
+        {
             in_note = false;
         }
         if in_note {
@@ -500,6 +500,26 @@ mod tests {
                        = note: /usr/bin/ld: warning: unsupported property\n          \
                        /usr/bin/ld: cannot find -lssl\n          \
                        collect2: error: ld returned 1 exit status\n"
+                .into(),
+            ..Default::default()
+        }];
+        let c = classify(TaskType::Build, 101, false, &d, "error: could not compile `x`");
+        assert_eq!(c.kind, ResultKind::EnvError);
+        assert!(c.env_hints.join("\n").contains("libssl-dev"), "{:?}", c.env_hints);
+    }
+
+    #[test]
+    fn a_note_containing_a_table_is_not_cut_short_by_it() {
+        // Linker wrappers print tabular output inside a note, and the line
+        // naming the missing library comes after it. Ending the note at the
+        // first `|` discarded exactly that line.
+        let d = vec![Diagnostic {
+            level: "error".into(),
+            message: "linking with `cc` failed: exit status: 1".into(),
+            rendered: "error: linking with `cc` failed\n  \
+                       = note: linker-wrapper output:\n          \
+                       | target | status |\n          \
+                       /usr/bin/ld: cannot find -lssl\n"
                 .into(),
             ..Default::default()
         }];
