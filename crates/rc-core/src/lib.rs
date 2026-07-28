@@ -6,6 +6,7 @@
 
 pub mod adapter;
 pub mod ansi;
+pub mod arch;
 pub mod budget;
 pub mod cas;
 pub mod contract;

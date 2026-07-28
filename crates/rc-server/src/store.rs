@@ -1365,15 +1365,46 @@ impl Store {
         Ok(())
     }
 
-    pub fn finish_image_build(&self, id: &str, digest: &str, log_ref: &str, ok: bool, message: &str) -> Result<()> {
+    pub fn finish_image_build(
+        &self,
+        id: &str,
+        digest: &str,
+        log_ref: &str,
+        ok: bool,
+        message: &str,
+        arch: Option<&str>,
+    ) -> Result<()> {
+        // A successful build produces a single-platform digest; the builder's
+        // host arch is the ground truth. Failures leave arch alone unless we
+        // never had one (so list_envs / re-dispatch still know the intent).
+        let arch = arch.unwrap_or("").trim();
         self.conn.lock().execute(
             "UPDATE images SET digest = ?2, build_log_ref = ?3, built_at = ?4,
                  status = CASE WHEN ?5 = 1 THEN 'healthy' ELSE 'failing' END,
-                 message = ?6
+                 message = ?6,
+                 arch = CASE
+                     WHEN ?5 = 1 AND ?7 != '' THEN ?7
+                     WHEN arch = '' AND ?7 != '' THEN ?7
+                     ELSE arch END
              WHERE id = ?1",
-            params![id, digest, log_ref, now_secs(), i64::from(ok), message],
+            params![id, digest, log_ref, now_secs(), i64::from(ok), message, arch],
         )?;
         Ok(())
+    }
+
+    /// Look up an environment image by content digest (the trust anchor).
+    pub fn image_by_digest(&self, digest: &str) -> Result<Option<ImageRow>> {
+        if digest.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM images WHERE digest = ?1 ORDER BY built_at DESC LIMIT 1",
+                params![digest],
+                image_from_row,
+            )
+            .optional()?)
     }
 
     /// Feed a task outcome back into image health (§8.5).
@@ -2465,6 +2496,25 @@ mod tests {
         assert!(!s.is_digest_trusted("sha256:x").unwrap());
         s.approve_image("e1", "admin").unwrap();
         assert!(s.is_digest_trusted("sha256:x").unwrap());
+    }
+
+    #[test]
+    fn finish_image_build_records_builder_arch() {
+        let s = store();
+        s.upsert_image(&ImageRow {
+            id: "e1".into(),
+            status: "building".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        s.finish_image_build("e1", "sha256:arm", "", true, "ok", Some("aarch64"))
+            .unwrap();
+        let row = s.get_image("e1").unwrap().unwrap();
+        assert_eq!(row.arch, "aarch64");
+        assert_eq!(
+            s.image_by_digest("sha256:arm").unwrap().unwrap().id,
+            "e1"
+        );
     }
 
     #[test]

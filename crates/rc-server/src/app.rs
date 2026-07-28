@@ -29,7 +29,8 @@ pub struct App {
     /// waiting for the next tick.
     pub dispatch_signal: Notify,
     log_cache: Mutex<HashMap<String, Arc<Vec<String>>>>,
-    /// Environment builds already handed to a worker: env_id -> (worker, sent).
+    /// Environment builds already handed to a worker:
+    /// env_id -> (worker, host_arch, sent).
     ///
     /// An image row stays `building` for as long as the build runs, which for a
     /// real toolchain image is minutes. The dispatcher ticks every two seconds,
@@ -38,7 +39,11 @@ pub struct App {
     /// of concurrent builds. This is runtime state, not a fact about the image,
     /// so it lives here rather than in SQLite: a restart drops the worker
     /// channels too, and re-dispatching then is the correct behaviour.
-    building: Mutex<HashMap<String, (String, i64)>>,
+    ///
+    /// Host arch is captured at claim time so a successful build can stamp the
+    /// image even if the worker has already disconnected when the done event
+    /// arrives.
+    building: Mutex<HashMap<String, (String, String, i64)>>,
     /// In-memory unit progress (not written to task_events). Keyed by task_id.
     pub progress: Mutex<HashMap<String, ProgressSnapshot>>,
     /// Terminal extras (delta + history_ref) memoized per (task_id, baseline)
@@ -81,6 +86,23 @@ fn required_capabilities(manifest: Option<&pb::Manifest>) -> Vec<String> {
 /// the order goes out again, so that a worker which died mid-build does not
 /// strand the environment forever (§8.2).
 pub const IMAGE_BUILD_LEASE_SECS: i64 = 3600;
+
+/// Arch field of the environment image behind a digest-pinned ref, if any.
+fn image_arch_for_ref(store: &Store, image_ref: &str) -> String {
+    let digest = image_ref
+        .split_once('@')
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    if digest.is_empty() {
+        return String::new();
+    }
+    store
+        .image_by_digest(digest)
+        .ok()
+        .flatten()
+        .map(|r| r.arch)
+        .unwrap_or_default()
+}
 
 /// Outcome of admitting a submission.
 #[derive(Debug)]
@@ -138,10 +160,13 @@ impl App {
 
     /// Claim the right to dispatch a build for `env_id`, unless one is already
     /// in flight on a worker that is still online and inside its lease.
-    pub fn claim_image_build(&self, env_id: &str, worker: &str) -> bool {
+    ///
+    /// `arch` is the host architecture of the chosen worker — recorded so the
+    /// finished digest can be stamped even after that worker drops offline.
+    pub fn claim_image_build(&self, env_id: &str, worker: &str, arch: &str) -> bool {
         let now = rc_core::now_secs();
         let mut building = self.building.lock();
-        if let Some((holder, sent_at)) = building.get(env_id) {
+        if let Some((holder, _arch, sent_at)) = building.get(env_id) {
             let holder_alive = self
                 .workers
                 .snapshot()
@@ -155,7 +180,10 @@ impl App {
                 "image build lease expired or its worker went away; re-dispatching"
             );
         }
-        building.insert(env_id.to_string(), (worker.to_string(), now));
+        building.insert(
+            env_id.to_string(),
+            (worker.to_string(), arch.to_string(), now),
+        );
         true
     }
 
@@ -195,8 +223,13 @@ impl App {
     }
 
     /// The build finished (either way) — stop holding the slot.
-    pub fn release_image_build(&self, env_id: &str) {
-        self.building.lock().remove(env_id);
+    ///
+    /// Returns `(worker_id, host_arch)` when a claim was outstanding.
+    pub fn release_image_build(&self, env_id: &str) -> Option<(String, String)> {
+        self.building
+            .lock()
+            .remove(env_id)
+            .map(|(worker, arch, _)| (worker, arch))
     }
 
     pub fn policy(&self) -> Policy {
@@ -542,7 +575,7 @@ impl App {
             worktree_id: task.worktree_id.clone(),
             project_id: task.project_id.clone(),
             image: task.image.clone(),
-            arch: String::new(),
+            arch: self.demand_arch_for(task, profile.as_ref()),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id)?,
             required_capabilities: required_capabilities(manifest.as_ref()),
@@ -648,6 +681,16 @@ impl App {
         20
     }
 
+    /// Host arch this task must land on, or empty for "any".
+    ///
+    /// Prefers the environment image's recorded arch (digest is single-platform
+    /// once built), then the profile cargo target's arch prefix.
+    fn demand_arch_for(&self, task: &TaskRow, profile: Option<&pb::ResolvedProfile>) -> String {
+        let image_arch = image_arch_for_ref(&self.store, &task.image);
+        let target = profile.map(|p| p.target.as_str()).unwrap_or("");
+        rc_core::arch::resolve_demand_arch(&image_arch, target)
+    }
+
     /// "Why is my task still queued?" — the reason every candidate worker was
     /// rejected. Computed on demand for the console; never on a hot path.
     pub fn explain_placement(&self, task: &TaskRow) -> Vec<(String, String)> {
@@ -658,21 +701,23 @@ impl App {
         if candidates.is_empty() {
             return vec![("*".into(), "no worker is connected".into())];
         }
+        let inputs = self.store.get_task_inputs(&task.id).ok().flatten();
+        let profile: Option<pb::ResolvedProfile> = inputs
+            .as_ref()
+            .and_then(|(_, profile_json, _)| serde_json::from_str(profile_json).ok());
+        let required_capabilities = inputs
+            .as_ref()
+            .and_then(|(manifest_json, _, _)| serde_json::from_str(manifest_json).ok())
+            .map(|m: Option<pb::Manifest>| required_capabilities(m.as_ref()))
+            .unwrap_or_default();
         let demand = Demand {
             worktree_id: task.worktree_id.clone(),
             project_id: task.project_id.clone(),
             image: task.image.clone(),
-            arch: String::new(),
+            arch: self.demand_arch_for(task, profile.as_ref()),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id).unwrap_or_default(),
-            required_capabilities: self
-                .store
-                .get_task_inputs(&task.id)
-                .ok()
-                .flatten()
-                .and_then(|(manifest_json, _, _)| serde_json::from_str(&manifest_json).ok())
-                .map(|m: Option<pb::Manifest>| required_capabilities(m.as_ref()))
-                .unwrap_or_default(),
+            required_capabilities,
         };
         scheduler::explain(&candidates, &demand, &policy)
             .into_iter()

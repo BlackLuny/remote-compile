@@ -67,8 +67,13 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
     if c.status != "online" {
         return Err(Reject::NotOnline);
     }
-    if !d.arch.is_empty() && !c.arch.is_empty() && c.arch != d.arch {
-        return Err(Reject::ArchMismatch);
+    // Compare canonical labels so "arm64" workers match an "aarch64" demand.
+    if !d.arch.is_empty() && !c.arch.is_empty() {
+        let want = rc_core::arch::normalize_host_arch(&d.arch);
+        let have = rc_core::arch::normalize_host_arch(&c.arch);
+        if want.is_some() && have.is_some() && want != have {
+            return Err(Reject::ArchMismatch);
+        }
     }
     if d.excluded.iter().any(|w| w == &c.worker_id) {
         return Err(Reject::AlreadyTried);
@@ -284,6 +289,16 @@ mod tests {
         d.arch = String::new();
         let mut arm = worker("a");
         arm.arch = "aarch64".into();
+        assert!(evaluate(&arm, &d, &p).is_ok());
+    }
+
+    #[test]
+    fn arch_aliases_are_equivalent() {
+        let p = Policy::default();
+        let mut d = demand();
+        d.arch = "aarch64".into();
+        let mut arm = worker("a");
+        arm.arch = "arm64".into();
         assert!(evaluate(&arm, &d, &p).is_ok());
     }
 

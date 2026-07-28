@@ -137,7 +137,10 @@ pub fn list_envs(app: &App, req: &pb::ListEnvsReq) -> Result<Vec<pb::EnvImage>> 
         if !needles.iter().all(|n| haystack.contains(n)) {
             continue;
         }
-        if !req.arch.is_empty() && !row.arch.is_empty() && !row.arch.contains(&req.arch) {
+        if !req.arch.is_empty()
+            && !row.arch.is_empty()
+            && !rc_core::arch::worker_matches_image_arch(&req.arch, &row.arch)
+        {
             continue;
         }
         if !req.target.is_empty() && !row.targets.is_empty() && !row.targets.contains(&req.target) {
@@ -202,6 +205,10 @@ pub fn default_image_for(app: &App, adapter: &str) -> Result<Option<String>> {
 
 /// Hand pending builds to a worker that can run BuildKit (§8.2). Building is
 /// itself a sandboxed task.
+///
+/// When the image row already names a host arch, only a matching worker may
+/// build it — otherwise the digest would be the wrong platform for every task
+/// that later demands that arch.
 pub async fn dispatch_pending_builds(app: &Arc<App>) -> Result<usize> {
     let pending = app.store.list_images(Some("building"))?;
     if pending.is_empty() {
@@ -212,18 +219,19 @@ pub async fn dispatch_pending_builds(app: &Arc<App>) -> Result<usize> {
         if img.built_at > 0 {
             continue;
         }
-        let Some(worker) = app
-            .workers
-            .snapshot()
-            .into_iter()
-            .find(|w| w.status == "online" && w.free_slots() > 0)
-        else {
-            break;
+        let Some(worker) = app.workers.snapshot().into_iter().find(|w| {
+            w.status == "online"
+                && w.free_slots() > 0
+                && rc_core::arch::worker_matches_image_arch(&w.arch, &img.arch)
+        }) else {
+            // No eligible worker right now; try the next image (another may
+            // need a different arch that is available).
+            continue;
         };
         // `building` is a durable status, not evidence that nothing is running:
         // without this claim the two-second tick re-sends the same order for
         // the whole length of the build.
-        if !app.claim_image_build(&img.id, &worker.id) {
+        if !app.claim_image_build(&img.id, &worker.id, &worker.arch) {
             continue;
         }
         let order = pb::ImageBuildOrder {
@@ -242,8 +250,11 @@ pub async fn dispatch_pending_builds(app: &Arc<App>) -> Result<usize> {
             )
             .await
         {
-            app.store
-                .set_image_status(&img.id, "building", &format!("building on {}", worker.id))?;
+            app.store.set_image_status(
+                &img.id,
+                "building",
+                &format!("building on {} ({})", worker.id, worker.arch),
+            )?;
             sent += 1;
         } else {
             app.release_image_build(&img.id);
@@ -252,15 +263,23 @@ pub async fn dispatch_pending_builds(app: &Arc<App>) -> Result<usize> {
     Ok(sent)
 }
 
-/// A worker finished building. The digest now becomes the trust anchor.
+/// A worker finished building. The digest now becomes the trust anchor, and
+/// the builder's host arch is written onto the image so placement can match.
 pub fn on_build_done(app: &App, done: &pb::ImageBuildDone) -> Result<()> {
-    app.release_image_build(&done.env_id);
+    let builder_arch = app
+        .release_image_build(&done.env_id)
+        .map(|(_worker, arch)| arch)
+        .filter(|a| !a.is_empty());
+    let arch = builder_arch
+        .as_deref()
+        .and_then(rc_core::arch::normalize_host_arch);
     app.store.finish_image_build(
         &done.env_id,
         &done.digest,
         &done.log_blob,
         done.ok,
         &done.message,
+        arch.as_deref(),
     )?;
     app.metrics.incr("images_built_total", 1.0);
     if !done.ok {
@@ -430,12 +449,15 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         a.workers.connect("w1", "x86_64", "0.1.0", 4, tx);
 
-        assert!(a.claim_image_build("e1", "w1"));
-        assert!(!a.claim_image_build("e1", "w1"));
-        assert!(!a.claim_image_build("e1", "w2"), "another worker may not take it either");
+        assert!(a.claim_image_build("e1", "w1", "x86_64"));
+        assert!(!a.claim_image_build("e1", "w1", "x86_64"));
+        assert!(
+            !a.claim_image_build("e1", "w2", "x86_64"),
+            "another worker may not take it either"
+        );
 
         // A different environment is unaffected.
-        assert!(a.claim_image_build("e2", "w1"));
+        assert!(a.claim_image_build("e2", "w1", "x86_64"));
 
         // Once it finishes the slot is free again, so a rebuild can happen.
         on_build_done(
@@ -448,7 +470,72 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(a.claim_image_build("e1", "w1"));
+        assert!(a.claim_image_build("e1", "w1", "x86_64"));
+    }
+
+    #[test]
+    fn successful_build_stamps_builder_arch_on_the_image() {
+        let a = app();
+        a.store
+            .upsert_image(&ImageRow {
+                id: "e1".into(),
+                status: "building".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(a.claim_image_build("e1", "w-arm", "aarch64"));
+        on_build_done(
+            &a,
+            &pb::ImageBuildDone {
+                env_id: "e1".into(),
+                ok: true,
+                digest: "sha256:arm".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = a.store.get_image("e1").unwrap().unwrap();
+        assert_eq!(row.arch, "aarch64");
+        assert_eq!(row.digest, "sha256:arm");
+        assert_eq!(row.status, "healthy");
+    }
+
+    #[test]
+    fn list_envs_can_filter_by_stamped_arch() {
+        let a = app();
+        a.store
+            .upsert_image(&ImageRow {
+                id: "e-arm".into(),
+                image_ref: "reg/rust:arm".into(),
+                digest: "sha256:arm".into(),
+                status: "healthy".into(),
+                arch: "aarch64".into(),
+                description: "rust".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        a.store
+            .upsert_image(&ImageRow {
+                id: "e-x86".into(),
+                image_ref: "reg/rust:x86".into(),
+                digest: "sha256:x86".into(),
+                status: "healthy".into(),
+                arch: "x86_64".into(),
+                description: "rust".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let arm = list_envs(
+            &a,
+            &pb::ListEnvsReq {
+                query: "rust".into(),
+                arch: "aarch64".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(arm.len(), 1);
+        assert_eq!(arm[0].env_id, "e-arm");
     }
 
     #[test]
