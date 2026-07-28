@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 #
-# One-click rc-worker install (§8.1).
+# One-click rc-worker install / upgrade (§8.1).
 #
-#   curl -fsSL https://<your-host>/worker-install.sh | \
-#     sudo RC_SERVER=http://ctrl:7701 RC_ENROLLMENT_TOKEN=<token> sh
+# First install (needs a single-use enrollment token from the console):
+#   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
+#     | sudo RC_SERVER=http://ctrl:7701 RC_ENROLLMENT_TOKEN=<token> sh
+#
+# Upgrade to latest GitHub Release (already enrolled — no token needed):
+#   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
+#     | sudo sh
+#
+# Pin version / fork / direct URL:
+#   sudo RC_RELEASE=v0.1.1 ./deploy/worker-install.sh
+#   sudo RC_BINARY_URL=https://.../rc-worker-linux-aarch64 ./deploy/worker-install.sh
 #
 # Uninstall:
 #   sudo /usr/local/bin/rc-worker uninstall --yes && sudo rm -f /usr/local/bin/rc-worker
@@ -16,6 +25,8 @@ set -euo pipefail
 RC_SERVER="${RC_SERVER:-}"
 RC_ENROLLMENT_TOKEN="${RC_ENROLLMENT_TOKEN:-}"
 RC_BINARY_URL="${RC_BINARY_URL:-}"
+RC_GITHUB_REPO="${RC_GITHUB_REPO:-BlackLuny/remote-compile}"
+RC_RELEASE="${RC_RELEASE:-latest}"
 RC_DATA_DIR="${RC_DATA_DIR:-/var/lib/rc-worker}"
 RC_USER="${RC_USER:-rc-worker}"
 RC_MAX_PARALLEL="${RC_MAX_PARALLEL:-}"
@@ -25,28 +36,101 @@ die() { echo "error: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
 
 [ "$(id -u)" = "0" ] || die "run as root (the systemd unit and docker group need it)"
-[ -n "$RC_SERVER" ] || die "set RC_SERVER, e.g. http://control-plane:7701"
-[ -n "$RC_ENROLLMENT_TOKEN" ] || die "set RC_ENROLLMENT_TOKEN (generate one in the console: Workers → 生成 enrollment token)"
+
+host_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo x86_64 ;;
+    aarch64|arm64) echo aarch64 ;;
+    *) die "unsupported architecture: $(uname -m) (need x86_64 or aarch64)" ;;
+  esac
+}
+
+host_os() {
+  case "$(uname -s)" in
+    Linux) echo linux ;;
+    *) die "rc-worker requires Linux + Docker (got $(uname -s))" ;;
+  esac
+}
+
+release_asset_url() {
+  local name="$1"
+  local tag="$RC_RELEASE"
+  if [ "$tag" = "latest" ]; then
+    echo "https://github.com/${RC_GITHUB_REPO}/releases/latest/download/${name}"
+  else
+    case "$tag" in v*) ;; *) tag="v${tag}" ;; esac
+    echo "https://github.com/${RC_GITHUB_REPO}/releases/download/${tag}/${name}"
+  fi
+}
+
+curl_get() {
+  local url="$1" out="$2"
+  local args=(-fsSL --retry 3 --retry-delay 2 -o "$out")
+  if [ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]; then
+    args+=(-H "Authorization: Bearer ${GITHUB_TOKEN:-$GH_TOKEN}")
+  fi
+  curl "${args[@]}" "$url"
+}
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
 command -v git >/dev/null || die "git is required for the L1 baseline layer (§4.1)"
+command -v curl >/dev/null || die "curl is required to download release binaries"
+
+ENROLLED=0
+if [ -f "$RC_DATA_DIR/worker.json" ]; then
+  ENROLLED=1
+fi
+
+# First install needs server + token; upgrade of an enrolled worker needs neither.
+if [ "$ENROLLED" -eq 0 ]; then
+  [ -n "$RC_SERVER" ] || die "set RC_SERVER, e.g. http://control-plane:7701"
+  [ -n "$RC_ENROLLMENT_TOKEN" ] || die "set RC_ENROLLMENT_TOKEN (console: Workers → 生成 enrollment token)"
+fi
 
 # ---------------------------------------------------------------- binary
-if [ -n "$RC_BINARY_URL" ]; then
-  note "downloading rc-worker from $RC_BINARY_URL"
-  curl -fsSL "$RC_BINARY_URL" -o "$INSTALL_PATH.new"
-  chmod +x "$INSTALL_PATH.new"
-  mv "$INSTALL_PATH.new" "$INSTALL_PATH"
-elif [ -x "./rc-worker" ]; then
-  note "installing ./rc-worker"
-  install -m 0755 ./rc-worker "$INSTALL_PATH"
-elif [ -x "$INSTALL_PATH" ]; then
-  note "reusing the rc-worker already at $INSTALL_PATH"
-else
-  die "no binary: set RC_BINARY_URL or run this from a directory containing ./rc-worker"
-fi
-"$INSTALL_PATH" --version >/dev/null || die "$INSTALL_PATH is not runnable on this host"
+install_binary() {
+  local arch os name url tmp sums expect got
+  arch="$(host_arch)"
+  os="$(host_os)"
+  name="rc-worker-${os}-${arch}"
+  tmp="$(mktemp)"
+
+  if [ -n "$RC_BINARY_URL" ]; then
+    url="$RC_BINARY_URL"
+    note "downloading rc-worker from $url"
+    curl_get "$url" "$tmp" || die "download failed: $url"
+  elif [ -x "./rc-worker" ]; then
+    note "installing ./rc-worker"
+    install -m 0755 ./rc-worker "$INSTALL_PATH"
+    return
+  else
+    url="$(release_asset_url "$name")"
+    note "downloading $url (RC_RELEASE=$RC_RELEASE)"
+    curl_get "$url" "$tmp" || die "download failed: $url
+hint: set RC_BINARY_URL, place ./rc-worker next to this script, or check RC_RELEASE/RC_GITHUB_REPO"
+  fi
+
+  chmod +x "$tmp"
+  "$tmp" --version >/dev/null 2>&1 || die "$tmp is not runnable on this host (wrong arch?)"
+
+  sums="$(mktemp)"
+  if [ -z "$RC_BINARY_URL" ] && curl_get "$(release_asset_url SHA256SUMS)" "$sums" 2>/dev/null; then
+    expect="$(awk -v f="$name" '$2 == f { print $1; exit }' "$sums" || true)"
+    if [ -n "$expect" ]; then
+      got="$(sha256sum "$tmp" | awk '{print $1}')"
+      [ "$got" = "$expect" ] || die "SHA256 mismatch for $name (got $got want $expect)"
+      note "checksum ok ($name)"
+    fi
+  fi
+  rm -f "$sums"
+
+  install -m 0755 "$tmp" "$INSTALL_PATH"
+  rm -f "$tmp"
+}
+
+install_binary
+note "installed $($INSTALL_PATH --version 2>/dev/null || echo rc-worker) → $INSTALL_PATH"
 
 # ------------------------------------------------------------------ user
 if ! id "$RC_USER" >/dev/null 2>&1; then
@@ -74,19 +158,24 @@ chown -R "$RC_USER":"$RC_USER" "$RC_DATA_DIR"
 note "shared sccache is off by design; per-worktree target volumes still cache local crates"
 
 # ------------------------------------------------------------------ enroll
-if [ ! -f "$RC_DATA_DIR/worker.json" ]; then
+if [ "$ENROLLED" -eq 0 ]; then
   note "enrolling with $RC_SERVER"
   ENROLL_ARGS="--server $RC_SERVER --token $RC_ENROLLMENT_TOKEN"
   [ -n "$RC_MAX_PARALLEL" ] && ENROLL_ARGS="$ENROLL_ARGS --max-parallel $RC_MAX_PARALLEL"
   # shellcheck disable=SC2086
   runuser -u "$RC_USER" -- "$INSTALL_PATH" --data-dir "$RC_DATA_DIR" enroll $ENROLL_ARGS
 else
-  note "already enrolled ($RC_DATA_DIR/worker.json exists); skipping"
+  note "already enrolled ($RC_DATA_DIR/worker.json exists); keeping identity, upgrading binary only"
 fi
 
 # ----------------------------------------------------------------- systemd
-note "writing /etc/systemd/system/rc-worker.service"
-cat > /etc/systemd/system/rc-worker.service <<EOF
+UNIT=/etc/systemd/system/rc-worker.service
+# Keep a hand-tuned unit on upgrade (FORCE_UNIT=1 to rewrite).
+if [ -f "$UNIT" ] && [ "${FORCE_UNIT:-0}" != "1" ]; then
+  note "keeping existing $UNIT (FORCE_UNIT=1 to regenerate)"
+else
+  note "writing $UNIT"
+  cat > "$UNIT" <<EOF
 [Unit]
 Description=remote-compile build worker
 After=docker.service network-online.target
@@ -111,8 +200,13 @@ KillSignal=SIGINT
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 systemctl daemon-reload
 systemctl enable --now rc-worker
-note "done — follow it with: journalctl -u rc-worker -f"
+# Restart so an upgrade actually loads the new binary (enable --now is a no-op
+# when the unit was already active).
+systemctl restart rc-worker
+note "done — $($INSTALL_PATH --version 2>/dev/null || true)"
+note "follow it with: journalctl -u rc-worker -f"
 note "to take this worker out of rotation gracefully, use Drain in the console (§8.1)"

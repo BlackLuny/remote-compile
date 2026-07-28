@@ -1,0 +1,189 @@
+# Build multi-arch release binaries and publish a GitHub Release on tag push.
+#
+# Trigger:
+#   git tag -a v0.1.1 -m "v0.1.1"
+#   git push origin v0.1.1
+#
+# Or: Actions → Release → Run workflow (optional tag override).
+#
+# Assets (per platform):
+#   rc-server-{os}-{arch}
+#   rc-worker-{os}-{arch}   # Linux only (Docker sandbox)
+#   rc-agent-{os}-{arch}
+#   SHA256SUMS
+#   worker-install.sh / server-install.sh / agent-install.sh
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Publish as this tag (must already exist, e.g. v0.1.1). Empty = build artifacts only."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.asset_os }}-${{ matrix.asset_arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset_os: linux
+            asset_arch: x86_64
+            build_worker: true
+          - runner: ubuntu-24.04-arm
+            asset_os: linux
+            asset_arch: aarch64
+            build_worker: true
+          - runner: macos-14
+            asset_os: darwin
+            asset_arch: aarch64
+            build_worker: false
+          - runner: macos-13
+            asset_os: darwin
+            asset_arch: x86_64
+            build_worker: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build admin console
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build release binaries
+        run: |
+          if [ "${{ matrix.build_worker }}" = "true" ]; then
+            cargo build --release -p rc-server -p rc-worker -p rc-agent
+          else
+            # Workers need Linux + Docker; still ship server/agent for macOS hosts.
+            cargo build --release -p rc-server -p rc-agent
+          fi
+
+      - name: Package assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          os="${{ matrix.asset_os }}"
+          arch="${{ matrix.asset_arch }}"
+          mkdir -p dist
+          install -m 0755 "target/release/rc-server" "dist/rc-server-${os}-${arch}"
+          install -m 0755 "target/release/rc-agent"  "dist/rc-agent-${os}-${arch}"
+          if [ "${{ matrix.build_worker }}" = "true" ]; then
+            install -m 0755 "target/release/rc-worker" "dist/rc-worker-${os}-${arch}"
+          fi
+          # Smoke: binaries must start far enough to print --version.
+          "dist/rc-server-${os}-${arch}" --version
+          "dist/rc-agent-${os}-${arch}" --version
+          if [ -x "dist/rc-worker-${os}-${arch}" ]; then
+            "dist/rc-worker-${os}-${arch}" --version
+          fi
+          ls -la dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Tag push always publishes. workflow_dispatch only when a tag is given.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    steps:
+      - name: Checkout (install scripts)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bins-*
+          merge-multiple: true
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Binaries from every matrix leg.
+          find artifacts -type f -exec cp -v {} release/ \;
+          # Frozen install scripts so curl|sh against a release is reproducible.
+          install -m 0755 deploy/worker-install.sh release/worker-install.sh
+          install -m 0755 deploy/server-install.sh release/server-install.sh
+          install -m 0755 deploy/agent-install.sh  release/agent-install.sh
+          cd release
+          sha256sum rc-* *.sh > SHA256SUMS
+          ls -la
+          cat SHA256SUMS
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) tag="v${tag}" ;;
+          esac
+          echo "name=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/rc-server-*
+            release/rc-worker-*
+            release/rc-agent-*
+            release/worker-install.sh
+            release/server-install.sh
+            release/agent-install.sh
+            release/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

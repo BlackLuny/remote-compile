@@ -44,6 +44,54 @@ coding agent ──MCP/stdio──► rc-agent ──gRPC──► rc-server ─
 
 ## Quick start
 
+### From GitHub Releases (recommended)
+
+Binaries are published for **linux/darwin × x86_64/aarch64** on every `v*` tag
+(see [Releases](https://github.com/BlackLuny/remote-compile/releases)).
+
+```bash
+# 1. control plane (Linux)
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/server-install.sh \
+  | sudo sh
+sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server \
+  admin --username admin --password '<password>'
+# console → http://127.0.0.1:7700     agents/workers → :7701
+
+# 2. compile machine (Linux + Docker; x86_64 or aarch64 — arch is auto-detected)
+TOKEN=$(sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server enroll-token)
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
+  | sudo RC_SERVER=http://<control-plane>:7701 RC_ENROLLMENT_TOKEN="$TOKEN" sh
+
+# 3. dev machine (Linux or macOS → ~/.local/bin/rc-agent)
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | sh
+# on the control plane:
+sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server agent-token
+rc-agent configure --server http://<control-plane>:7701 --token <agent-token>
+```
+
+### Upgrade
+
+Same install scripts replace the binary and restart the unit; **data dirs and
+worker enrollments are kept**. Order: control plane → workers → agents.
+
+```bash
+# control plane
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/server-install.sh \
+  | sudo sh
+
+# each worker (no enrollment token needed if already enrolled)
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
+  | sudo sh
+
+# each dev machine
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | sh
+```
+
+Pin a version: `RC_RELEASE=v0.1.1`. Private mirror / fork: `RC_GITHUB_REPO=org/repo`.
+Direct URL: `RC_BINARY_URL=https://…/rc-worker-linux-aarch64`.
+
+### Build from source
+
 ```bash
 # 1. build everything (the console is embedded into the rc-server binary)
 cd web && npm install && npm run build && cd ..
@@ -369,6 +417,24 @@ cd web && npm run dev         # console with hot reload, proxying to :7700
 `scripts/smoke.sh` starts a real control plane, drives the MCP server over
 stdio, and asserts the whole admission path: the approval gate, L1 baseline
 sync, L2 content-addressed sync, CAS dedup, blob pinning and supersede.
+
+## Cutting a release
+
+1. Land the change on `main` (CI runs tests on every PR/push).
+2. Bump and tag (pushes branch + `v*` tag; GitHub Actions builds multi-arch
+   binaries and publishes a Release with install scripts + `SHA256SUMS`):
+
+```bash
+./scripts/tag-release.sh 0.1.1          # bumps Cargo.toml, commits, tags v0.1.1, pushes
+# or, if version is already bumped:
+./scripts/tag-release.sh                # tags current workspace version
+```
+
+3. Watch **Actions → Release**. When it finishes, the upgrade one-liners above
+   pull the new artifacts.
+
+Asset naming: `rc-{server,worker,agent}-{linux,darwin}-{x86_64,aarch64}`.
+Workers are Linux-only (Docker sandbox). Agents also ship for macOS.
 
 ## Status
 

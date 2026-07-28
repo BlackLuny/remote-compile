@@ -1,0 +1,37 @@
+# Pull-request / main smoke: unit tests and a release-profile compile of all crates.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build console (embedded into rc-server)
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release -p rc-server -p rc-worker -p rc-agent
