@@ -76,7 +76,8 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
   die "tag $TAG already exists (delete it first if you meant to re-cut)"
 fi
 
-if [ -n "$(git status --porcelain)" ]; then
+# Ignore untracked noise (e.g. local .omc/); only block on modified tracked files.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   die "working tree is dirty; commit or stash before tagging"
 fi
 
