@@ -41,21 +41,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          # Build on Ubuntu 22.04 so binaries link against glibc ≤ 2.35 and run
+          # on Debian 12 / older enterprise hosts (24.04 needs GLIBC_2.39).
+          - runner: ubuntu-22.04
             asset_os: linux
             asset_arch: x86_64
             build_worker: true
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             asset_os: linux
             asset_arch: aarch64
             build_worker: true
           - runner: macos-14
             asset_os: darwin
             asset_arch: aarch64
-            build_worker: false
-          - runner: macos-13
-            asset_os: darwin
-            asset_arch: x86_64
             build_worker: false
 
     steps:

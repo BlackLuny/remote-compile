@@ -88,7 +88,13 @@ download_binary() {
   curl_get "$url" "$tmp" || die "download failed: $url
 hint: set RC_BINARY_URL, or place ./rc-server next to this script, or check RC_RELEASE/RC_GITHUB_REPO"
   chmod +x "$tmp"
-  "$tmp" --version >/dev/null 2>&1 || die "downloaded file is not a runnable rc-server for this host"
+  if ! "$tmp" --version >/dev/null 2>&1; then
+    echo "---- binary probe ----" >&2
+    file "$tmp" 2>/dev/null || true
+    "$tmp" --version 2>&1 || true
+    ldd "$tmp" 2>&1 | head -20 || true
+    die "downloaded file is not a runnable rc-server for this host (glibc too old? rebuild on Ubuntu 22.04)"
+  fi
   # Best-effort checksum when publishing a full release.
   sums="$(mktemp)"
   if curl_get "$(release_asset_url SHA256SUMS)" "$sums" 2>/dev/null; then
