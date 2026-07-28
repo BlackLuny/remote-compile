@@ -149,6 +149,10 @@ message SubmitTaskReq {
   string fingerprint = 11;
   string bundle_blob = 12;       // optional git bundle blob for the baseline layer
   bool no_cache = 13;
+  // Hosts the repository asks the build to be able to reach (§7.1). A request,
+  // not a grant: the control plane decides, and only what it approves is ever
+  // handed to a worker.
+  repeated string egress = 14;
 }
 
 message TaskHandle {
@@ -160,6 +164,11 @@ message TaskHandle {
   repeated string missing_blobs = 5;
   bool subscribed = 6;           // 挂到了已有的同指纹任务上，而非新建
   string message = 7;
+  // 已登记但尚未批准的出网域名：构建照跑，只是这些域名还不可达。
+  repeated string egress_pending = 8;
+  // 因为该 project 的审批队列已满而根本没有登记的域名。它们不会出现在
+  // 审批队列里，所以必须在这里说出来，否则 agent 只会看到一个普通的网络错误。
+  repeated string egress_refused = 9;
 }
 
 message TaskQuery {
@@ -385,6 +394,10 @@ message TaskAssignment {
   Manifest manifest = 7;
   ResolvedProfile profile = 8;
   repeated string bundle_blobs = 9;
+  // Approved egress for this project, decided by the control plane. The worker
+  // unions this with its own allowlist for this task only; it never reads the
+  // agent's request, which arrives unvetted.
+  repeated string egress_allow = 10;
 }
 
 message ImageBuildOrder {

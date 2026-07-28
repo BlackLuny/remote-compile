@@ -24,6 +24,19 @@ pub struct WorkerConfig {
     /// the only lever left against exfiltration through an allowed host
     /// (§7.1/§16).
     pub egress_byte_cap: u64,
+    /// Let the proxy dial loopback, RFC1918 and link-local addresses. Off by
+    /// default: an allowlisted *name* says nothing about where it resolves, and
+    /// `169.254.169.254` or a wildcard-DNS name pointing at 127.0.0.1 would
+    /// otherwise turn one approval into access to the worker's own network.
+    /// Operators whose registry genuinely lives on a private address turn this
+    /// on knowing what it costs.
+    #[serde(default)]
+    pub allow_private_egress: bool,
+    /// Ports the egress proxy may dial. Defaults to 80/443; an operator whose
+    /// allowlist names an internal mirror on another port adds it here rather
+    /// than discovering a 403 after an upgrade.
+    #[serde(default = "default_egress_ports")]
+    pub egress_ports: Vec<u16>,
     /// Give up on a worktree's caches after this long without a task (§9).
     pub worktree_idle_days: i64,
     /// Refuse new work below this much free disk.
@@ -57,11 +70,17 @@ impl Default for WorkerConfig {
             cpus: 4.0,
             pids_limit: 2048,
             egress_byte_cap: 2 * 1024 * 1024 * 1024,
+            allow_private_egress: false,
+            egress_ports: default_egress_ports(),
             worktree_idle_days: 14,
             min_disk_free_gb: 20,
             labels: Default::default(),
         }
     }
+}
+
+fn default_egress_ports() -> Vec<u16> {
+    crate::proxy::DEFAULT_DIALABLE_PORTS.to_vec()
 }
 
 fn default_parallelism() -> u32 {
@@ -165,6 +184,29 @@ mod tests {
         cfg.save().unwrap();
         let mode = std::fs::metadata(WorkerConfig::path_in(&dir)).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "worker token must not be readable by others");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_worker_enrolled_before_the_egress_settings_existed_keeps_working() {
+        // An upgrade must not turn an existing worker.json into a parse error,
+        // and the defaults it picks up have to be the safe ones rather than
+        // whatever serde would zero-fill.
+        let dir = std::env::temp_dir().join(format!("rc-wold-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            WorkerConfig::path_in(&dir),
+            r#"{"server":"http://x","worker_id":"w1","worker_token":"t",
+                "data_dir":".","max_parallel":2,"allowlist":["crates.io"],
+                "memory_mb":1024,"cpus":1.0,"pids_limit":64,
+                "egress_byte_cap":1024,"worktree_idle_days":7,
+                "min_disk_free_gb":1,"labels":{}}"#,
+        )
+        .unwrap();
+
+        let cfg = WorkerConfig::load(&dir).unwrap();
+        assert_eq!(cfg.egress_ports, vec![80, 443]);
+        assert!(!cfg.allow_private_egress, "the worker's own network stays closed by default");
         std::fs::remove_dir_all(&dir).ok();
     }
 

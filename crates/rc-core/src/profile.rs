@@ -39,6 +39,27 @@ pub struct BuildProfile {
     /// already tracks — a key committed years ago is synced on every check
     /// (§4.3 deliberately syncs what git sees). This is how to keep one back.
     pub exclude: Option<Vec<String>>,
+    /// Paths to sync even though `.gitignore` hides them, gitignore-style.
+    ///
+    /// The mirror image of `exclude`, and it exists because §4.3 takes git as
+    /// the definition of what exists: a generated file the build `include!`s but
+    /// `.gitignore` covers is in none of git's three lists, so it never travels,
+    /// and the remote failure — a missing module — names nothing that appears in
+    /// any diff. Only the repository may declare it: like `exclude`, this
+    /// decides what leaves the machine.
+    ///
+    /// `exclude` wins where the two overlap, so withholding a file is never
+    /// undone by a broader include.
+    pub include: Option<Vec<String>>,
+    /// Hosts the build needs to reach, beyond the fleet's default allowlist
+    /// (§7.1) — an internal registry, a private git host.
+    ///
+    /// A request, never a grant. The sandbox has no route anywhere except the
+    /// worker's proxy, and the proxy answers for a host only once an
+    /// administrator has approved it for this project: an allowlist entry is a
+    /// hole in the sandbox that §16 shows cannot be closed again from inside.
+    /// Like `exclude` and `include`, only the repository's own file may ask.
+    pub egress: Option<Vec<String>>,
 }
 
 /// What the repository permits beyond its own root.
@@ -114,6 +135,8 @@ const KNOWN_KEYS: &[&str] = &[
     "tasks",
     "extra_roots",
     "exclude",
+    "include",
+    "egress",
 ];
 
 pub fn parse_toml(text: &str) -> Result<ParsedProfile, String> {
@@ -141,10 +164,11 @@ impl BuildProfile {
         macro_rules! fill {
             ($($f:ident),+) => { $( if self.$f.is_none() { self.$f = lower.$f.clone(); } )+ };
         }
-        // `exclude` and `extra_roots` are deliberately absent: both decide what
-        // leaves the developer's machine, and only the repository's own file
-        // may answer that. Inheriting either from a fleet-learned profile would
-        // let one project's stored config change another's disclosure.
+        // `exclude`, `include`, `egress` and `extra_roots` are deliberately
+        // absent: all four decide what leaves the developer's machine — or what
+        // the sandbox may reach — and only the repository's own file may answer
+        // that. Inheriting one from a fleet-learned profile would let one
+        // project's stored config change another's disclosure.
         fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands);
         for (k, v) in &lower.env {
             self.env.entry(k.clone()).or_insert_with(|| v.clone());
@@ -210,6 +234,14 @@ impl Resolution {
         features.sort();
         features.dedup();
         push("features", &features.join(","));
+        // Two builds that could reach different networks are not the same
+        // build, so a cached verdict must not carry across a change here.
+        // Sorted like `features`: reordering the lines in a config file does not
+        // change what the build can reach, and should not cost a rebuild.
+        let mut egress = p.egress.clone().unwrap_or_default();
+        egress.sort();
+        egress.dedup();
+        push("egress", &egress.join(","));
         // Order of pre_commands is semantically meaningful, so it is preserved.
         for (i, c) in p.pre_commands.clone().unwrap_or_default().iter().enumerate() {
             push(&format!("pre_commands[{i}]"), c);
@@ -295,6 +327,32 @@ clippy = "cargo clippy -- -D warnings"
     }
 
     #[test]
+    fn a_server_layer_cannot_supply_include_or_exclude() {
+        // Both decide what leaves this machine. A fleet-learned value doing so
+        // for a repository that never asked is the one direction this chain
+        // must not have — see `overlay`.
+        let (merged, _) = resolve(vec![
+            (ProfileSource::Repo, p("adapter = \"rust\"")),
+            (
+                ProfileSource::Server,
+                p("include = [\"*.generated.rs\"]\nexclude = [\"*.pem\"]"),
+            ),
+        ]);
+        assert_eq!(merged.include, None);
+        assert_eq!(merged.exclude, None);
+    }
+
+    #[test]
+    fn include_is_a_known_key() {
+        let parsed = parse_toml("include = [\"common/src/prisma.generated.rs\"]\n").unwrap();
+        assert!(parsed.unknown_keys.is_empty(), "{:?}", parsed.unknown_keys);
+        assert_eq!(
+            parsed.profile.include.as_deref(),
+            Some(&["common/src/prisma.generated.rs".to_string()][..])
+        );
+    }
+
+    #[test]
     fn empty_layers_do_not_claim_authorship() {
         let (_, source) = resolve(vec![
             (ProfileSource::Explicit, BuildProfile::default()),
@@ -347,6 +405,21 @@ clippy = "cargo clippy -- -D warnings"
     #[test]
     fn pre_command_order_matters() {
         let mut a = BuildProfile::default();
+        // The control plane strips `pre_commands` off a learned profile by
+        // clearing the field and re-serialising, so "cleared" has to actually
+        // mean "absent from the toml" — if the key survived as an empty value
+        // an unapproved script would still be shipped to every other agent.
+        let mut stripped = BuildProfile {
+            adapter: Some("rust".into()),
+            pre_commands: Some(vec!["cargo run -p xtask codegen".into()]),
+            ..Default::default()
+        };
+        assert!(to_toml(&stripped).contains("pre_commands"));
+        stripped.pre_commands = None;
+        let text = to_toml(&stripped);
+        assert!(!text.contains("pre_commands"), "{text}");
+        assert!(parse_toml(&text).unwrap().profile.pre_commands.is_none());
+
         a.pre_commands = Some(vec!["one".into(), "two".into()]);
         let mut b = BuildProfile::default();
         b.pre_commands = Some(vec!["two".into(), "one".into()]);

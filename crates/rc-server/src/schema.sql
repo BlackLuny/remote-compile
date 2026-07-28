@@ -57,6 +57,43 @@ CREATE TABLE IF NOT EXISTS images (
   build_log_ref          TEXT NOT NULL DEFAULT '',
   message                TEXT NOT NULL DEFAULT ''
 );
+-- Hosts a project's builds may reach beyond the fleet default (§7.1). The
+-- repository asks; an administrator decides. Scoped to one project on purpose:
+-- an allowlist entry is a channel data can be encoded out through (§16), so one
+-- project's dependency source is not another project's build script's business.
+CREATE TABLE IF NOT EXISTS egress (
+  project_id   TEXT NOT NULL,
+  host         TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending_approval',
+  reason       TEXT NOT NULL DEFAULT '',
+  requested_by TEXT NOT NULL DEFAULT '',
+  approved_by  TEXT NOT NULL DEFAULT '',
+  approved_at  INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, host)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_status ON egress(status);
+
+-- Fleet-learned `pre_commands`. The rest of a profile decides which image and
+-- which command a build uses; this is arbitrary shell running inside another
+-- project's sandbox, so the fleet may not pass it on unasked. A repository
+-- running its own `pre_commands` needs no approval — approval is for teaching
+-- them to agents that never asked. Keyed by content digest, so editing the
+-- script asks again.
+CREATE TABLE IF NOT EXISTS pre_commands (
+  project_id   TEXT NOT NULL,
+  path         TEXT NOT NULL DEFAULT '',
+  digest       TEXT NOT NULL,
+  commands     TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'pending_approval',
+  requested_by TEXT NOT NULL DEFAULT '',
+  approved_by  TEXT NOT NULL DEFAULT '',
+  approved_at  INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, path, digest)
+);
+CREATE INDEX IF NOT EXISTS idx_pre_commands_status ON pre_commands(status);
+
 CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
 CREATE INDEX IF NOT EXISTS idx_images_digest ON images(digest);
 
@@ -98,8 +135,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   sync_ms        INTEGER NOT NULL DEFAULT 0,
   build_ms       INTEGER NOT NULL DEFAULT 0,
   bytes_synced   INTEGER NOT NULL DEFAULT 0,
-  cache_hit      INTEGER NOT NULL DEFAULT 0
+  cache_hit      INTEGER NOT NULL DEFAULT 0,
+  egress_key     TEXT NOT NULL DEFAULT ''
 );
+-- `egress_key` is the egress grant this task's fingerprint was computed from
+-- (§7.1), so the build cannot run with a grant its cache key does not describe.
+-- It lives outside the CREATE above because SQLite reconstructs that statement
+-- verbatim when a column is dropped, and a comment inside the body makes the
+-- reconstruction unparseable.
 CREATE INDEX IF NOT EXISTS idx_tasks_fingerprint ON tasks(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_tasks_supersede   ON tasks(supersede_key, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status      ON tasks(status);

@@ -11,6 +11,12 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
+/// How many egress rows one project may accumulate. Generous for a real
+/// repository — a build reaching more than this many distinct hosts is not a
+/// build — and small enough that the approval queue stays a thing a human can
+/// read.
+const MAX_EGRESS_PER_PROJECT: i64 = 64;
+
 pub struct AgentService {
     app: Arc<App>,
 }
@@ -31,6 +37,63 @@ impl AgentService {
             Ok(false) => Err(Status::unauthenticated("unknown agent token")),
             Err(e) => Err(Status::internal(e.to_string())),
         }
+    }
+
+    /// Register the hosts a repository asked to reach, and report the ones an
+    /// administrator has not approved yet (§7.1).
+    ///
+    /// Never fatal: a build that cannot reach a host fails on its own terms,
+    /// with a network error the agent can act on, and refusing the whole task
+    /// would strand every project whose request is still in the queue. The
+    /// patterns are re-validated here because the agent that sent them is not
+    /// something the control plane trusts.
+    fn record_egress_requests(&self, req: &SubmitTaskReq) -> (Vec<String>, Vec<String>) {
+        if req.egress.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let hosts = match rc_core::egress::normalize_all(&req.egress) {
+            Ok(hosts) => hosts,
+            Err(problems) => {
+                tracing::warn!(project = %req.project_id, ?problems, "ignoring malformed egress request");
+                return (Vec::new(), Vec::new());
+            }
+        };
+        // The approval queue is the one human gate in this design, so it has to
+        // stay readable. An agent token is fleet-wide and `project_id` comes off
+        // the wire, which means anyone holding a token can file requests under
+        // any project; a cap will not stop them forging one, but it does stop a
+        // loop from burying every genuine request under a million rows.
+        // Counted against rows actually created, not against hosts asked for:
+        // the config line stays in the repository, so a project re-requests
+        // everything it already has on every single submission, and charging
+        // that would put a settled project permanently over its own cap.
+        // Existing rows are never disturbed — a decision already made must not
+        // be walked back by a flood.
+        let mut room =
+            MAX_EGRESS_PER_PROJECT - self.app.store.egress_count(&req.project_id).unwrap_or(0);
+        let mut refused = Vec::new();
+        for host in &hosts {
+            if room <= 0 {
+                refused.push(host.clone());
+                continue;
+            }
+            match self.app.store.request_egress(&req.project_id, host, &req.agent_session) {
+                Ok(created) => {
+                    if created {
+                        room -= 1;
+                    }
+                }
+                Err(e) => tracing::warn!(%host, error = %e, "could not record the egress request"),
+            }
+        }
+        if !refused.is_empty() {
+            tracing::warn!(
+                project = %req.project_id, ?refused,
+                "egress requests refused: this project is at its approval-queue cap"
+            );
+        }
+        let pending = self.app.store.pending_egress(&req.project_id).unwrap_or_default();
+        (pending, refused)
     }
 }
 
@@ -163,30 +226,42 @@ impl AgentApi for AgentService {
     async fn submit_task(&self, req: Request<SubmitTaskReq>) -> Result<Response<TaskHandle>, Status> {
         self.authenticate(&req)?;
         let req = req.into_inner();
+        let (egress_pending, egress_refused) = self.record_egress_requests(&req);
         match self.app.submit(&req) {
             Ok(Admission::Queued { task_id }) => Ok(Response::new(TaskHandle {
                 task_id,
                 status: "queued".into(),
+                egress_pending,
+                egress_refused,
                 ..Default::default()
             })),
             Ok(Admission::Subscribed { task_id }) => Ok(Response::new(TaskHandle {
                 task_id,
                 status: "queued".into(),
+                egress_pending,
+                egress_refused,
                 subscribed: true,
                 message: "identical work already in flight; attached to it".into(),
                 ..Default::default()
             })),
+            // A cache hit is exactly when the agent most needs telling: nothing
+            // ran, so nothing will fail with a network error to hint that an
+            // approval is still sitting in a queue.
             Ok(Admission::CacheHit { task_id, result }) => Ok(Response::new(TaskHandle {
                 task_id,
                 status: "done".into(),
                 cache_hit: true,
                 result: Some(result),
+                egress_pending,
+                egress_refused,
                 ..Default::default()
             })),
             Ok(Admission::NeedsBlobs { missing }) => Ok(Response::new(TaskHandle {
                 status: "needs_blobs".into(),
                 missing_blobs: missing,
                 message: "upload the listed blobs and resubmit".into(),
+                egress_pending,
+                egress_refused,
                 ..Default::default()
             })),
             Err(e) => Err(Status::failed_precondition(e.to_string())),
@@ -292,17 +367,43 @@ impl AgentApi for AgentService {
             }
         }
 
+        // Put an approved `pre_commands` back into the profile the fleet hands
+        // out. Stored apart from the profile precisely so that this is the only
+        // place it can re-enter, and only after someone read it (§3.2).
+        let mut config_toml = stored.as_ref().map(|p| p.config_toml.clone()).unwrap_or_default();
+        let approved_pre = self
+            .app
+            .store
+            .approved_pre_commands(&req.project_id, &req.path)
+            .unwrap_or_default();
+        if !approved_pre.is_empty() {
+            if let Ok(parsed) = rc_core::profile::parse_toml(&config_toml) {
+                let mut p = parsed.profile;
+                p.pre_commands = Some(approved_pre);
+                config_toml = rc_core::profile::to_toml(&p);
+            }
+        }
+        let pre_pending = self
+            .app
+            .store
+            .pending_pre_commands(&req.project_id, &req.path)
+            .unwrap_or(false);
+
         let message = if resolved.is_empty() {
             "控制面还没有已审批的可用镜像：用 prepare_env 提交 Dockerfile，管理员审批后即可使用（§8.3/§8.4）".to_string()
         } else if stored.is_none() {
             "该项目还没有 Build Profile，返回的是 fleet 默认镜像；首次成功后会自动沉淀".to_string()
+        } else if pre_pending {
+            // Said out loud because the symptom is invisible: the build simply
+            // runs without a codegen step it needed, and fails somewhere else.
+            "该项目学到的 pre_commands 还在等管理员审批，本次不会执行它们（§3.2）".to_string()
         } else {
             String::new()
         };
 
         Ok(Response::new(ProfileResp {
             found: stored.is_some(),
-            config_toml: stored.as_ref().map(|p| p.config_toml.clone()).unwrap_or_default(),
+            config_toml,
             health: stored.as_ref().map(|p| ProfileHealth {
                 last_success_at: p.last_success_at,
                 success_count: p.success_count as u32,
@@ -336,13 +437,46 @@ impl AgentApi for AgentService {
             }
         }
 
+        // §3.2: `pre_commands` is the one profile field that is not a *choice*
+        // but a *program*. Every other field picks an image, a target, a
+        // command line; this one is arbitrary shell that will run inside the
+        // sandbox of every other agent that inherits this profile. So it does
+        // not travel with the profile — it is split off here, recorded as a
+        // request, and only put back by `get_profile` once an administrator has
+        // read it. A repository running its own `pre_commands` is untouched:
+        // approval gates teaching them to agents that never asked.
+        let mut stored_profile = parsed.profile.clone();
+        let learned = stored_profile.pre_commands.take().unwrap_or_default();
+        if !learned.is_empty() {
+            match self.app.store.request_pre_commands(
+                &req.project_id,
+                &req.path,
+                &learned,
+                &req.agent_session,
+            ) {
+                Ok(true) => {
+                    self.app
+                        .store
+                        .audit(
+                            &req.agent_session,
+                            "pre_commands_requested",
+                            &req.project_id,
+                            &crate::store::Store::pre_commands_digest(&learned),
+                        )
+                        .ok();
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "could not record learned pre_commands"),
+            }
+        }
+
         let row = crate::store::ProfileRow {
             id: format!("prof-{}", &blake3::hash(format!("{}|{}", req.project_id, req.path).as_bytes()).to_hex()[..16]),
             project_id: req.project_id.clone(),
             path: req.path.clone(),
             adapter: parsed.profile.adapter.clone().unwrap_or_default(),
             image: parsed.profile.image.clone().unwrap_or_default(),
-            config_toml: req.config_toml.clone(),
+            config_toml: rc_core::profile::to_toml(&stored_profile),
             created_by: req.agent_session.clone(),
             ..Default::default()
         };

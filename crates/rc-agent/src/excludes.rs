@@ -1,4 +1,5 @@
-//! What never leaves the machine.
+//! What never leaves the machine — and, in `Includes`, the one thing that must
+//! leave it despite git.
 //!
 //! Two kinds of exclusion meet here. The adapter's are structural — `target/`,
 //! `.git/`, `node_modules/` — directories whose contents are build output or
@@ -59,6 +60,33 @@ impl Excludes {
         self.matches_dirs(path) || self.matches_user(path)
     }
 
+    /// Directory names a walk need never descend into, owned so that a
+    /// `filter_entry` closure — which must be `'static` — can carry them.
+    ///
+    /// Only the structural set qualifies. A user pattern may name a single file
+    /// inside a directory that is otherwise wanted, so pruning on one would
+    /// withhold that directory's other files too.
+    pub fn pruned_dir_names(&self) -> Vec<String> {
+        rc_core::ALWAYS_EXCLUDE
+            .iter()
+            .map(|d| (*d).to_string())
+            .chain(self.dirs.iter().cloned())
+            .collect()
+    }
+
+    /// Whether a user pattern excludes this *directory* outright, so a walk can
+    /// stop there.
+    ///
+    /// Safe as a pruning rule precisely because `matches_user` tests a file's
+    /// parents: everything beneath an excluded directory is already withheld, so
+    /// refusing to descend changes nothing but the time spent.
+    pub fn prunes_user_dir(&self, path: &str) -> bool {
+        if self.user_empty {
+            return false;
+        }
+        self.user.matched(Path::new(path), true).is_ignore()
+    }
+
     /// Build output and VCS internals, excluded whatever the config says.
     fn matches_dirs(&self, path: &str) -> bool {
         let first = path.split('/').next().unwrap_or("");
@@ -76,31 +104,7 @@ impl Excludes {
         if self.user_empty {
             return false;
         }
-        // Enumeration hands us one file path at a time, never a directory. Ask
-        // only about the file and every directory pattern quietly does nothing:
-        // `secrets/`, and plain `secrets`, match a *directory*, and git excludes
-        // what is beneath by never descending into it. Someone writing
-        // `exclude = ["secrets"]`, seeing no error, and having the files
-        // uploaded anyway is exactly the failure this feature must not have.
-        //
-        // Parents are tested outermost-first and an excluded one wins outright.
-        // That is git's rule — a file cannot be re-included once a parent
-        // directory is excluded — and it is also the safe direction:
-        // `matched_path_or_any_parents` would let `!secrets/public.txt` reopen
-        // the directory, releasing more than the author of `secrets` asked to
-        // withhold.
-        let mut prefix = String::new();
-        let parts: Vec<&str> = path.split('/').collect();
-        for part in &parts[..parts.len().saturating_sub(1)] {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(part);
-            if self.user.matched(Path::new(&prefix), true).is_ignore() {
-                return true;
-            }
-        }
-        self.user.matched(Path::new(path), false).is_ignore()
+        matches_path_or_parent(&self.user, path)
     }
 
     /// Whether the L1 git baseline may still be used.
@@ -125,6 +129,108 @@ impl Excludes {
     pub fn user_patterns(&self) -> &[String] {
         &self.pattern_text
     }
+
+    /// An owned copy carrying only the user patterns, for a `'static` walk
+    /// filter. Recompiling a handful of globs costs nothing next to the walk it
+    /// prunes.
+    pub fn clone_user_matcher(&self) -> Excludes {
+        Excludes::new(&[], &self.pattern_text).expect("these patterns already compiled once")
+    }
+}
+
+/// What travels even though `.gitignore` hides it — `include` in
+/// `.remote-compile.toml`.
+///
+/// Enumeration takes git as the authority on what exists (§4.3), which is right
+/// for tracked and untracked files alike and wrong for exactly one case: a file
+/// the build reads and `.gitignore` covers. Generated code is the usual one. It
+/// appears in none of git's lists, so no amount of scanning finds it, and the
+/// failure it produces remotely — a module that will not resolve — has no
+/// counterpart in any diff.
+///
+/// This does *not* undo an exclusion: `Excludes` is applied after enumeration,
+/// so a path matching both is still withheld. Nor does it cost the root its git
+/// baseline; an included file is by definition untracked, so it travels through
+/// the CAS like any other untracked file and the bundle is unaffected.
+#[derive(Debug)]
+pub struct Includes {
+    patterns: Gitignore,
+    empty: bool,
+    pattern_text: Vec<String>,
+}
+
+impl Includes {
+    pub fn new(patterns: &[String]) -> Result<Self, String> {
+        let mut builder = GitignoreBuilder::new("");
+        for p in patterns {
+            builder
+                .add_line(None, p)
+                .map_err(|e| format!("include pattern `{p}` is not valid: {e}"))?;
+        }
+        let compiled = builder
+            .build()
+            .map_err(|e| format!("could not compile the include patterns: {e}"))?;
+        Ok(Includes {
+            patterns: compiled,
+            empty: patterns.is_empty(),
+            pattern_text: patterns.to_vec(),
+        })
+    }
+
+    /// No `include` at all — the ordinary case, and the one that must cost
+    /// nothing: enumeration skips the extra walk entirely. Production builds one
+    /// from the repo config even when that config is empty, so this exists for
+    /// tests that scan without a repository config at all.
+    #[cfg(test)]
+    pub fn none() -> Self {
+        Includes::new(&[]).expect("no patterns cannot fail to compile")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        if self.empty {
+            return false;
+        }
+        matches_path_or_parent(&self.patterns, path)
+    }
+
+    pub fn patterns(&self) -> &[String] {
+        &self.pattern_text
+    }
+}
+
+/// Match a file path against gitignore-syntax patterns, testing its parent
+/// directories too.
+///
+/// Enumeration hands us one file path at a time, never a directory. Ask only
+/// about the file and every directory pattern quietly does nothing: `secrets/`,
+/// and plain `secrets`, match a *directory*, and git acts on that by never
+/// descending into it. Someone writing `exclude = ["secrets"]`, seeing no
+/// error, and having the files uploaded anyway is exactly the failure this must
+/// not have; `include = ["generated"]` silently pulling in nothing is the same
+/// bug pointed the other way.
+///
+/// Parents are tested outermost-first and a matching one wins outright. That is
+/// git's rule — a file cannot be re-included once a parent directory is
+/// excluded — and for `exclude` it is also the safe direction:
+/// `matched_path_or_any_parents` would let `!secrets/public.txt` reopen the
+/// directory, releasing more than the author of `secrets` asked to withhold.
+fn matches_path_or_parent(patterns: &Gitignore, path: &str) -> bool {
+    let mut prefix = String::new();
+    let parts: Vec<&str> = path.split('/').collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if patterns.matched(Path::new(&prefix), true).is_ignore() {
+            return true;
+        }
+    }
+    patterns.matched(Path::new(path), false).is_ignore()
 }
 
 #[cfg(test)]
@@ -144,6 +250,50 @@ mod tests {
         assert!(e.matches(".git/config"));
         assert!(e.matches("node_modules/x"));
         assert!(!e.matches("src/target_helper.rs"));
+    }
+
+    #[test]
+    fn a_withheld_directory_is_pruned_but_a_withheld_file_is_not() {
+        // The `include` walk asks this before descending. Testing it end to end
+        // is impossible — `exclude` drops those files at the end of the walk
+        // either way, so the manifest looks identical whether or not the walk
+        // went in. The only observable difference is the time, so the rule is
+        // pinned here instead.
+        let dir_pattern = ex(&["dumps/"]);
+        assert!(dir_pattern.prunes_user_dir("dumps"));
+        assert!(!dir_pattern.prunes_user_dir("src"));
+
+        // A pattern naming one file inside a directory must never prune the
+        // directory: its siblings are wanted, and pruning would lose them.
+        let file_pattern = ex(&["dumps/secret.txt"]);
+        assert!(!file_pattern.prunes_user_dir("dumps"));
+        assert!(file_pattern.matches("dumps/secret.txt"));
+        assert!(!file_pattern.matches("dumps/wanted.txt"));
+
+        assert!(!ex(&[]).prunes_user_dir("dumps"), "no patterns, nothing to prune");
+    }
+
+    #[test]
+    fn an_include_matches_the_same_way_an_exclude_does() {
+        let i = Includes::new(&["*.generated.rs".to_string(), "gen/".to_string()]).unwrap();
+        assert!(i.matches("common/src/prisma.generated.rs"));
+        assert!(i.matches("gen/deep/file.rs"), "a directory pattern reaches what is under it");
+        assert!(!i.matches("src/main.rs"));
+    }
+
+    #[test]
+    fn no_include_matches_nothing() {
+        // The ordinary case. It must also be the cheap one — `is_empty` is what
+        // lets enumeration skip the extra walk entirely.
+        let i = Includes::none();
+        assert!(i.is_empty());
+        assert!(!i.matches("anything.rs"));
+    }
+
+    #[test]
+    fn a_bad_include_pattern_is_reported_not_ignored() {
+        let err = Includes::new(&["{unclosed".to_string()]).unwrap_err();
+        assert!(err.contains("include pattern"), "{err}");
     }
 
     #[test]

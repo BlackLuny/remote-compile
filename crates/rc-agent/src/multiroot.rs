@@ -12,7 +12,7 @@
 //! the first time and nothing after that, and it avoids having to reason about
 //! several git mirrors materialising into one tree.
 
-use crate::excludes::Excludes;
+use crate::excludes::{Excludes, Includes};
 use crate::index::StatIndex;
 use crate::scanner::{self, Scan, ScanError};
 use rc_core::pb::{FileEntry, Manifest, RootInfo};
@@ -48,10 +48,11 @@ pub struct MultiScan {
 pub fn scan_all(
     layout: &Layout,
     excludes: &Excludes,
+    includes: &Includes,
     mut open_index: impl FnMut(&Path) -> anyhow::Result<StatIndex>,
 ) -> Result<MultiScan, ScanError> {
     for attempt in 1..=scanner::MAX_SCAN_ATTEMPTS {
-        let outcome = scan_once(layout, excludes, &mut open_index)?;
+        let outcome = scan_once(layout, excludes, includes, &mut open_index)?;
         let Some(changed) = outcome.unstable else {
             return Ok(outcome.scan);
         };
@@ -76,6 +77,7 @@ struct Once {
 fn scan_once(
     layout: &Layout,
     excludes: &Excludes,
+    includes: &Includes,
     open_index: &mut impl FnMut(&Path) -> anyhow::Result<StatIndex>,
 ) -> Result<Once, ScanError> {
     let mut entries: Vec<FileEntry> = Vec::new();
@@ -83,6 +85,14 @@ fn scan_once(
     let mut scanned: Vec<RootMount> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut covered: HashSet<String> = HashSet::new();
+    // Where each merged entry came from: its index in `entries`, keyed by path,
+    // and for each entry the root that produced it and whether only `include`
+    // did. Both questions are asked when two roots reach the same file.
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    let mut provenance: HashMap<usize, (usize, bool)> = HashMap::new();
+    // Layout index -> its slot in `roots_info`, so a replaced entry can be
+    // subtracted from the root that no longer provides it.
+    let mut info_at: HashMap<usize, usize> = HashMap::new();
     let mut primary: Option<Scan> = None;
     let (mut hashed, mut reused) = (0usize, 0usize);
     // Stats as each root finished, so a root that changes while a *later* root
@@ -97,6 +107,11 @@ fn scan_once(
             // the enclosing repository knows about this crate at all — if git
             // lists it, the crate is a tracked part of the repo and anything
             // ignored inside it was ignored on purpose (§4.3).
+            //
+            // `covered` deliberately holds only what the enclosing root's *git*
+            // enumeration produced. An `include` hit is the repository naming
+            // one file, not git knowing the directory, and letting one answer
+            // this question would skip a whole crate on the strength of it.
             let manifest_path = roots::anchored(&root.mount, MANIFEST_FILE);
             if layout.enclosing(index).is_some() && covered.contains(&manifest_path) {
                 continue;
@@ -115,9 +130,15 @@ fn scan_once(
         // not track, so neither git nor the ancestor ignore rules can describe
         // it (§Enumeration::Standalone).
         let scan = if root.nested {
-            scanner::scan_with(&root.path, excludes, &mut idx, scanner::Enumeration::Standalone)?
+            scanner::scan_with(
+                &root.path,
+                excludes,
+                includes,
+                &mut idx,
+                scanner::Enumeration::Standalone,
+            )?
         } else {
-            scanner::scan(&root.path, excludes, &mut idx)?
+            scanner::scan(&root.path, excludes, includes, &mut idx)?
         };
         if scan.attempts > 1 {
             tracing::info!(
@@ -134,9 +155,38 @@ fn scan_once(
         let mut files = 0u32;
         for e in &scan.manifest.entries {
             let path = roots::anchored(&root.mount, &e.path);
-            covered.insert(path.clone());
+            if !scan.included.contains(&e.path) {
+                covered.insert(path.clone());
+            }
             bytes += e.size;
             files += 1;
+            // A root that lies inside this one answers for its own contents. If
+            // an enclosing root's `include` walk already reached a file there,
+            // that entry is the same file seen from further away: replace it,
+            // rather than hand `manifest::build` two entries for one path and
+            // let the collision check refuse a scan that is not ambiguous at all.
+            if let Some(&at) = owner.get(&path) {
+                let (from, by_include) = provenance[&at];
+                if by_include && root.path.starts_with(&layout.roots[from].path) {
+                    // The file leaves the enclosing root's tally with the entry,
+                    // or the per-root totals would add up to more files than the
+                    // manifest holds.
+                    if let Some(&slot) = info_at.get(&from) {
+                        let info: &mut RootInfo = &mut roots_info[slot];
+                        info.files = info.files.saturating_sub(1);
+                        info.bytes = info.bytes.saturating_sub(entries[at].size);
+                    }
+                    entries[at] = FileEntry {
+                        path,
+                        in_baseline: root.primary && e.in_baseline,
+                        ..e.clone()
+                    };
+                    provenance.insert(at, (index, scan.included.contains(&e.path)));
+                    continue;
+                }
+            }
+            owner.insert(path.clone(), entries.len());
+            provenance.insert(entries.len(), (index, scan.included.contains(&e.path)));
             entries.push(FileEntry {
                 path,
                 // Only the primary root's baseline is materialised, so every
@@ -155,6 +205,7 @@ fn scan_once(
                 .collect::<Vec<_>>(),
         ));
 
+        info_at.insert(index, roots_info.len());
         roots_info.push(RootInfo {
             mount: root.mount.clone(),
             local_path: root.path.to_string_lossy().into_owned(),
@@ -203,7 +254,7 @@ fn scan_once(
             scanner::Enumeration::Auto
         };
         after_paths.extend(
-            scanner::enumerate(&root.path, excludes, mode)?
+            scanner::enumerate(&root.path, excludes, includes, mode)?
                 .into_iter()
                 .map(|p| roots::anchored(&root.mount, &p)),
         );
@@ -332,10 +383,10 @@ mod tests {
 
         let app = app.canonicalize().unwrap();
         let layout = roots::compute(&app, &[]).unwrap();
-        let multi = scan_all(&layout, &ex(&["target"]), indexes()).unwrap();
+        let multi = scan_all(&layout, &ex(&["target"]), &Includes::none(), indexes()).unwrap();
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let single = scanner::scan(&app, &ex(&["target"]), &mut idx).unwrap();
+        let single = scanner::scan(&app, &ex(&["target"]), &Includes::none(), &mut idx).unwrap();
 
         assert_eq!(paths(&multi.manifest), paths(&single.manifest));
         assert_eq!(multi.manifest.root_hash, single.manifest.root_hash);
@@ -356,7 +407,7 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let lib = lib.canonicalize().unwrap();
         let layout = roots::compute(&app, std::slice::from_ref(&lib)).unwrap();
-        let scan = scan_all(&layout, &ex(&["target"]), indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&["target"]), &Includes::none(), indexes()).unwrap();
 
         assert_eq!(scan.manifest.anchor_mount, "app");
         let p = paths(&scan.manifest);
@@ -384,7 +435,7 @@ mod tests {
             &[lib.canonicalize().unwrap()],
         )
         .unwrap();
-        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()).unwrap();
 
         let by_path: HashMap<&str, &FileEntry> =
             scan.manifest.entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -408,7 +459,7 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let inner = app.join("vendor/inner");
         let layout = roots::compute(&app, &[inner]).unwrap();
-        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()).unwrap();
 
         assert_eq!(scan.scanned.len(), 1, "the outer scan already covers it");
         let p = paths(&scan.manifest);
@@ -431,7 +482,7 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let plain = {
             let mut idx = StatIndex::open_memory().unwrap();
-            scanner::scan(&app, &ex(&[]), &mut idx).unwrap()
+            scanner::scan(&app, &ex(&[]), &Includes::none(), &mut idx).unwrap()
         };
         assert!(
             !paths(&plain.manifest).iter().any(|p| p.contains("local-crates")),
@@ -439,7 +490,7 @@ mod tests {
         );
 
         let layout = roots::compute(&app, &[app.join("local-crates/foo")]).unwrap();
-        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()).unwrap();
 
         assert_eq!(scan.scanned.len(), 2, "it has to be picked up on its own");
         assert!(
@@ -448,6 +499,162 @@ mod tests {
             paths(&scan.manifest)
         );
         assert!(scan.warnings.iter().any(|w| w.contains("not tracked by it")));
+    }
+
+    fn inc(patterns: &[&str]) -> Includes {
+        Includes::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn include_does_not_make_the_outer_repo_look_like_it_covers_a_nested_root() {
+        // Coverage is decided by whether the *enclosing repository* enumerates
+        // the nested crate's manifest — "if git lists it, the crate is a tracked
+        // part of the repo". An `include` hit is not git listing it. Letting one
+        // count would skip the nested scan on the strength of a single file and
+        // sync the crate half-empty.
+        let base = scratch("nested-include-coverage");
+        let app = repo(&base, "app");
+        write(&app, ".gitignore", "local-crates/\n");
+        write(&app, "src/main.rs", "fn main() {}");
+        commit(&app);
+        write(&app, "local-crates/foo/Cargo.toml", "[package]\nname = \"foo\"\n");
+        write(&app, "local-crates/foo/src/lib.rs", "pub fn f() {}");
+
+        let app = app.canonicalize().unwrap();
+        let layout = roots::compute(&app, &[app.join("local-crates/foo")]).unwrap();
+        // A pattern with every reason to exist — "sync the manifests git hides"
+        // — that happens to name the nested crate's Cargo.toml.
+        let scan = scan_all(&layout, &ex(&[]), &inc(&["**/Cargo.toml"]), indexes()).unwrap();
+
+        assert_eq!(scan.scanned.len(), 2, "the nested root still needs its own scan");
+        let p = paths(&scan.manifest);
+        assert!(
+            p.contains(&"local-crates/foo/src/lib.rs".to_string()),
+            "the crate's source must not be dropped: {p:?}"
+        );
+        assert_eq!(
+            p.iter().filter(|x| *x == "local-crates/foo/Cargo.toml").count(),
+            1,
+            "and the file both roots can see must appear exactly once: {p:?}"
+        );
+    }
+
+    #[test]
+    fn include_reaches_into_a_member_the_outer_repo_already_covers() {
+        // The ordinary monorepo: `a` is a tracked path dependency, so it is a
+        // root in the layout that never gets scanned — the outer repo's own
+        // enumeration covers it. `include` must still deliver the generated file
+        // under it, because the outer enumeration is exactly what cannot see it.
+        // Fencing every layout root (which is what the first fix did) puts this
+        // file out of everyone's reach and silently ships an incomplete tree.
+        let base = scratch("member-include");
+        let app = repo(&base, "app");
+        write(&app, ".gitignore", "*.generated.rs\n");
+        write(&app, "src/main.rs", "fn main() {}");
+        write(&app, "a/Cargo.toml", "[package]\nname = \"a\"\n");
+        write(&app, "a/src/lib.rs", "pub fn f() {}");
+        commit(&app);
+        write(&app, "a/src/x.generated.rs", "// load-bearing");
+
+        let app = app.canonicalize().unwrap();
+        let layout = roots::compute(&app, &[app.join("a")]).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &inc(&["*.generated.rs"]), indexes()).unwrap();
+
+        assert_eq!(scan.scanned.len(), 1, "the member is covered; it is not scanned twice");
+        let p = paths(&scan.manifest);
+        assert!(
+            p.contains(&"a/src/x.generated.rs".to_string()),
+            "the outer include walk must still reach a covered member: {p:?}"
+        );
+    }
+
+    #[test]
+    fn an_include_that_also_matches_tracked_files_changes_nothing_about_coverage() {
+        // The include walk runs with ignore rules off, so it sees tracked files
+        // too. Those are not "include-only": if a pattern happening to match a
+        // member's `Cargo.toml` could take it out of the coverage set, an
+        // ordinary monorepo would either collide outright (`*.toml`) or start
+        // asking for consent to upload its own tracked members (`*`).
+        for pattern in ["*.toml", "Cargo.toml", "*"] {
+            let base = scratch(&format!("tracked-include-{}", pattern.replace('*', "star")));
+            let app = repo(&base, "app");
+            write(&app, "src/main.rs", "fn main() {}");
+            write(&app, "a/Cargo.toml", "[package]\nname = \"a\"\n");
+            write(&app, "a/src/lib.rs", "pub fn f() {}");
+            commit(&app);
+
+            let app = app.canonicalize().unwrap();
+            let layout = roots::compute(&app, &[app.join("a")]).unwrap();
+            let scan = scan_all(&layout, &ex(&[]), &inc(&[pattern]), indexes())
+                .unwrap_or_else(|e| panic!("`include = [\"{pattern}\"]` broke the scan: {e}"));
+
+            assert_eq!(
+                scan.scanned.len(),
+                1,
+                "`{pattern}`: a tracked member is covered by git and must not be scanned again"
+            );
+            assert!(
+                !scan.warnings.iter().any(|w| w.contains("not tracked by it")),
+                "`{pattern}`: a tracked member must not be reported as hidden: {:?}",
+                scan.warnings
+            );
+            let p = paths(&scan.manifest);
+            assert_eq!(p.iter().filter(|x| *x == "a/src/lib.rs").count(), 1, "`{pattern}`: {p:?}");
+        }
+    }
+
+    #[test]
+    fn the_readme_pattern_does_not_collide_with_a_nested_root() {
+        // The feature's flagship config — `include = ["*.generated.rs"]` — meets
+        // the multi-root case the code already special-cases. Both roots can see
+        // the nested crate's generated file; only the root that answers for it
+        // may enumerate it, or the collision check refuses the whole scan.
+        let base = scratch("nested-include-collision");
+        let app = repo(&base, "app");
+        write(&app, ".gitignore", "local-crates/\n*.generated.rs\n");
+        write(&app, "src/main.rs", "fn main() {}");
+        commit(&app);
+        write(&app, "local-crates/foo/Cargo.toml", "[package]\nname = \"foo\"\n");
+        write(&app, "local-crates/foo/src/lib.rs", "pub fn f() {}");
+        write(&app, "local-crates/foo/src/x.generated.rs", "// generated");
+
+        let app = app.canonicalize().unwrap();
+        let layout = roots::compute(&app, &[app.join("local-crates/foo")]).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &inc(&["*.generated.rs"]), indexes())
+            .expect("the two roots must not both claim the same path");
+
+        let p = paths(&scan.manifest);
+        assert_eq!(
+            p.iter().filter(|x| *x == "local-crates/foo/src/x.generated.rs").count(),
+            1,
+            "{p:?}"
+        );
+        assert!(p.contains(&"local-crates/foo/src/lib.rs".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn a_broad_include_still_leaves_a_hidden_root_visible_for_consent() {
+        // Uploading a `.gitignore`d nested crate needs the user's approval, and
+        // that gate keys on the root being *scanned as nested*. If a wide
+        // `include` let the primary root swallow it, the tree would leave the
+        // machine with the approval never asked for.
+        let base = scratch("nested-include-consent");
+        let app = repo(&base, "app");
+        write(&app, ".gitignore", "local-crates/\n");
+        write(&app, "src/main.rs", "fn main() {}");
+        commit(&app);
+        write(&app, "local-crates/foo/Cargo.toml", "[package]\nname = \"foo\"\n");
+        write(&app, "local-crates/foo/src/lib.rs", "pub fn f() {}");
+
+        let app = app.canonicalize().unwrap();
+        let layout = roots::compute(&app, &[app.join("local-crates/foo")]).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &inc(&["*"]), indexes()).unwrap();
+
+        assert!(
+            scan.scanned.iter().any(|r| r.nested),
+            "the hidden crate must still arrive as a nested root: {:?}",
+            scan.scanned.iter().map(|r| (&r.mount, r.nested)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -465,10 +672,10 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let lib = lib.canonicalize().unwrap();
         let layout = roots::compute(&app, std::slice::from_ref(&lib)).unwrap();
-        let first = scan_all(&layout, &ex(&[]), indexes()).unwrap();
+        let first = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()).unwrap();
 
         write(&lib, "b.rs", "after");
-        let second = scan_all(&layout, &ex(&[]), indexes()).unwrap();
+        let second = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()).unwrap();
         assert_ne!(first.manifest.root_hash, second.manifest.root_hash);
     }
 
@@ -492,7 +699,7 @@ mod tests {
         let layout = roots::compute(&app, &[app.join("a"), app.join("b")]).unwrap();
         assert_eq!(layout.roots.len(), 3, "all three are considered");
 
-        let scan = scan_all(&layout, &ex(&[]), indexes()).unwrap();
+        let scan = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()).unwrap();
         assert_eq!(scan.scanned.len(), 1, "but only the repository is scanned");
         assert_eq!(scan.manifest.anchor_mount, "");
         assert!(
@@ -517,7 +724,7 @@ mod tests {
         let layout = roots::compute(&app, &[app.join("src")]).unwrap();
         // `src` has no Cargo.toml, so it is treated as uncovered and scanned
         // standalone — which re-reads main.rs and collides.
-        let Err(err) = scan_all(&layout, &ex(&[]), indexes()) else {
+        let Err(err) = scan_all(&layout, &ex(&[]), &Includes::none(), indexes()) else {
             panic!("a collision must not resolve silently");
         };
         assert!(
@@ -540,7 +747,7 @@ mod tests {
         let lib = lib.canonicalize().unwrap();
         let layout = roots::compute(&app, std::slice::from_ref(&lib)).unwrap();
         let excl = Excludes::new(&[], &["*.pem".to_string()]).unwrap();
-        let scan = scan_all(&layout, &excl, indexes()).unwrap();
+        let scan = scan_all(&layout, &excl, &Includes::none(), indexes()).unwrap();
 
         let baseline_notes = scan
             .warnings

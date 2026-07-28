@@ -210,6 +210,13 @@ impl App {
                 "fingerprint mismatch; using the server-computed value"
             );
         }
+        // §7.1: what this project is *allowed to reach* is part of what the
+        // build is. The agent cannot compute this — approval lives here — so it
+        // is folded in after the comparison above, which is against the value
+        // the agent could compute.
+        let granted = self.store.approved_egress(&req.project_id)?;
+        let fingerprint = rc_core::fingerprint::with_egress(&fingerprint, &granted);
+        let egress_key = granted.join(",");
 
         self.store
             .upsert_project(&req.project_id, &req.repo_url, &req.project_root)?;
@@ -262,9 +269,9 @@ impl App {
 
         // §5.1 task cache.
         if !req.no_cache {
-            if let Some(prev) = self.store.find_cached_result(&fingerprint, policy.task_cache_ttl_secs)? {
+            if let Some(prev) = self.store.find_cached_result(&fingerprint, &egress_key, policy.task_cache_ttl_secs)? {
                 let id = ids::task_id();
-                let row = self.new_row(&id, req, &fingerprint, &command, TaskState::Done);
+                let row = self.new_row(&id, req, &fingerprint, &egress_key, &command, TaskState::Done);
                 self.persist_new(&row, req)?;
                 self.store.record_cache_hit(&id, &prev)?;
                 self.metrics.incr("tasks_cache_hit_total", 1.0);
@@ -277,14 +284,14 @@ impl App {
 
         // §5.3 identical work already in flight: subscribe rather than
         // enqueue a duplicate.
-        if let Some(active) = self.store.find_active_by_fingerprint(&fingerprint)? {
+        if let Some(active) = self.store.find_active_by_fingerprint(&fingerprint, &egress_key)? {
             self.store.add_subscriber(&active.id, &req.agent_session)?;
             self.metrics.incr("tasks_dedup_total", 1.0);
             return Ok(Admission::Subscribed { task_id: active.id });
         }
 
         let id = ids::task_id();
-        let row = self.new_row(&id, req, &fingerprint, &command, TaskState::Queued);
+        let row = self.new_row(&id, req, &fingerprint, &egress_key, &command, TaskState::Queued);
         self.persist_new(&row, req)?;
         self.store.add_subscriber(&id, &req.agent_session)?;
         self.store.set_image(&id, &profile.image)?;
@@ -311,6 +318,7 @@ impl App {
         id: &str,
         req: &pb::SubmitTaskReq,
         fingerprint: &str,
+        egress_key: &str,
         command: &str,
         status: TaskState,
     ) -> TaskRow {
@@ -326,6 +334,7 @@ impl App {
             worktree_id: req.worktree_id.clone(),
             agent_session: req.agent_session.clone(),
             fingerprint: fingerprint.to_string(),
+            egress_key: egress_key.to_string(),
             supersede_key: ids::supersede_key(&req.worktree_id, &req.agent_session, &req.task_type),
             status: status.as_str().to_string(),
             command: command.to_string(),
@@ -485,6 +494,31 @@ impl App {
             return Ok(false);
         };
 
+        // The intersection of what was granted when this task was keyed and
+        // what is granted now (§7.1).
+        //
+        // Both halves matter. Dropping what has since been revoked is the
+        // security half: a host revoked while this task waited in the queue is
+        // not reachable from it. Dropping what has since been *granted* is the
+        // correctness half: the task's fingerprint folded in the grant as it
+        // stood at submission, and running with more than that would file the
+        // result under a key that understates the network the build could
+        // reach. The developer's next submission picks up the new grant
+        // honestly, under its own key.
+        //
+        // The intersection can also be *smaller* than the key — a revocation
+        // while queued — and then the result must not be served to a submission
+        // that still holds the full grant. So the row records what the build
+        // actually ran with, and the cache matches on that rather than on the
+        // fingerprint alone.
+        let egress_allow: Vec<String> = {
+            let now = self.store.approved_egress(&task.project_id)?;
+            let keyed: std::collections::HashSet<&str> =
+                task.egress_key.split(',').filter(|s| !s.is_empty()).collect();
+            now.into_iter().filter(|h| keyed.contains(h.as_str())).collect()
+        };
+        self.store.set_dispatched_egress(&task.id, &egress_allow)?;
+
         let assignment = pb::TaskAssignment {
             task_id: task.id.clone(),
             project_id: task.project_id.clone(),
@@ -495,6 +529,7 @@ impl App {
             manifest,
             profile,
             bundle_blobs: self.store.bundles_for(&task.project_id)?,
+            egress_allow,
         };
 
         self.store.assign_to_worker(&task.id, &choice.worker_id)?;

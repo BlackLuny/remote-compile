@@ -132,6 +132,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/images/{id}/approve", post(approve_image))
         .route("/api/images/{id}/reject", post(reject_image))
         .route("/api/images/{id}/rebuild", post(rebuild_image))
+        .route("/api/egress", get(list_egress))
+        .route("/api/egress/decide", post(decide_egress))
+        .route("/api/pre-commands", get(list_pre_commands))
+        .route("/api/pre-commands/decide", post(decide_pre_commands))
         .route("/api/profiles", get(list_profiles))
         .route("/api/profiles/{id}", put(update_profile).delete(delete_profile))
         .route("/api/projects", get(list_projects))
@@ -687,6 +691,122 @@ async fn get_image(
 
 /// §8.3: the approval queue is the gate between "an agent wrote a Dockerfile"
 /// and "that Dockerfile runs on our build fleet".
+#[derive(serde::Deserialize)]
+struct EgressQuery {
+    status: Option<String>,
+}
+
+async fn list_egress(
+    _u: AdminUser,
+    State(app): State<Arc<App>>,
+    Query(q): Query<EgressQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rows = app.store.list_egress(q.status.as_deref()).map_err(ApiError::from)?;
+    Ok(Json(json!({ "egress": rows })))
+}
+
+#[derive(serde::Deserialize)]
+struct EgressDecision {
+    project_id: String,
+    host: String,
+    /// `approved` | `rejected`. Re-deciding is allowed: revoking sets the row
+    /// back to unapproved, and the next task dispatched stops carrying it.
+    action: String,
+}
+
+/// Approve or revoke one host for one project (§7.1).
+///
+/// Deliberately not a bulk endpoint. Each row widens what a sandbox can reach,
+/// and §16 is clear that any reachable host is a channel a build script can
+/// encode data into — so the decision is made one host at a time, by a name a
+/// human read.
+async fn decide_egress(
+    AdminUser(u): AdminUser,
+    State(app): State<Arc<App>>,
+    Json(req): Json<EgressDecision>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let status = match req.action.as_str() {
+        "approve" | "approved" => "approved",
+        "reject" | "rejected" => "rejected",
+        other => return Err(ApiError::bad(format!("unknown action `{other}`"))),
+    };
+    // Validated again on the way in: the stored row is what the worker will be
+    // told to allow, and `*` must not become reachable because something wrote
+    // it straight into the database.
+    let host = rc_core::egress::normalize(&req.host).map_err(ApiError::bad)?;
+    let changed = app
+        .store
+        .set_egress_status(&req.project_id, &host, status, &u.username)
+        .map_err(ApiError::from)?;
+    if changed == 0 {
+        return Err(ApiError::not_found("no such egress request"));
+    }
+    app.store
+        .audit(&u.username, &format!("egress_{status}"), &req.project_id, &host)
+        .ok();
+    Ok(Json(json!({ "project_id": req.project_id, "host": host, "status": status })))
+}
+
+async fn list_pre_commands(
+    _u: AdminUser,
+    State(app): State<Arc<App>>,
+    Query(q): Query<EgressQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rows = app.store.list_pre_commands(q.status.as_deref()).map_err(ApiError::from)?;
+    Ok(Json(json!({ "pre_commands": rows })))
+}
+
+#[derive(serde::Deserialize)]
+struct PreCommandsDecision {
+    project_id: String,
+    #[serde(default)]
+    path: String,
+    /// The content digest of the exact script being decided on. Required, and
+    /// not derivable from the project alone: approving "this project's
+    /// pre_commands" without naming which script would silently bless whatever
+    /// arrived last.
+    digest: String,
+    /// `approved` | `rejected`.
+    action: String,
+}
+
+/// Approve or revoke one learned `pre_commands` script (§3.2).
+///
+/// The script is arbitrary shell that will run inside the sandbox of every
+/// agent inheriting this profile, so the decision is per exact content: the
+/// digest is the identity, and an edited script comes back as a new request
+/// rather than riding the old approval.
+async fn decide_pre_commands(
+    AdminUser(u): AdminUser,
+    State(app): State<Arc<App>>,
+    Json(req): Json<PreCommandsDecision>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let status = match req.action.as_str() {
+        "approve" | "approved" => "approved",
+        "reject" | "rejected" => "rejected",
+        other => return Err(ApiError::bad(format!("unknown action `{other}`"))),
+    };
+    let changed = app
+        .store
+        .set_pre_commands_status(&req.project_id, &req.path, &req.digest, status, &u.username)
+        .map_err(ApiError::from)?;
+    if changed == 0 {
+        return Err(ApiError::not_found("no such pre_commands request"));
+    }
+    app.store
+        .audit(
+            &u.username,
+            &format!("pre_commands_{status}"),
+            &req.project_id,
+            &req.digest,
+        )
+        .ok();
+    Ok(Json(json!({
+        "project_id": req.project_id, "path": req.path,
+        "digest": req.digest, "status": status
+    })))
+}
+
 async fn approve_image(
     AdminUser(u): AdminUser,
     State(app): State<Arc<App>>,

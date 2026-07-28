@@ -76,6 +76,40 @@ enum Command {
         #[arg(long, default_value = "cli")]
         by: String,
     },
+    /// Approve (or revoke) one egress host for one project (§7.1).
+    ApproveEgress {
+        project_id: String,
+        host: String,
+        /// Take the approval back. The row stays for the audit trail; the next
+        /// task dispatched simply stops carrying the host.
+        #[arg(long)]
+        revoke: bool,
+        #[arg(long, default_value = "cli")]
+        by: String,
+    },
+    /// List the `pre_commands` scripts agents have learned and offered to the
+    /// fleet, so there is something to read before approving one (§3.2).
+    ListPreCommands {
+        /// `pending_approval` | `approved` | `rejected` | `superseded`.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Approve (or reject) one learned `pre_commands` script (§3.2).
+    ///
+    /// Identified by content digest, not by project: this is arbitrary shell
+    /// that will run inside the sandbox of every agent inheriting the profile,
+    /// so the thing being approved is the exact script, and editing it asks
+    /// again.
+    ApprovePreCommands {
+        project_id: String,
+        digest: String,
+        #[arg(long, default_value = "")]
+        path: String,
+        #[arg(long)]
+        reject: bool,
+        #[arg(long, default_value = "cli")]
+        by: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -129,6 +163,50 @@ fn main() -> Result<()> {
             store.add_enrollment_token(&token, "cli", ttl_secs)?;
             println!("{token}");
             eprintln!("(single use, expires in {ttl_secs}s)");
+            Ok(())
+        }
+        Command::ApproveEgress { project_id, host, revoke, by } => {
+            let host = rc_core::egress::normalize(&host).map_err(|e| anyhow::anyhow!(e))?;
+            let store = open_store(cli.data_dir)?;
+            let status = if revoke { "rejected" } else { "approved" };
+            let changed = store.set_egress_status(&project_id, &host, status, &by)?;
+            if changed == 0 {
+                anyhow::bail!("no egress request for {project_id} / {host}");
+            }
+            store.audit(&by, &format!("egress_{status}"), &project_id, &host)?;
+            println!("{host} is now {status} for {project_id}");
+            Ok(())
+        }
+        Command::ListPreCommands { status } => {
+            let store = open_store(cli.data_dir)?;
+            let rows = store.list_pre_commands(status.as_deref())?;
+            if rows.is_empty() {
+                println!("nothing to show");
+                return Ok(());
+            }
+            for r in rows {
+                println!(
+                    "\n{} [{}]  project={} path={:?}  by={}",
+                    r.digest, r.status, r.project_id, r.path, r.requested_by
+                );
+                // The script itself, not a summary: approving a digest whose
+                // contents nobody printed would be approving nothing.
+                for c in &r.commands {
+                    println!("    {c}");
+                }
+            }
+            Ok(())
+        }
+        Command::ApprovePreCommands { project_id, digest, path, reject, by } => {
+            let store = open_store(cli.data_dir)?;
+            let status = if reject { "rejected" } else { "approved" };
+            let changed =
+                store.set_pre_commands_status(&project_id, &path, &digest, status, &by)?;
+            if changed == 0 {
+                anyhow::bail!("no pre_commands request {digest} for {project_id}");
+            }
+            store.audit(&by, &format!("pre_commands_{status}"), &project_id, &digest)?;
+            println!("{digest} is now {status} for {project_id}");
             Ok(())
         }
         Command::ApproveImage { env_id, by } => {

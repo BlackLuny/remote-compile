@@ -5,6 +5,7 @@ use crate::client::{self, ServerClient};
 use crate::config::WorkerConfig;
 use crate::docker::{self, Network, RunSpec, Sandbox};
 use crate::gitmirror::{BaselineSource, Mirror};
+use crate::proxy;
 use crate::workspace;
 use anyhow::{anyhow, Result};
 use rc_core::cas::FsCas;
@@ -333,6 +334,14 @@ impl Runner {
         env.push("HOME=/rc/home".to_string());
         env.push("TERM=dumb".to_string());
 
+        // Hosts the control plane approved for *this* project (§7.1). They get a
+        // listener of their own, alive only while this container is and holding
+        // a credential only this container is given, so the widened allowlist is
+        // reachable neither by whatever task lands here next nor by whatever
+        // task is running here alongside it.
+        // `_task_proxy` must outlive `self.sandbox.run`, hence the binding.
+        let (proxy_url, _task_proxy) = self.task_proxy(assignment).await;
+
         // A sub-project inside a monorepo builds from its own directory inside
         // the mounted workspace (§3.2). The path comes from the agent, so it is
         // checked rather than trusted: `../..` here would put the build's cwd
@@ -365,7 +374,7 @@ impl Runner {
             memory_mb: self.cfg.memory_mb,
             cpus: self.cfg.cpus,
             pids_limit: self.cfg.pids_limit,
-            network: match &self.proxy {
+            network: match &proxy_url {
                 Some(p) => Network::Egress { proxy: p.clone() },
                 None => Network::None,
             },
@@ -375,6 +384,68 @@ impl Runner {
     }
 
     /// Read-through cache: the local CAS first, the control plane second.
+    /// The proxy this task's container should use.
+    ///
+    /// With nothing extra approved — the ordinary case — that is the shared
+    /// listener, already running with the worker's own allowlist. When the
+    /// control plane has approved hosts for this project, the task gets a
+    /// listener of its own instead, carrying the worker's allowlist plus those
+    /// hosts, and it dies with the returned handle.
+    ///
+    /// Every build container shares one bridge, so binding a private listener
+    /// is not the same as owning it: the port is reachable from any container
+    /// on the worker. The task-scoped proxy is therefore given a credential
+    /// that goes into exactly one container's `http_proxy` URL, and serves
+    /// nobody else.
+    ///
+    /// The list comes from the assignment, which is the control plane speaking.
+    /// Nothing here reads what the agent asked for: that is a request, and a
+    /// worker that honoured it directly would let any agent widen its own
+    /// sandbox (§7.1/§8.3).
+    async fn task_proxy(
+        &self,
+        assignment: &pb::TaskAssignment,
+    ) -> (Option<String>, Option<proxy::ProxyHandle>) {
+        if assignment.egress_allow.is_empty() || self.proxy.is_none() {
+            return (self.proxy.clone(), None);
+        }
+        let mut allowlist = self.cfg.allowlist.clone();
+        allowlist.extend(assignment.egress_allow.iter().cloned());
+        let gateway = match self.sandbox.ensure_egress_network().await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, "no egress network; falling back to the shared proxy");
+                return (self.proxy.clone(), None);
+            }
+        };
+        let credential = ulid::Ulid::generate().to_string();
+        match proxy::listen(
+            gateway,
+            allowlist,
+            self.cfg.egress_byte_cap,
+            Some(credential),
+            self.cfg.egress_ports.clone(),
+            self.cfg.allow_private_egress,
+        )
+        .await
+        {
+            Ok((url, handle)) => {
+                tracing::info!(
+                    task = %assignment.task_id,
+                    hosts = ?assignment.egress_allow,
+                    "task-scoped egress proxy listening"
+                );
+                (Some(url), Some(handle))
+            }
+            // Falling back to the shared proxy is the safe direction: the build
+            // simply cannot reach the extra hosts and fails saying so.
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start a task-scoped proxy");
+                (self.proxy.clone(), None)
+            }
+        }
+    }
+
     async fn blob(&self, hash: &str, client: &mut ServerClient) -> Result<Option<Vec<u8>>> {
         if let Ok(data) = self.cas.get(hash) {
             return Ok(Some(data));

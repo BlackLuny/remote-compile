@@ -131,13 +131,16 @@ async fn run(data_dir: PathBuf, offline: bool) -> Result<()> {
 
     // §7.1: containers reach nothing but this proxy, and only for allowlisted
     // hosts.
+    // Held for the life of the process: dropping the handle stops the listener.
+    let mut _shared_proxy = None;
     let proxy_url = if offline {
         tracing::info!("running offline: build containers get --network=none");
         None
     } else {
         match start_proxy(&sandbox, &cfg).await {
-            Ok(url) => {
+            Ok((url, handle)) => {
                 tracing::info!(%url, "egress proxy listening");
+                _shared_proxy = Some(handle);
                 Some(url)
             }
             Err(e) => {
@@ -177,18 +180,23 @@ async fn run(data_dir: PathBuf, offline: bool) -> Result<()> {
     }
 }
 
-async fn start_proxy(sandbox: &Sandbox, cfg: &WorkerConfig) -> Result<String> {
+async fn start_proxy(
+    sandbox: &Sandbox,
+    cfg: &WorkerConfig,
+) -> Result<(String, proxy::ProxyHandle)> {
     let gateway = sandbox.ensure_egress_network().await?;
-    let server = Arc::new(proxy::ProxyServer {
-        allowlist: proxy::Allowlist::new(cfg.allowlist.clone()),
-        byte_cap: cfg.egress_byte_cap,
-    });
-    // Bind on the bridge gateway so only containers on rc-egress can reach it.
-    let addr = format!("{gateway}:0")
-        .parse()
-        .context("parse the egress gateway address")?;
-    let bound = server.bind(addr).await?;
-    Ok(format!("http://{gateway}:{}", bound.port()))
+    // The fleet proxy carries the same list for every task, so there is nothing
+    // here one project could steal from another: no credential.
+    let (url, handle) = proxy::listen(
+        gateway,
+        cfg.allowlist.clone(),
+        cfg.egress_byte_cap,
+        None,
+        cfg.egress_ports.clone(),
+        cfg.allow_private_egress,
+    )
+    .await?;
+    Ok((url, handle))
 }
 
 /// One connection to the control plane, from opening the channel to losing it.

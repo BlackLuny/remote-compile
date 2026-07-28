@@ -99,6 +99,35 @@ pub fn compute(input: FingerprintInput<'_>) -> Result<String, FingerprintError> 
     Ok(h.finalize().to_hex().to_string())
 }
 
+/// Fold the egress hosts a build may actually reach into its fingerprint.
+///
+/// The profile already carries what the repository *asked* for; this carries
+/// what the control plane *granted*, which is server-side state the agent
+/// cannot see. Three things depend on the distinction:
+///
+/// - approving a host has to invalidate the failure that not having it caused,
+///   or the developer keeps being served the pre-approval error;
+/// - revoking one has to invalidate the successes it produced;
+/// - a second project that copies the first's config gets the same requested
+///   list for free, so the request cannot be what separates their caches.
+///
+/// An empty grant leaves the fingerprint alone, so the ordinary build — no
+/// egress at all — still dedups across projects exactly as before.
+pub fn with_egress(fingerprint: &str, granted: &[String]) -> String {
+    if granted.is_empty() {
+        return fingerprint.to_string();
+    }
+    let mut hosts: Vec<&str> = granted.iter().map(|s| s.as_str()).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    let mut h = blake3::Hasher::new();
+    for part in std::iter::once(fingerprint).chain(hosts) {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
 /// Convenience wrapper over the wire type.
 pub fn compute_for(
     manifest_root_hash: &str,
@@ -129,6 +158,42 @@ mod tests {
             profile_canonical: prof,
             anchor_mount: "",
         }
+    }
+
+    #[test]
+    fn a_grant_makes_it_a_different_build_and_no_grant_changes_nothing() {
+        let base = compute(input("m1", DIGEST, "rustc 1.85.0", "cmd=cargo check")).unwrap();
+        // The ordinary build — no egress at all — must keep deduping across
+        // projects exactly as it did before this feature existed.
+        assert_eq!(with_egress(&base, &[]), base);
+
+        let granted = with_egress(&base, &["registry.corp".into()]);
+        assert_ne!(granted, base, "an approval must invalidate the failure it caused");
+
+        // Revoking is just as much a change as granting: the server folds the
+        // *current* grant into the *base* fingerprint on every submission, so
+        // losing the grant lands back on the key the ungranted build uses and
+        // the successes produced under it are no longer reachable.
+        assert_eq!(with_egress(&base, &[]), base);
+        assert_ne!(granted, with_egress(&base, &[]));
+
+        // Two projects that were granted different hosts do not share results,
+        // even though they may have requested identically.
+        let other = with_egress(&base, &["registry.other".into()]);
+        assert_ne!(granted, other);
+    }
+
+    #[test]
+    fn the_order_an_administrator_approved_in_is_not_part_of_the_build() {
+        let base = compute(input("m1", DIGEST, "rustc 1.85.0", "cmd=cargo check")).unwrap();
+        let one = with_egress(&base, &["b.example.com".into(), "a.example.com".into()]);
+        let two = with_egress(&base, &["a.example.com".into(), "b.example.com".into()]);
+        assert_eq!(one, two);
+        // …and neither is a duplicate approval.
+        assert_eq!(
+            one,
+            with_egress(&base, &["a.example.com".into(), "b.example.com".into(), "a.example.com".into()])
+        );
     }
 
     #[test]

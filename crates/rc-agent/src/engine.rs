@@ -85,6 +85,24 @@ impl Engine {
                 })
             }
         };
+        // The other direction: files `.gitignore` hides that the build still
+        // reads. A bad pattern stops here for the same reason — silently
+        // matching nothing looks exactly like a working include until the
+        // remote build cannot find the file.
+        let includes = match excludes::Includes::new(&self.repo_includes(&root)) {
+            Ok(i) => i,
+            Err(message) => {
+                return Ok(Outcome {
+                    task_id: String::new(),
+                    kind: None,
+                    status: "config_error".into(),
+                    text: format!(
+                        "✗ {} 的 include 配置有问题: {message}\n改好再试；控制面不会猜测它的含义。",
+                        rc_core::profile::REPO_CONFIG_FILE
+                    ),
+                })
+            }
+        };
 
         self.cfg.ensure_dirs()?;
 
@@ -109,7 +127,7 @@ impl Engine {
         }
 
         let cfg = &self.cfg;
-        let scan = match multiroot::scan_all(&layout, &excludes, |p| {
+        let scan = match multiroot::scan_all(&layout, &excludes, &includes, |p| {
             let index = StatIndex::open(&cfg.index_path(p))?;
             if index.is_empty() {
                 tracing::info!(root = %p.display(), "cold stat index: this first scan hashes every file");
@@ -175,11 +193,36 @@ impl Engine {
         // every answer — including the ones that never reach the network. A
         // remote-only failure caused by an exclusion is otherwise indorsable
         // from an ordinary compile error.
-        let exclude_note = describe_exclusions(&self.repo_excludes(&root));
+        // Included files are the same story pointed the other way: the repo told
+        // git to ignore them and this overrides that, so what got uploaded is
+        // named rather than left to be discovered.
+        let (egress_hosts, egress_problems) = self.repo_egress(&root);
+        let config_note = join_notes(
+            join_notes(
+                describe_exclusions(&self.repo_excludes(&root)),
+                describe_inclusions(includes.patterns()),
+            ),
+            describe_egress_problems(&egress_problems),
+        );
 
         // ---- local result cache: answer without touching the network ----
+        //
+        // §7.1: this cache is keyed on what the repository *asked* to reach.
+        // What the build's outcome actually depends on is what was *granted*,
+        // and only the control plane knows that. There is no way to key a local
+        // cache on something this process cannot observe, so a project that
+        // declares any egress at all does not get one.
+        //
+        // Keying on "is an approval pending" was tried and is wrong: a host can
+        // be rejected and later approved, or refused by the queue cap, and in
+        // both cases nothing is pending while the verdict still hangs on a
+        // decision that has not been made yet. Getting that wrong replays a
+        // pre-approval failure for a day, which is the exact bug this is here to
+        // prevent. The server's cache still answers — it folds the grant into
+        // its own key — so the cost is one round trip, not a rebuild.
+        let local_cache = local_cache_allowed(&egress_hosts);
         let results = ResultCache::open(&self.cfg.results_path())?;
-        if !req.no_cache {
+        if !req.no_cache && local_cache {
             if let Some((task_id, kind, cached)) =
                 results.get(&fingerprint, rc_core::TASK_CACHE_TTL_SECS)
             {
@@ -193,7 +236,7 @@ impl Engine {
                 };
                 let text = with_note(
                     format!("{rendered}\n(本地指纹缓存命中，未重新编译；task_id={task_id})"),
-                    &exclude_note,
+                    &config_note,
                 );
                 return Ok(Outcome {
                     task_id: task_id.clone(),
@@ -245,6 +288,11 @@ impl Engine {
             fingerprint: fingerprint.clone(),
             bundle_blob,
             no_cache: req.no_cache,
+            // A request the control plane records and an administrator decides
+            // on. The build is submitted either way: an unapproved host fails
+            // the build with a network error, which is a far better answer than
+            // refusing to compile anything until someone clicks.
+            egress: egress_hosts,
         };
 
         // What actually got synced beyond the named directory. Approval was
@@ -271,14 +319,24 @@ impl Engine {
             }
         }
 
+        // Named on the result, not logged and forgotten: a build that cannot
+        // reach a host it asked for fails with an ordinary network error, and
+        // nothing in that error says an approval is sitting in a queue.
+        let config_note = join_notes(
+            join_notes(config_note, describe_pending_egress(&handle.egress_pending)),
+            describe_refused_egress(&handle.egress_refused),
+        );
+
         if handle.cache_hit {
             let result = handle.result.clone().unwrap_or_default();
             let rendered = format_result(&handle.task_id, &result, self.cfg.max_diagnostics, true, bytes);
             // Only the result is cached. The notes below describe *this*
             // invocation's scan, and are recomputed on every call.
-            results.put(&fingerprint, &handle.task_id, &result).ok();
+            if local_cache {
+                results.put(&fingerprint, &handle.task_id, &result).ok();
+            }
             let mut text = with_note(rendered, &root_note);
-            text = with_note(text, &exclude_note);
+            text = with_note(text, &config_note);
             text = with_warnings(text, &scan.warnings);
             return Ok(Outcome {
                 task_id: handle.task_id,
@@ -293,15 +351,27 @@ impl Engine {
         let status = client.get_task(&handle.task_id, wait).await?;
         let mut outcome = self.render(&status, bytes);
         outcome.text = with_note(outcome.text, &root_note);
-        outcome.text = with_note(outcome.text, &exclude_note);
+        outcome.text = with_note(outcome.text, &config_note);
         // §4.3: a degraded enumeration is exactly the situation where a
         // remote/local divergence appears, so never hide it.
         outcome.text = with_warnings(outcome.text, &scan.warnings);
         if let Some(result) = &status.result {
+            // A build that failed *because* an egress approval had not landed
+            // yet must not be cached: the fingerprint does not change when the
+            // administrator approves, so the developer would keep being handed
+            // the pre-approval failure for the rest of the TTL — from a cache
+            // hit that never contacts the server and so never learns the
+            // approval happened. The server-side cache is safe from this
+            // because it folds the granted set into its own key; the agent
+            // cannot, so it declines to remember instead.
             if rc_core::TaskState::parse_or_default(&status.status).is_terminal() {
-                results.put(&fingerprint, &status.task_id, result).ok();
+                if local_cache {
+                    results.put(&fingerprint, &status.task_id, result).ok();
+                }
                 // Fleet learning (§3.2/§1.1 principle 4): the first agent to
-                // get a green build teaches every other agent how.
+                // get a green build teaches every other agent how. A green
+                // build is worth teaching whether or not something is still
+                // queued for approval — it evidently did not need it.
                 if result.kind == "success" && !client_profile.found {
                     self.publish_profile(&mut client, &project_id, &resolution).await;
                 }
@@ -326,6 +396,15 @@ impl Engine {
         }
         profile.target = resolution.profile.target.clone();
         profile.toolchain = resolution.profile.toolchain.clone();
+        // §3.2: a green build that needed a codegen step did not need it by
+        // accident, so the next agent should not have to work it out again.
+        // Sent as a *request*: the control plane keeps it out of the profile it
+        // hands other agents until an administrator has read it, because unlike
+        // every other field here this one is a program that will run inside
+        // their sandbox.
+        if !resolution.profile.pre_commands.clone().unwrap_or_default().is_empty() {
+            profile.pre_commands = resolution.profile.pre_commands.clone();
+        }
 
         let req = pb::UpsertProfileReq {
             project_id: project_id.to_string(),
@@ -473,6 +552,51 @@ impl Engine {
             .ok()
             .and_then(|text| rc_core::profile::parse_toml(&text).ok())
             .and_then(|p| p.profile.exclude)
+            .unwrap_or_default()
+    }
+
+    /// `egress` as declared by the repository itself. Only the repo file counts,
+    /// for the same reason as `exclude` and `include`: this widens what the
+    /// sandbox can reach, and a fleet-learned value doing that for a project
+    /// that never asked would be exactly backwards.
+    /// Returns the hosts worth sending and the problems worth telling the agent
+    /// about. Validating here is what turns a typo into a config error instead
+    /// of a build that fails much later with an ordinary network message; the
+    /// control plane validates again, because it trusts no agent.
+    ///
+    /// A malformed entry withholds only itself. `normalize_all` is
+    /// all-or-nothing by design — a config with three typos should take one
+    /// round trip to fix — but applying that here would mean one bad line
+    /// silently dropping every good one, and the whole point is that nothing
+    /// about egress should be silent.
+    fn repo_egress(&self, root: &Path) -> (Vec<String>, Vec<String>) {
+        let declared = std::fs::read_to_string(root.join(rc_core::profile::REPO_CONFIG_FILE))
+            .ok()
+            .and_then(|text| rc_core::profile::parse_toml(&text).ok())
+            .and_then(|p| p.profile.egress)
+            .unwrap_or_default();
+        let mut hosts = Vec::new();
+        let mut problems = Vec::new();
+        for entry in &declared {
+            match rc_core::egress::normalize(entry) {
+                Ok(host) => hosts.push(host),
+                Err(e) => problems.push(e),
+            }
+        }
+        hosts.sort();
+        hosts.dedup();
+        (hosts, problems)
+    }
+
+    /// `include` as declared by the repository itself. Only the repo file
+    /// counts, for the same reason `exclude` is read this way: it decides what
+    /// leaves this machine, and a fleet-learned pattern deciding that for a
+    /// project it has never seen would be exactly backwards.
+    fn repo_includes(&self, root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join(rc_core::profile::REPO_CONFIG_FILE))
+            .ok()
+            .and_then(|text| rc_core::profile::parse_toml(&text).ok())
+            .and_then(|p| p.profile.include)
             .unwrap_or_default()
     }
 
@@ -765,6 +889,79 @@ fn describe_exclusions(patterns: &[String]) -> String {
     )
 }
 
+/// The mirror of `describe_exclusions`: `include` uploads files the repository
+/// told git to ignore, which is a disclosure the caller should see named rather
+/// than infer from a byte count.
+fn describe_inclusions(patterns: &[String]) -> String {
+    if patterns.is_empty() {
+        return String::new();
+    }
+    format!(
+        "已按 include 附加同步 ({})：这些文件被 .gitignore 忽略，但仓库声明构建需要它们。",
+        patterns.join(", ")
+    )
+}
+
+/// Egress the repository asked for and nobody has approved yet (§7.1).
+fn describe_pending_egress(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "⏳ egress 待审批 ({})：这些域名在构建里仍然不可达，需要管理员批准后才生效。",
+        hosts.join(", ")
+    )
+}
+
+/// Egress entries that were never sent because they are not host names. Said
+/// here, at submit time, rather than left to surface as a network failure in a
+/// build log — the control plane would only log a warning nobody reads.
+fn describe_egress_problems(problems: &[String]) -> String {
+    if problems.is_empty() {
+        return String::new();
+    }
+    format!(
+        "⚠ egress 配置有误，以下条目已被忽略：\n  {}",
+        problems.join("\n  ")
+    )
+}
+
+/// Whether this project's verdicts may be remembered on this machine (§7.1).
+///
+/// A named function rather than an inline `is_empty()` because the reasoning is
+/// not obvious from the expression: the local cache is keyed on a fingerprint
+/// that contains what the repository *asked* to reach, while the outcome
+/// depends on what an administrator *granted* — state this process cannot see.
+/// Anything that can be settled later by a decision made elsewhere must not be
+/// remembered here, or an approval arrives and the developer keeps being handed
+/// the failure that preceded it.
+fn local_cache_allowed(egress_hosts: &[String]) -> bool {
+    egress_hosts.is_empty()
+}
+
+/// Hosts the control plane would not even queue for approval, because this
+/// project is at its cap. They are not pending, so nothing else will ever
+/// mention them — and the build will fail with a network error that looks
+/// exactly like a host nobody has got round to approving yet.
+fn describe_refused_egress(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "✗ egress 未受理 ({})：该 project 的审批队列已满，这些域名没有被登记，\
+         需要管理员先清理已有条目。",
+        hosts.join(", ")
+    )
+}
+
+fn join_notes(a: String, b: String) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => format!("{a}\n{b}"),
+    }
+}
+
 fn with_note(text: String, note: &str) -> String {
     if note.is_empty() {
         return text;
@@ -1040,6 +1237,40 @@ mod tests {
         };
         assert!(format_result("t", &result, 10, false, 2048).contains("synced=2.0KB"));
         assert!(!format_result("t", &result, 10, false, 0).contains("synced"));
+    }
+
+    #[test]
+    fn a_project_that_declares_egress_is_never_remembered_locally() {
+        assert!(local_cache_allowed(&[]), "an ordinary project keeps its local cache");
+        assert!(
+            !local_cache_allowed(&["registry.corp".to_string()]),
+            "a verdict that hangs on an approval must not be cached where the \
+             approval cannot be seen"
+        );
+    }
+
+    #[test]
+    fn a_bad_egress_line_withholds_only_itself_and_is_named() {
+        let root = std::env::temp_dir().join(format!("rc-egress-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(rc_core::profile::REPO_CONFIG_FILE),
+            "egress = [\"ok.example.com\", \"127.0.0.1\", \"https://x/y\", \"OK.example.com\"]\n",
+        )
+        .unwrap();
+
+        let engine = Engine::new(AgentConfig::default());
+        let (hosts, problems) = engine.repo_egress(&root);
+        // The good line survives, lowercased and deduplicated…
+        assert_eq!(hosts, vec!["ok.example.com"]);
+        // …and both bad ones are reported rather than silently dropped.
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("IP address")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("host names")), "{problems:?}");
+
+        let note = describe_egress_problems(&problems);
+        assert!(note.contains("127.0.0.1"), "{note}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

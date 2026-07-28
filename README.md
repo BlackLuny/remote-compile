@@ -179,6 +179,7 @@ features = ["ssr"]
 pre_commands = ["cargo run -p xtask codegen"]
 extra_roots = ["../private_tun"]                     # see below
 exclude = ["*.pem", "secrets/**"]                    # see below
+include = ["*.generated.rs"]                         # see below
 
 [tasks]
 check  = "cargo check --workspace --all-targets"
@@ -253,6 +254,52 @@ worker's git mirror cleaned out by hand. And it does not make the build work
 without the file — if the build reads it, the build fails remotely and passes
 locally, which is exactly the divergence §4.3 warns about. Every result names
 the active patterns for that reason.
+
+### Getting an ignored file onto the wire
+
+The same rule cuts the other way. Enumeration asks git what exists — tracked
+files, plus untracked ones git does not ignore — so a file the build reads and
+`.gitignore` covers is in none of its lists and never travels. Generated code is
+the usual one: `cargo prisma generate` writes `common/src/prisma.generated.rs`,
+`.gitignore` has `*.generated.rs`, the build `include!`s it, and the worker
+reports a module that will not resolve while every local build is green.
+Nothing in the diff explains it.
+
+```toml
+include = ["*.generated.rs", "gen/"]
+```
+
+Same syntax and the same reach as `exclude`: a directory name takes everything
+beneath it, and patterns apply to every synced root. Where the two overlap
+`exclude` wins, so a broad include can never reopen a file the repository went
+out of its way to withhold. The structural exclusions — `target/`, `.git/`,
+`node_modules/` — are not reachable at all.
+
+Keep the patterns narrow anyway. `include = ["*"]` is not "everything safe": it
+is every ignored file outside those structural directories, which on a real
+repository means logs, dumps, local databases and whatever else `.gitignore`
+exists to hold back. Name the files the build reads.
+
+Finding them costs one extra walk of the tree with ignore rules off, run only
+when `include` is non-empty. It skips the structural directories and any
+directory `exclude` withholds, which is what keeps it cheap — on a 5700-file
+repository it is about 20ms.
+
+A directory that is a root in its own right — a `.gitignore`d path dependency,
+say — answers for itself, and `include` stops at its edge, exactly as git stops
+at a submodule. Without that the enclosing repository could claim one file of a
+nested crate, be taken to have covered the whole thing, and sync it half-empty.
+
+Unlike `exclude` this leaves the L1 baseline alone. An included file is
+untracked by definition, so the `git bundle` never contained it and nothing is
+being claimed about history; it travels through the CAS like any other untracked
+file. Only the repository's own file may declare it — the same rule as `exclude`
+and `extra_roots`, for the same reason — and every result names the active
+patterns, because this uploads files the repository told git to ignore.
+
+Regenerating on the worker instead, with `pre_commands`, is the other option: it
+keeps the file off the wire entirely, at the cost of the generator needing to
+run in the sandbox on every cold build.
 
 ## Admin console
 

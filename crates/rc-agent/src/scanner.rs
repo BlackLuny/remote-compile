@@ -6,7 +6,7 @@
 //! produce the worst class of bug: builds that fail remotely and pass locally,
 //! with nothing in the diff to explain it (§4.3).
 
-use crate::excludes::Excludes;
+use crate::excludes::{Excludes, Includes};
 use crate::index::{Stat, StatIndex};
 use anyhow::{anyhow, Result};
 use rc_core::pb::{EntryType, FileEntry, Manifest};
@@ -17,6 +17,9 @@ use std::process::Command;
 #[derive(Debug)]
 pub struct Scan {
     pub manifest: Manifest,
+    /// Manifest paths that exist only because of `include`. A path git never
+    /// listed cannot stand in for the repository's own knowledge of a directory.
+    pub included: HashSet<String>,
     pub repo_url: Option<String>,
     pub is_git: bool,
     /// The first base commit ever seen in this worktree. Worktree identity is
@@ -84,13 +87,19 @@ pub enum Enumeration {
 }
 
 /// Enumerate, hash and package a worktree.
-pub fn scan(root: &Path, excludes: &Excludes, index: &mut StatIndex) -> Result<Scan, ScanError> {
-    scan_with(root, excludes, index, Enumeration::Auto)
+pub fn scan(
+    root: &Path,
+    excludes: &Excludes,
+    includes: &Includes,
+    index: &mut StatIndex,
+) -> Result<Scan, ScanError> {
+    scan_with(root, excludes, includes, index, Enumeration::Auto)
 }
 
 pub fn scan_with(
     root: &Path,
     excludes: &Excludes,
+    includes: &Includes,
     index: &mut StatIndex,
     mode: Enumeration,
 ) -> Result<Scan, ScanError> {
@@ -106,7 +115,7 @@ pub fn scan_with(
     loop {
         attempts += 1;
         let listing = if is_git {
-            git_listing(&root)?
+            git_listing(&root, excludes, includes)?
         } else {
             if !standalone {
                 warnings.push(
@@ -115,7 +124,7 @@ pub fn scan_with(
                         .to_string(),
                 );
             }
-            ignore_listing(&root, excludes, standalone)?
+            ignore_listing(&root, excludes, includes, standalone)?
         };
 
         let before = stat_all(&root, &listing.paths, excludes);
@@ -125,9 +134,9 @@ pub fn scan_with(
         // comparing only known paths cannot see it — and a manifest missing a
         // file that exists locally is precisely the §4.3 divergence.
         let after_listing = if is_git {
-            git_listing(&root)?
+            git_listing(&root, excludes, includes)?
         } else {
-            ignore_listing(&root, excludes, standalone)?
+            ignore_listing(&root, excludes, includes, standalone)?
         };
         let after = stat_all(&root, &after_listing.paths, excludes);
 
@@ -185,8 +194,15 @@ pub fn scan_with(
         let live: HashSet<String> = manifest.entries.iter().map(|e| e.path.clone()).collect();
         index.retain(&live).ok();
 
+        let included = listing
+            .included
+            .iter()
+            .filter(|p| manifest.entries.iter().any(|e| &&e.path == p))
+            .cloned()
+            .collect();
         return Ok(Scan {
             manifest,
+            included,
             repo_url,
             is_git,
             first_base_commit,
@@ -201,13 +217,16 @@ pub fn scan_with(
 #[derive(Debug, Default)]
 struct Listing {
     paths: Vec<String>,
+    /// Of `paths`, the ones only `include` produced. git disowns these, so they
+    /// cannot answer questions about what the repository covers (§multi-root).
+    included: HashSet<String>,
     /// Tracked *and* unmodified at `base_commit`: the worker can get these
     /// from its git mirror instead of the CAS (§4.1 L1).
     clean: HashSet<String>,
     base_commit: String,
 }
 
-fn git_listing(root: &Path) -> Result<Listing, ScanError> {
+fn git_listing(root: &Path, excludes: &Excludes, includes: &Includes) -> Result<Listing, ScanError> {
     let base_commit = git(root, &["rev-parse", "HEAD"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -243,14 +262,100 @@ fn git_listing(root: &Path) -> Result<Listing, ScanError> {
         paths.push(path);
     }
     paths.extend(untracked);
+    // Files git will not name at all, because it was told to ignore them. They
+    // are untracked by definition, so they never enter `clean` and the baseline
+    // is none the wiser: they travel through the CAS like any other untracked
+    // file.
+    // Only what git did *not* list. The walk runs with ignore rules off, so it
+    // also turns up plenty of files git knows perfectly well — and calling one
+    // of those "include-only" would tell multi-root that the repository does not
+    // know about a directory it tracks.
+    let git_listed: HashSet<String> = paths.iter().cloned().collect();
+    let included: HashSet<String> = ignored_but_included(root, excludes, includes)
+        .into_iter()
+        .filter(|p| !git_listed.contains(p))
+        .collect();
+    paths.extend(included.iter().cloned());
     paths.sort();
     paths.dedup();
 
-    Ok(Listing { paths, clean, base_commit })
+    Ok(Listing { paths, included, clean, base_commit })
+}
+
+/// The `include` walk (§4.3): find files `.gitignore` hides that the repository
+/// has declared load-bearing.
+///
+/// Asking git is not an option — the whole point is that git disowns these — so
+/// this walks the tree with ignore rules off. Two things keep that affordable:
+/// it runs only when `include` is non-empty, and it prunes the structurally
+/// excluded directories, which is where the bulk lives (`target/` alone is
+/// gigabytes and is never a source of load-bearing files).
+fn ignored_but_included(root: &Path, excludes: &Excludes, includes: &Includes) -> Vec<String> {
+    if includes.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .follow_links(false)
+        .filter_entry({
+            // Owned: `filter_entry` demands `'static`. Two reasons to refuse a
+            // directory — build output, which is gigabytes and never
+            // load-bearing, and a directory another root answers for.
+            let pruned = excludes.pruned_dir_names();
+            let user_pruned = excludes.clone_user_matcher();
+            let base = root.to_path_buf();
+            move |entry| {
+                if entry.file_type().is_some_and(|ft| !ft.is_dir()) {
+                    return true;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if pruned.contains(&name) {
+                    return false;
+                }
+                match entry.path().strip_prefix(&base) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => {
+                        // A directory the repository withheld is withheld
+                        // whatever `include` says, so there is nothing under it
+                        // worth walking.
+                        !user_pruned.prunes_user_dir(&rel.to_string_lossy().replace('\\', "/"))
+                    }
+                    _ => true,
+                }
+            }
+        });
+    for entry in walker.build().flatten() {
+        let Some(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        // `excludes` is applied again in `hash_entries`, so a path matching both
+        // is dropped either way; checking here keeps it out of the torn-snapshot
+        // comparison too, where a withheld file has no business appearing.
+        if rel.is_empty() || excludes.matches(&rel) || !includes.matches(&rel) {
+            continue;
+        }
+        found.push(rel);
+    }
+    found
 }
 
 /// Degraded enumeration for non-git directories (§4.3 fallback).
-fn ignore_listing(root: &Path, excludes: &Excludes, standalone: bool) -> Result<Listing, ScanError> {
+fn ignore_listing(
+    root: &Path,
+    excludes: &Excludes,
+    includes: &Includes,
+    standalone: bool,
+) -> Result<Listing, ScanError> {
     let mut paths = Vec::new();
     let mut walker = ignore::WalkBuilder::new(root);
     walker
@@ -276,9 +381,20 @@ fn ignore_listing(root: &Path, excludes: &Excludes, standalone: bool) -> Result<
         }
         paths.push(rel);
     }
+    // This walk applies `.gitignore` too, so the same files are hidden from it
+    // as from git — and `include` has to reach them here as well. As above, only
+    // the ones this enumeration missed count as include-only.
+    let walked: HashSet<String> = paths.iter().cloned().collect();
+    let included: HashSet<String> = ignored_but_included(root, excludes, includes)
+        .into_iter()
+        .filter(|p| !walked.contains(p))
+        .collect();
+    paths.extend(included.iter().cloned());
     paths.sort();
+    paths.dedup();
     Ok(Listing {
         paths,
+        included,
         clean: HashSet::new(),
         base_commit: String::new(),
     })
@@ -362,14 +478,19 @@ fn hash_entries(
 
 /// Enumerate a root the same way `scan` would, without hashing anything.
 /// Used to re-check the whole root set after a multi-root sweep.
-pub fn enumerate(root: &Path, excludes: &Excludes, mode: Enumeration) -> Result<Vec<String>, ScanError> {
+pub fn enumerate(
+    root: &Path,
+    excludes: &Excludes,
+    includes: &Includes,
+    mode: Enumeration,
+) -> Result<Vec<String>, ScanError> {
     let root = root
         .canonicalize()
         .map_err(|e| ScanError::Other(anyhow!("canonicalize {}: {e}", root.display())))?;
     let listing = if mode == Enumeration::Auto && git_root(&root).is_some() {
-        git_listing(&root)?
+        git_listing(&root, excludes, includes)?
     } else {
-        ignore_listing(&root, excludes, mode == Enumeration::Standalone)?
+        ignore_listing(&root, excludes, includes, mode == Enumeration::Standalone)?
     };
     Ok(listing
         .paths
@@ -547,7 +668,7 @@ mod tests {
 
     fn scan_repo(dir: &Path) -> Scan {
         let mut idx = StatIndex::open_memory().unwrap();
-        scan(dir, &ex(&[]), &mut idx).expect("scan should succeed")
+        scan(dir, &ex(&[]), &Includes::none(), &mut idx).expect("scan should succeed")
     }
 
     fn paths(s: &Scan) -> Vec<String> {
@@ -585,6 +706,187 @@ mod tests {
         );
     }
 
+    fn inc(patterns: &[&str]) -> Includes {
+        let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+        Includes::new(&owned).unwrap()
+    }
+
+    #[test]
+    fn an_ignored_file_the_repo_declares_load_bearing_is_synced() {
+        // The zfc case: generated code the build `#[path = ...]`s in, covered by
+        // a `*.generated.rs` rule. git lists it nowhere, so without `include`
+        // the remote build fails on a module that exists perfectly well locally.
+        let d = repo("include-generated");
+        write(&d, ".gitignore", "*.generated.rs\n");
+        write(&d, "src/lib.rs", "#[path = \"prisma.generated.rs\"] mod prisma;");
+        commit_all(&d);
+        write(&d, "src/prisma.generated.rs", "pub struct Client;");
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&[]), &inc(&["*.generated.rs"]), &mut idx).unwrap();
+        let p = paths(&s);
+        assert!(p.contains(&"src/prisma.generated.rs".to_string()), "{p:?}");
+        // Untracked by definition, so it cannot ride the baseline — and the
+        // baseline itself is untouched, unlike with `exclude`.
+        assert!(s.manifest.baseline);
+        let entry = s
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == "src/prisma.generated.rs")
+            .unwrap();
+        assert!(!entry.in_baseline, "an ignored file is not in the git bundle");
+    }
+
+    #[test]
+    fn including_an_already_tracked_file_changes_nothing() {
+        // The baseline is left on because an included file is untracked *by
+        // definition* — but nothing stops a pattern from also naming a file
+        // somebody `git add -f`'d. It must then appear exactly once, and still
+        // ride the bundle rather than being uploaded a second time.
+        let d = repo("include-tracked");
+        write(&d, ".gitignore", "*.generated.rs\n");
+        write(&d, "src/lib.rs", "mod gen;");
+        write(&d, "src/gen.generated.rs", "// forced into git");
+        run_git(&d, &["add", "-f", "."]);
+        commit_all(&d);
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&[]), &inc(&["*.generated.rs"]), &mut idx).unwrap();
+        let hits: Vec<_> = s
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| e.path == "src/gen.generated.rs")
+            .collect();
+        assert_eq!(hits.len(), 1, "enumerated twice: {:?}", paths(&s));
+        assert!(hits[0].in_baseline, "a tracked file still comes from the bundle");
+        assert!(s.manifest.baseline);
+    }
+
+    #[test]
+    fn exclude_wins_where_include_overlaps_it() {
+        // Otherwise a broad include would quietly re-open a file the repository
+        // went out of its way to withhold.
+        let d = repo("include-vs-exclude");
+        write(&d, ".gitignore", "*.generated.rs\nlocal.pem\n");
+        write(&d, "src/lib.rs", "fn main() {}");
+        commit_all(&d);
+        write(&d, "src/keys.generated.rs", "const KEY: &str = \"secret\";");
+        write(&d, "local.pem", "-----BEGIN PRIVATE KEY-----");
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["*.generated.rs"]), &inc(&["*.generated.rs", "*.pem"]), &mut idx)
+            .unwrap();
+        let p = paths(&s);
+        assert!(!p.contains(&"src/keys.generated.rs".to_string()), "{p:?}");
+        assert!(p.contains(&"local.pem".to_string()), "an include with no exclusion still applies");
+    }
+
+    #[test]
+    fn an_excluded_directory_is_withheld_even_when_include_names_it() {
+        // What this locks is the outcome, not the walk: `exclude` wins. The
+        // walk *also* refuses to descend there, which is a saving rather than a
+        // behaviour — see `prunes_user_dir`'s own test, because no scan result
+        // can tell the two apart.
+        let d = repo("include-excluded-dir");
+        write(&d, ".gitignore", "dumps/\n");
+        write(&d, "src/main.rs", "fn main() {}");
+        commit_all(&d);
+        write(&d, "dumps/customers.generated.rs", "// huge and private");
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&["dumps/"]), &inc(&["*.generated.rs"]), &mut idx).unwrap();
+        assert!(
+            !paths(&s).iter().any(|p| p.starts_with("dumps/")),
+            "{:?}",
+            paths(&s)
+        );
+    }
+
+    #[test]
+    fn include_cannot_reach_into_build_output() {
+        // `include = ["*"]` must not turn `target/` into a several-gigabyte
+        // upload: the structural exclusions are not negotiable, and the walk
+        // never descends there in the first place.
+        let d = repo("include-target");
+        write(&d, "src/main.rs", "fn main() {}");
+        commit_all(&d);
+        write(&d, "target/debug/huge.rlib", "x".repeat(1000).as_str());
+
+        let mut idx = StatIndex::open_memory().unwrap();
+        let s = scan(&d, &ex(&[]), &inc(&["*"]), &mut idx).unwrap();
+        assert!(!paths(&s).iter().any(|x| x.starts_with("target/")), "{:?}", paths(&s));
+    }
+
+    #[test]
+    fn an_included_file_that_changes_mid_scan_is_still_caught() {
+        // §4.2 works by enumerating, hashing, RE-enumerating and diffing the
+        // stats — so it only protects paths both enumerations produce. Drive the
+        // very functions `scan_with` drives, with the tree changing in between:
+        // a generated file rewritten by a codegen that is still running is
+        // exactly the case that would otherwise compile a torn tree.
+        let d = repo("include-unstable");
+        write(&d, ".gitignore", "*.generated.rs\n");
+        write(&d, "src/lib.rs", "mod x;");
+        commit_all(&d);
+        write(&d, "src/x.generated.rs", "// v1");
+
+        let excludes = ex(&[]);
+        let includes = inc(&["*.generated.rs"]);
+        let d = d.canonicalize().unwrap();
+
+        let first = git_listing(&d, &excludes, &includes).unwrap();
+        assert!(first.paths.contains(&"src/x.generated.rs".to_string()));
+        let before = stat_all(&d, &first.paths, &excludes);
+
+        // The codegen writes again, and adds a second file while it is at it.
+        write(&d, "src/x.generated.rs", "// v2, longer than the first");
+        write(&d, "src/y.generated.rs", "// appeared mid-scan");
+
+        let second = git_listing(&d, &excludes, &includes).unwrap();
+        let after = stat_all(&d, &second.paths, &excludes);
+
+        let changed: Vec<&String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|p| before.get(*p) != after.get(*p))
+            .collect();
+        assert!(
+            changed.iter().any(|p| *p == "src/x.generated.rs"),
+            "a rewritten included file must count as movement: {changed:?}"
+        );
+        assert!(
+            changed.iter().any(|p| *p == "src/y.generated.rs"),
+            "and one that appeared only in the second pass: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn changing_an_included_file_changes_the_root_hash() {
+        // Included content is build input, so a stale fingerprint would serve a
+        // cached verdict for code the worker never compiled.
+        let d = repo("include-fingerprint");
+        write(&d, ".gitignore", "*.generated.rs\n");
+        write(&d, "src/lib.rs", "mod x;");
+        commit_all(&d);
+        write(&d, "src/x.generated.rs", "// v1");
+
+        let mut a = StatIndex::open_memory().unwrap();
+        let first = scan(&d, &ex(&[]), &inc(&["*.generated.rs"]), &mut a).unwrap();
+        write(&d, "src/x.generated.rs", "// v2 — different content entirely");
+        let mut b = StatIndex::open_memory().unwrap();
+        let second = scan(&d, &ex(&[]), &inc(&["*.generated.rs"]), &mut b).unwrap();
+
+        assert_ne!(first.manifest.root_hash, second.manifest.root_hash);
+
+        // And the include itself must move the hash, or the same fingerprint
+        // would cover two different sets of sources.
+        let mut c = StatIndex::open_memory().unwrap();
+        let without = scan(&d, &ex(&[]), &Includes::none(), &mut c).unwrap();
+        assert_ne!(second.manifest.root_hash, without.manifest.root_hash);
+    }
+
     #[test]
     fn build_output_never_syncs_even_when_tracked() {
         let d = repo("target");
@@ -606,7 +908,7 @@ mod tests {
         write(&d, "local.pem", "-----BEGIN PRIVATE KEY-----");
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &Includes::none(), &mut idx).unwrap();
         let p = paths(&s);
         assert!(!p.contains(&"local.pem".to_string()), "{p:?}");
         assert!(p.contains(&"src/main.rs".to_string()));
@@ -626,7 +928,7 @@ mod tests {
         commit_all(&d);
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &Includes::none(), &mut idx).unwrap();
 
         assert!(!paths(&s).contains(&"private.pem".to_string()));
         assert!(
@@ -657,7 +959,7 @@ mod tests {
         std::fs::remove_file(d.join("private.pem")).unwrap();
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &Includes::none(), &mut idx).unwrap();
         assert!(
             !s.manifest.baseline,
             "HEAD still carries the secret, so the bundle would too"
@@ -679,7 +981,7 @@ mod tests {
 
         assert!(!d.join("private.pem").exists());
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &Includes::none(), &mut idx).unwrap();
         assert!(
             !s.manifest.baseline,
             "history still reaches the secret, so the baseline cannot be used"
@@ -694,7 +996,7 @@ mod tests {
         write(&d, "src/main.rs", "fn main() {}");
         commit_all(&d);
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&["*.pem"]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&["*.pem"]), &Includes::none(), &mut idx).unwrap();
         assert!(!s.manifest.baseline);
     }
 
@@ -707,7 +1009,7 @@ mod tests {
         commit_all(&d);
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&["secrets"]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&["secrets"]), &Includes::none(), &mut idx).unwrap();
         let p = paths(&s);
         assert!(!p.iter().any(|x| x.starts_with("secrets/")), "{p:?}");
         assert!(p.contains(&"src/main.rs".to_string()));
@@ -719,7 +1021,7 @@ mod tests {
         write(&d, "private.pem", "-----BEGIN PRIVATE KEY-----");
         commit_all(&d);
         let mut idx = StatIndex::open_memory().unwrap();
-        let s = scan(&d, &ex(&[]), &mut idx).unwrap();
+        let s = scan(&d, &ex(&[]), &Includes::none(), &mut idx).unwrap();
         assert!(s.manifest.baseline);
         assert!(paths(&s).contains(&"private.pem".to_string()));
     }
@@ -734,9 +1036,9 @@ mod tests {
         commit_all(&d);
 
         let mut a = StatIndex::open_memory().unwrap();
-        let with = scan(&d, &ex(&[]), &mut a).unwrap();
+        let with = scan(&d, &ex(&[]), &Includes::none(), &mut a).unwrap();
         let mut b = StatIndex::open_memory().unwrap();
-        let without = scan(&d, &ex(&["secret.txt"]), &mut b).unwrap();
+        let without = scan(&d, &ex(&["secret.txt"]), &Includes::none(), &mut b).unwrap();
         assert_ne!(with.manifest.root_hash, without.manifest.root_hash);
     }
 
@@ -899,17 +1201,17 @@ mod tests {
         commit_all(&d);
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let first = scan(&d, &ex(&[]), &mut idx).unwrap();
+        let first = scan(&d, &ex(&[]), &Includes::none(), &mut idx).unwrap();
         assert_eq!(first.hashed, 10);
         assert_eq!(first.reused, 0);
 
-        let second = scan(&d, &ex(&[]), &mut idx).unwrap();
+        let second = scan(&d, &ex(&[]), &Includes::none(), &mut idx).unwrap();
         assert_eq!(second.reused, 10, "nothing changed, so nothing is re-hashed");
         assert_eq!(second.hashed, 0);
         assert_eq!(first.manifest.root_hash, second.manifest.root_hash);
 
         write(&d, "f3.rs", "edited content");
-        let third = scan(&d, &ex(&[]), &mut idx).unwrap();
+        let third = scan(&d, &ex(&[]), &Includes::none(), &mut idx).unwrap();
         assert_eq!(third.hashed, 1, "only the edited file is re-hashed");
         assert_ne!(second.manifest.root_hash, third.manifest.root_hash);
     }
@@ -923,12 +1225,12 @@ mod tests {
         commit_all(&d);
 
         let mut idx = StatIndex::open_memory().unwrap();
-        let first = scan(&d, &Excludes::structural(&[]), &mut idx).unwrap();
+        let first = scan(&d, &Excludes::structural(&[]), &Includes::none(), &mut idx).unwrap();
         assert!(!first.first_base_commit.is_empty());
 
         write(&d, "a.rs", "v2");
         commit_all(&d);
-        let second = scan(&d, &Excludes::structural(&[]), &mut idx).unwrap();
+        let second = scan(&d, &Excludes::structural(&[]), &Includes::none(), &mut idx).unwrap();
 
         assert_ne!(
             first.manifest.base_commit, second.manifest.base_commit,
@@ -967,7 +1269,7 @@ mod tests {
         // The scanner surfaces it as a typed error rather than a silent merge.
         let err = ScanError::CaseConflict("src/Main.rs".into(), "src/main.rs".into());
         assert!(err.to_string().contains("differ only by case"));
-        let _ = scan(&d, &Excludes::structural(&[]), &mut idx);
+        let _ = scan(&d, &Excludes::structural(&[]), &Includes::none(), &mut idx);
     }
 
     #[test]
