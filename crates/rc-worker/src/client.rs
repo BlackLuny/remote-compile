@@ -151,6 +151,7 @@ pub fn progress_event(task_id: &str, phase: &str, detail: &str) -> WorkerEvent {
             task_id: task_id.to_string(),
             phase: phase.to_string(),
             detail: detail.to_string(),
+            ..Default::default()
         })),
     }
 }

@@ -58,6 +58,21 @@ pub struct Policy {
     pub alert_webhook: String,
     /// Fallback image when nothing else is known.
     pub default_image: String,
+    // Per-mechanism kill-switches (§6); default on for independent rollback.
+    #[serde(default = "default_true")]
+    pub verdict_v2: bool,
+    #[serde(default = "default_true")]
+    pub task_contract_env: bool,
+    #[serde(default = "default_true")]
+    pub budget_gate: bool,
+    #[serde(default = "default_true")]
+    pub diag_delta: bool,
+    #[serde(default = "default_true")]
+    pub unit_progress: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Policy {
@@ -78,6 +93,11 @@ impl Default for Policy {
             min_disk_free_gb: 20,
             alert_webhook: String::new(),
             default_image: "docker.io/library/rust:1-bookworm".into(),
+            verdict_v2: true,
+            task_contract_env: true,
+            budget_gate: true,
+            diag_delta: true,
+            unit_progress: true,
         }
     }
 }

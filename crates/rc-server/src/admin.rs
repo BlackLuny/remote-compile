@@ -602,6 +602,7 @@ async fn get_task_log(
             limit: p.limit,
             grep: p.grep,
             tail: p.tail,
+            ..Default::default()
         })
         .map_err(ApiError::from)?;
     Ok(Json(json!({

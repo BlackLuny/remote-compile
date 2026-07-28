@@ -67,6 +67,8 @@ const MIGRATIONS: &[&str] = &[
        PRIMARY KEY (project_id, path, digest)
      );
      CREATE INDEX IF NOT EXISTS idx_pre_commands_status ON pre_commands(status);",
+    // Unit progress totals for history_ref (mechanism five). Additive.
+    "ALTER TABLE tasks ADD COLUMN units_seen_total INTEGER NOT NULL DEFAULT 0;",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -623,11 +625,14 @@ impl Store {
         Ok(())
     }
 
+    /// Update status only while the task is non-terminal (R6/B5). Progress or
+    /// late phase events must not resurrect a canceled/done task.
     pub fn set_status(&self, id: &str, status: &str) -> Result<()> {
         self.conn.lock().execute(
             "UPDATE tasks SET status = ?2,
                  started_at = CASE WHEN ?2 = 'running' AND started_at = 0 THEN ?3 ELSE started_at END
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND status NOT IN ('done','failed','canceled','superseded')",
             params![id, status, now_ms()],
         )?;
         Ok(())
@@ -655,17 +660,22 @@ impl Store {
 
     /// Return a task to the queue after an infra failure, remembering which
     /// workers already tried (they must not be picked again — §6.2).
-    pub fn requeue(&self, id: &str, failed_worker: &str, reason: &str) -> Result<()> {
+    ///
+    /// Conditional on non-terminal status (R6'): if cancel already won, this
+    /// returns `false` and leaves the row alone.
+    pub fn requeue(&self, id: &str, failed_worker: &str, reason: &str) -> Result<bool> {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT OR IGNORE INTO task_attempts (task_id, worker_id, at, error) VALUES (?1,?2,?3,?4)",
             params![id, failed_worker, now_ms(), reason],
         )?;
-        conn.execute(
-            "UPDATE tasks SET status = 'queued', worker_id = '' WHERE id = ?1",
+        let n = conn.execute(
+            "UPDATE tasks SET status = 'queued', worker_id = ''
+             WHERE id = ?1
+               AND status NOT IN ('done','failed','canceled','superseded')",
             params![id],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     pub fn attempted_workers(&self, task_id: &str) -> Result<Vec<String>> {
@@ -687,6 +697,8 @@ impl Store {
         Ok(rows)
     }
 
+    /// Write a terminal result only if the row is still non-terminal.
+    /// Returns true when this caller won the race (R6).
     pub fn complete_task(
         &self,
         id: &str,
@@ -694,14 +706,16 @@ impl Store {
         result: &rc_core::pb::TaskResult,
         log_ref: &str,
         image: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let stats = result.stats.unwrap_or_default();
         let json = serde_json::to_string(result)?;
-        self.conn.lock().execute(
+        let n = self.conn.lock().execute(
             "UPDATE tasks SET status = ?2, result_kind = ?3, result_json = ?4, log_ref = ?5,
                  finished_at = ?6, sync_ms = ?7, build_ms = ?8, bytes_synced = ?9,
-                 image = CASE WHEN ?10 != '' THEN ?10 ELSE image END
-             WHERE id = ?1",
+                 image = CASE WHEN ?10 != '' THEN ?10 ELSE image END,
+                 units_seen_total = ?11
+             WHERE id = ?1
+               AND status NOT IN ('done','failed','canceled','superseded')",
             params![
                 id,
                 status,
@@ -713,9 +727,100 @@ impl Store {
                 stats.build_ms as i64,
                 stats.bytes_synced as i64,
                 image,
+                result.units_seen_total as i64,
             ],
         )?;
-        Ok(())
+        Ok(n > 0)
+    }
+
+    /// Recent completed tasks' build_ms p50 and last units_seen_total for
+    /// progress reference (not an ETA).
+    pub fn history_ref(
+        &self,
+        project_id: &str,
+        task_type: &str,
+        n: usize,
+    ) -> Result<(Option<u64>, Option<u32>)> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT build_ms, units_seen_total FROM tasks
+             WHERE project_id = ?1 AND task_type = ?2 AND status = 'done'
+               AND result_kind IN ('success','compile_error','env_error')
+             ORDER BY finished_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, task_type, n as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut build_ms: Vec<u64> = Vec::new();
+        let mut last_units: Option<u32> = None;
+        for row in rows {
+            let (ms, units) = row?;
+            if ms > 0 {
+                build_ms.push(ms as u64);
+            }
+            if last_units.is_none() && units > 0 {
+                last_units = Some(units as u32);
+            }
+        }
+        if build_ms.is_empty() {
+            return Ok((None, last_units));
+        }
+        build_ms.sort_unstable();
+        let p50 = build_ms[build_ms.len() / 2];
+        Ok((Some(p50), last_units))
+    }
+
+    /// Resolve a baseline task for diagnostic delta.
+    /// `mode`: auto | none | last_success | <task_id>
+    ///
+    /// Only tasks that finished **before** `before_finished_at` (with id
+    /// tie-break) are candidates — so the current task never becomes its own
+    /// baseline, and a later sibling never pretends to be history (R4/B1).
+    pub fn resolve_baseline(
+        &self,
+        project_id: &str,
+        worktree_id: &str,
+        task_type: &str,
+        mode: &str,
+        exclude_task_id: &str,
+        before_finished_at: i64,
+    ) -> Result<Option<TaskRow>> {
+        if mode.is_empty() || mode == "none" {
+            return Ok(None);
+        }
+        if mode != "auto" && mode != "last_success" {
+            if mode == exclude_task_id {
+                return Ok(None);
+            }
+            return self.get_task(mode);
+        }
+        let kind_filter = if mode == "last_success" {
+            " AND result_kind = 'success'"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT * FROM tasks
+             WHERE project_id = ?1 AND worktree_id = ?2 AND task_type = ?3
+               AND status = 'done' AND id != ?4
+               AND (finished_at < ?5 OR (finished_at = ?5 AND id < ?4))
+               {kind_filter}
+             ORDER BY finished_at DESC, id DESC LIMIT 1"
+        );
+        let conn = self.conn.lock();
+        conn.query_row(
+            &sql,
+            params![
+                project_id,
+                worktree_id,
+                task_type,
+                exclude_task_id,
+                before_finished_at
+            ],
+            TaskRow::from_row,
+        )
+        .optional()
+        .context("resolve_baseline")
     }
 
     /// Serve a cached result under a fresh task id so the agent still gets a
@@ -2396,6 +2501,7 @@ mod tests {
             conn.execute_batch(
                 "ALTER TABLE images DROP COLUMN last_env_error_project;
                  ALTER TABLE tasks DROP COLUMN egress_key;
+                 ALTER TABLE tasks DROP COLUMN units_seen_total;
                  INSERT INTO images (id, digest) VALUES ('e1', 'd');
                  INSERT INTO tasks (id, task_type, fingerprint) VALUES ('t1', 'check', 'fp1');",
             )
@@ -2524,7 +2630,7 @@ mod tests {
         let s = store();
         s.insert_task(&task("t1", "f", "k", "s", "queued"), "{}", "{}", "").unwrap();
         s.assign_to_worker("t1", "w-a").unwrap();
-        s.requeue("t1", "w-a", "docker daemon gone").unwrap();
+        assert!(s.requeue("t1", "w-a", "docker daemon gone").unwrap());
         assert_eq!(s.attempted_workers("t1").unwrap(), vec!["w-a"]);
         assert_eq!(s.get_task("t1").unwrap().unwrap().status, "queued");
     }
@@ -2638,5 +2744,130 @@ mod tests {
             serde_json::from_str::<rc_core::pb::ResolvedProfile>(partial).is_err(),
             "a profile missing its fields must not deserialise into defaults"
         );
+    }
+
+    #[test]
+    fn resolve_baseline_excludes_current_task() {
+        let s = store();
+        s.insert_task(&task("t1", "fp1", "k", "s", "queued"), "{}", "{}", "")
+            .unwrap();
+        s.complete_task(
+            "t1",
+            "done",
+            &TaskResult {
+                kind: "compile_error".into(),
+                diagnostics: vec![rc_core::pb::Diagnostic {
+                    level: "error".into(),
+                    code: "E0308".into(),
+                    message: "mismatched types".into(),
+                    file: "src/a.rs".into(),
+                    line: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "",
+            "",
+        )
+        .unwrap();
+        s.insert_task(&task("t2", "fp2", "k", "s", "queued"), "{}", "{}", "")
+            .unwrap();
+        s.complete_task(
+            "t2",
+            "done",
+            &TaskResult {
+                kind: "compile_error".into(),
+                ..Default::default()
+            },
+            "",
+            "",
+        )
+        .unwrap();
+        let t2 = s.get_task("t2").unwrap().unwrap();
+        let base = s
+            .resolve_baseline("p1", "w1", "check", "auto", "t2", t2.finished_at)
+            .unwrap()
+            .expect("t1");
+        assert_eq!(base.id, "t1");
+        let t1 = s.get_task("t1").unwrap().unwrap();
+        assert!(
+            s.resolve_baseline("p1", "w1", "check", "auto", "t1", t1.finished_at)
+                .unwrap()
+                .is_none(),
+            "first task has no prior baseline"
+        );
+        assert!(s
+            .resolve_baseline("p1", "w-other", "check", "auto", "t2", t2.finished_at)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn complete_task_loses_to_cancel_and_vice_versa() {
+        let s = store();
+        s.insert_task(&task("t1", "fp", "k", "s", "running"), "{}", "{}", "")
+            .unwrap();
+        let cancel = TaskResult {
+            kind: "infra_error".into(),
+            summary: "canceled".into(),
+            ..Default::default()
+        };
+        let done = TaskResult {
+            kind: "success".into(),
+            summary: "ok".into(),
+            ..Default::default()
+        };
+        assert!(s.complete_task("t1", "canceled", &cancel, "", "").unwrap());
+        assert!(!s.complete_task("t1", "done", &done, "", "").unwrap());
+        assert_eq!(s.get_task("t1").unwrap().unwrap().status, "canceled");
+
+        s.insert_task(&task("t2", "fp2", "k", "s", "running"), "{}", "{}", "")
+            .unwrap();
+        assert!(s.complete_task("t2", "done", &done, "", "").unwrap());
+        assert!(!s.complete_task("t2", "canceled", &cancel, "", "").unwrap());
+        assert_eq!(s.get_task("t2").unwrap().unwrap().status, "done");
+    }
+
+    #[test]
+    fn set_status_does_not_resurrect_terminal() {
+        let s = store();
+        s.insert_task(&task("t1", "fp", "k", "s", "running"), "{}", "{}", "")
+            .unwrap();
+        s.complete_task(
+            "t1",
+            "canceled",
+            &TaskResult {
+                kind: "infra_error".into(),
+                ..Default::default()
+            },
+            "",
+            "",
+        )
+        .unwrap();
+        s.set_status("t1", "running").unwrap();
+        assert_eq!(s.get_task("t1").unwrap().unwrap().status, "canceled");
+    }
+
+    #[test]
+    fn requeue_does_not_resurrect_canceled() {
+        // R6': cancel wins before requeue → stays canceled.
+        let s = store();
+        s.insert_task(&task("t1", "fp", "k", "s", "running"), "{}", "{}", "")
+            .unwrap();
+        assert!(s
+            .complete_task(
+                "t1",
+                "canceled",
+                &TaskResult {
+                    kind: "infra_error".into(),
+                    summary: "canceled".into(),
+                    ..Default::default()
+                },
+                "",
+                "",
+            )
+            .unwrap());
+        assert!(!s.requeue("t1", "w-a", "infra").unwrap());
+        assert_eq!(s.get_task("t1").unwrap().unwrap().status, "canceled");
     }
 }

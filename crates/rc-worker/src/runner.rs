@@ -10,7 +10,7 @@ use crate::workspace;
 use anyhow::{anyhow, Result};
 use rc_core::cas::FsCas;
 use rc_core::model::TaskType;
-use rc_core::pb::{self, EntryType, TaskAssignment, TaskDone, TaskResult, TaskStats};
+use rc_core::pb::{self, worker_event, EntryType, TaskAssignment, TaskDone, TaskResult, TaskStats};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -221,7 +221,59 @@ impl Runner {
             .await;
 
         let build_started = std::time::Instant::now();
-        let output = self.run_build(&assignment, &profile, &root).await?;
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::watch::channel(rc_core::progress::UnitProgress::default());
+        // Emitter: throttle ≥2s, never blocks the log collector (F26.3).
+        let emit_task_id = task_id.clone();
+        let emit_events = events.clone();
+        let emitter = tokio::spawn(async move {
+            // Throttle ≥2s: mark dirty on change, flush latest on interval (R7').
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // consume immediate first tick
+            let mut dirty = false;
+            loop {
+                tokio::select! {
+                    changed = progress_rx.changed() => {
+                        if changed.is_err() {
+                            // Channel closed: flush latest then exit.
+                            let p = progress_rx.borrow().clone();
+                            if p.units_seen > 0 || !p.current_unit.is_empty() {
+                                let mut ev = client::progress_event(&emit_task_id, "", &p.current_unit);
+                                if let Some(worker_event::Body::Progress(ref mut tp)) = ev.body {
+                                    tp.phase.clear();
+                                    tp.current_unit = p.current_unit.clone();
+                                    tp.units_seen = p.units_seen;
+                                }
+                                let _ = emit_events.send(ev).await;
+                            }
+                            break;
+                        }
+                        dirty = true;
+                    }
+                    _ = interval.tick() => {
+                        if dirty {
+                            dirty = false;
+                            let p = progress_rx.borrow().clone();
+                            if p.units_seen > 0 || !p.current_unit.is_empty() {
+                                let mut ev = client::progress_event(&emit_task_id, "", &p.current_unit);
+                                if let Some(worker_event::Body::Progress(ref mut tp)) = ev.body {
+                                    tp.phase.clear();
+                                    tp.current_unit = p.current_unit.clone();
+                                    tp.units_seen = p.units_seen;
+                                }
+                                let _ = emit_events.send(ev).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let output = self
+            .run_build(&assignment, &profile, &root, Some(progress_tx))
+            .await?;
+        // Drop the sender so the emitter flushes and exits.
+        let _ = emitter.await;
         let build_ms = build_started.elapsed().as_millis() as u64;
 
         // ---- interpret ----
@@ -229,12 +281,19 @@ impl Runner {
         let diagnostics = adapter.parse_diagnostics(&output.stdout, &output.stderr);
         let task_type = TaskType::parse_or_default(&assignment.task_type);
         let combined = output.combined();
-        let classification = rc_core::diag::classify(
+        let command_is_default = rc_core::contract::command_is_default_resolved(
+            task_type,
+            &assignment.command,
+            &profile,
+        );
+        let classification = rc_core::diag::classify_with_exec(
             task_type,
             output.exit_code,
             output.timed_out,
+            &output.exec,
             &diagnostics,
             &combined,
+            command_is_default,
         );
         let (top, truncated) = rc_core::diag::top_diagnostics(&diagnostics, 50);
 
@@ -269,6 +328,10 @@ impl Runner {
                 exit_code: output.exit_code,
                 truncated_diagnostics: truncated,
                 env_hints: classification.env_hints,
+                verdict: Some(classification.verdict),
+                test_summary: classification.test_summary,
+                units_seen_total: output.units_seen,
+                diag_delta: None,
             }),
             log_blob,
             log_lines: combined.lines().count() as u64,
@@ -281,6 +344,7 @@ impl Runner {
         assignment: &TaskAssignment,
         profile: &pb::ResolvedProfile,
         root: &Path,
+        progress: Option<tokio::sync::watch::Sender<rc_core::progress::UnitProgress>>,
     ) -> Result<docker::RunOutput> {
         let adapter = rc_core::adapter::for_name(&profile.adapter);
         let cache = adapter.cache_config(profile);
@@ -379,6 +443,7 @@ impl Runner {
                 None => Network::None,
             },
             labels,
+            progress,
         };
         self.sandbox.run(&spec).await
     }
@@ -899,5 +964,74 @@ mod tests {
         assert!(p2.try_lock().is_err());
         drop(held);
         assert!(p2.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn progress_throttle_flushes_after_window_without_more_changes() {
+        // R7': one change, no further updates → flush after 2s interval.
+        let (tx, mut rx) = tokio::sync::watch::channel(rc_core::progress::UnitProgress::default());
+        let (ev_tx, mut ev_rx) = mpsc::channel::<pb::WorkerEvent>(8);
+        let emit_task_id = "t-prog".to_string();
+        let emitter = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            let mut dirty = false;
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            let p = rx.borrow().clone();
+                            if p.units_seen > 0 {
+                                let mut ev = client::progress_event(&emit_task_id, "", &p.current_unit);
+                                if let Some(worker_event::Body::Progress(ref mut tp)) = ev.body {
+                                    tp.phase.clear();
+                                    tp.units_seen = p.units_seen;
+                                    tp.current_unit = p.current_unit.clone();
+                                }
+                                let _ = ev_tx.send(ev).await;
+                            }
+                            break;
+                        }
+                        dirty = true;
+                    }
+                    _ = interval.tick() => {
+                        if dirty {
+                            dirty = false;
+                            let p = rx.borrow().clone();
+                            if p.units_seen > 0 {
+                                let mut ev = client::progress_event(&emit_task_id, "", &p.current_unit);
+                                if let Some(worker_event::Body::Progress(ref mut tp)) = ev.body {
+                                    tp.phase.clear();
+                                    tp.units_seen = p.units_seen;
+                                    tp.current_unit = p.current_unit.clone();
+                                }
+                                let _ = ev_tx.send(ev).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        tx.send(rc_core::progress::UnitProgress {
+            units_seen: 3,
+            current_unit: "foo".into(),
+        })
+        .unwrap();
+        // No further changes; wait for interval flush.
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ev_rx.recv())
+            .await
+            .expect("timeout waiting for flush")
+            .expect("channel closed");
+        match ev.body {
+            Some(worker_event::Body::Progress(p)) => {
+                assert!(p.phase.is_empty());
+                assert_eq!(p.units_seen, 3);
+                assert_eq!(p.current_unit, "foo");
+            }
+            other => panic!("expected Progress, got {other:?}"),
+        }
+        drop(tx);
+        let _ = emitter.await;
     }
 }

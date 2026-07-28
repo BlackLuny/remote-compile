@@ -55,17 +55,23 @@ impl std::error::Error for FingerprintError {}
 
 /// How the worker turns a (manifest, profile) pair into a running build:
 /// where the workspace is mounted, what the working directory ends up being,
-/// how the command is invoked.
+/// how the command is invoked, and which contract default_env is injected.
 ///
-/// None of that is visible in the manifest or the profile, so without a version
-/// here a change to it reuses results computed under the *old* semantics. That
-/// is not hypothetical: `abi2` exists because mounting the workspace at `/work`
-/// instead of at the sub-project path changes which `Cargo.toml` a build with
-/// `path = "crates/backend"` actually compiles, while leaving every hashed
-/// input identical.
+/// None of that is visible in the manifest or the profile alone, so without a
+/// version here a change to it reuses results computed under the *old*
+/// semantics. That is not hypothetical:
+/// - `abi2`: mounting the workspace at `/work` instead of at the sub-project
+///   path changes which `Cargo.toml` a build with `path = "crates/backend"`
+///   actually compiles, while leaving every hashed input identical.
+/// - `abi3`: TaskContract default_env (e.g. `CARGO_PROFILE_TEST_DEBUG=0`)
+///   changes execution semantics for the same canonical profile fields.
 ///
-/// **Bump this whenever execution semantics change**, even when no type does.
-pub const EXECUTOR_ABI: &str = "abi2";
+/// **Bump triggers (keep this list current):**
+/// - workspace mount layout or workdir resolution
+/// - contract `default_env` semantic change
+/// - command construction that is not already in the profile canonical form
+/// - any other execution-only change that would poison the task cache
+pub const EXECUTOR_ABI: &str = "abi3";
 
 /// True when an image reference names an immutable digest.
 pub fn is_digest_ref(image: &str) -> bool {
@@ -158,6 +164,28 @@ mod tests {
             profile_canonical: prof,
             anchor_mount: "",
         }
+    }
+
+    #[test]
+    fn abi3_does_not_match_abi2_fingerprint() {
+        // Contract default_env changes execution semantics; old cached results
+        // under abi2 must not be reused.
+        let mut h = blake3::Hasher::new();
+        for part in [
+            "abi2",
+            "",
+            "m1",
+            DIGEST,
+            "rustc 1.85.0",
+            blake3::hash(b"cmd=cargo test").to_hex().as_str(),
+        ] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        let old = h.finalize().to_hex().to_string();
+        let new = compute(input("m1", DIGEST, "rustc 1.85.0", "cmd=cargo test")).unwrap();
+        assert_ne!(old, new, "ABI bump must invalidate the task cache");
+        assert_eq!(EXECUTOR_ABI, "abi3");
     }
 
     #[test]

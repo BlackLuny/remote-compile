@@ -269,29 +269,46 @@ impl AgentApi for AgentService {
     }
 
     /// Long-poll: return as soon as the task reaches a terminal state, or when
-    /// `wait_secs` elapses. A short wait turns most incremental checks into a
-    /// synchronous call (§12).
+    /// `wait_secs` elapses. With `return_on_progress`, also returns when
+    /// progress_version advances past `seen_progress_version` (§5.4).
     async fn get_task(&self, req: Request<TaskQuery>) -> Result<Response<TaskStatus>, Status> {
         self.authenticate(&req)?;
         let req = req.into_inner();
         let deadline = std::time::Duration::from_secs(req.wait_secs.min(60) as u64);
         let mut rx = self.app.events.subscribe();
 
+        let baseline = if req.baseline.is_empty() {
+            "auto".to_string()
+        } else {
+            req.baseline.clone()
+        };
         let current = self
             .app
-            .task_status(&req.task_id)
+            .task_status_with_baseline(&req.task_id, &baseline)
             .map_err(internal)?
             .ok_or_else(|| Status::not_found(format!("unknown task {}", req.task_id)))?;
         if req.wait_secs == 0 || rc_core::TaskState::parse_or_default(&current.status).is_terminal() {
             return Ok(Response::new(current));
         }
+        if req.return_on_progress && current.progress_version > req.seen_progress_version {
+            return Ok(Response::new(current));
+        }
 
+        let task_id = req.task_id.clone();
+        let return_on_progress = req.return_on_progress;
+        let seen = req.seen_progress_version;
+        let baseline_c = baseline.clone();
         let wait = async {
             loop {
                 match rx.recv().await {
-                    Ok(ev) if ev.task_id() == Some(req.task_id.as_str()) => {
-                        if let Ok(Some(st)) = self.app.task_status(&req.task_id) {
+                    Ok(ev) if ev.task_id() == Some(task_id.as_str()) => {
+                        if let Ok(Some(st)) =
+                            self.app.task_status_with_baseline(&task_id, &baseline_c)
+                        {
                             if rc_core::TaskState::parse_or_default(&st.status).is_terminal() {
+                                return Some(st);
+                            }
+                            if return_on_progress && st.progress_version > seen {
                                 return Some(st);
                             }
                         }
@@ -299,8 +316,13 @@ impl AgentApi for AgentService {
                     Ok(_) => {}
                     // Lagged: fall back to a direct read rather than giving up.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if let Ok(Some(st)) = self.app.task_status(&req.task_id) {
+                        if let Ok(Some(st)) =
+                            self.app.task_status_with_baseline(&task_id, &baseline_c)
+                        {
                             if rc_core::TaskState::parse_or_default(&st.status).is_terminal() {
+                                return Some(st);
+                            }
+                            if return_on_progress && st.progress_version > seen {
                                 return Some(st);
                             }
                         }
@@ -316,7 +338,7 @@ impl AgentApi for AgentService {
             _ => {
                 let st = self
                     .app
-                    .task_status(&req.task_id)
+                    .task_status_with_baseline(&req.task_id, &baseline)
                     .map_err(internal)?
                     .ok_or_else(|| Status::not_found("task vanished"))?;
                 Ok(Response::new(st))
@@ -546,6 +568,90 @@ impl AgentApi for AgentService {
             workers,
             queue_depth: counters.queued as u32,
             running: counters.running as u32,
+        }))
+    }
+
+    /// Cancel a running or pending task. Mirrors the admin path: server writes
+    /// the terminal CANCELED state first, then tells the worker to kill.
+    ///
+    /// Ownership: `project_id` on the request must match the task row. The
+    /// bearer token is fleet-wide — this check prevents mis-cancel, not a
+    /// malicious agent holding a valid fleet token (R6).
+    async fn cancel_task(
+        &self,
+        req: Request<CancelTaskReq>,
+    ) -> Result<Response<CancelTaskResp>, Status> {
+        self.authenticate(&req)?;
+        let req = req.into_inner();
+        let task = self
+            .app
+            .store
+            .get_task(&req.task_id)
+            .map_err(internal)?
+            .ok_or_else(|| Status::not_found(format!("unknown task {}", req.task_id)))?;
+        if req.project_id.is_empty() || req.project_id != task.project_id {
+            return Err(Status::permission_denied(
+                "project_id does not match the task; refuse to cancel",
+            ));
+        }
+        if rc_core::TaskState::parse_or_default(&task.status).is_terminal() {
+            return Ok(Response::new(CancelTaskResp {
+                task_id: req.task_id,
+                status: task.status,
+                message: "task already finished".into(),
+            }));
+        }
+        // Server-written CANCELED verdict (§5.5); classify never produces this.
+        let canceled = TaskResult {
+            kind: "infra_error".into(),
+            summary: "任务已取消".into(),
+            verdict: Some(Verdict {
+                status: rc_core::pb::Status::Canceled as i32,
+                attribution: Attribution::AttrUnknown as i32,
+                rule: "canceled".into(),
+                remediation: vec!["任务已由调用方取消".into()],
+                evidence: None,
+            }),
+            ..Default::default()
+        };
+        // Conditional complete: loses to a concurrent TaskDone (R6).
+        let won = self
+            .app
+            .store
+            .complete_task(&req.task_id, "canceled", &canceled, "", "")
+            .map_err(internal)?;
+        if !won {
+            let latest = self
+                .app
+                .store
+                .get_task(&req.task_id)
+                .map_err(internal)?
+                .map(|t| t.status)
+                .unwrap_or_default();
+            return Ok(Response::new(CancelTaskResp {
+                task_id: req.task_id,
+                status: latest,
+                message: "task already finished".into(),
+            }));
+        }
+        self.app.progress.lock().remove(&req.task_id);
+        self.app.store.unpin_task_blobs(&req.task_id).map_err(internal)?;
+        if !task.worker_id.is_empty() {
+            self.app
+                .workers
+                .send(
+                    &task.worker_id,
+                    ServerCmd {
+                        body: Some(server_cmd::Body::CancelTaskId(req.task_id.clone())),
+                    },
+                )
+                .await;
+        }
+        self.app.publish_task(&req.task_id);
+        Ok(Response::new(CancelTaskResp {
+            task_id: req.task_id,
+            status: "canceled".into(),
+            message: "canceled".into(),
         }))
     }
 }

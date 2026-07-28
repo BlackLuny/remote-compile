@@ -112,6 +112,9 @@ fn main() -> Result<()> {
                 command: None,
                 wait_secs,
                 no_cache,
+                env: Default::default(),
+                no_remediate: false,
+                baseline: "auto".into(),
             }))?;
             println!("{}", outcome.text);
             // Some outcomes never became a task at all — nothing was submitted,

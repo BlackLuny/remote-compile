@@ -69,6 +69,8 @@ pub struct RunSpec {
     pub pids_limit: i64,
     pub network: Network,
     pub labels: HashMap<String, String>,
+    /// Latest-value channel for unit progress; log collection never waits on it.
+    pub progress: Option<tokio::sync::watch::Sender<rc_core::progress::UnitProgress>>,
 }
 
 /// `uid:gid` the build runs as — this process's own.
@@ -97,6 +99,12 @@ pub struct RunOutput {
     /// human output goes to stderr (§10.2). Merging them breaks JSON parsing.
     pub stdout: String,
     pub stderr: String,
+    /// Docker-level execution evidence, collected by inspect before the
+    /// container is removed. Feeds the evidence-backed classifier.
+    pub exec: rc_core::pb::ExecEvidence,
+    /// Units observed from Compiling/Checking lines during the stream.
+    pub units_seen: u32,
+    pub current_unit: String,
 }
 
 impl RunOutput {
@@ -294,7 +302,13 @@ impl Sandbox {
             .with_context(|| format!("create container for {}", spec.name))?;
         let id = created.id;
 
-        let result = self.run_created(&id, spec).await;
+        let mut result = self.run_created(&id, spec).await;
+        // Inspect *before* remove: OOMKilled and exit signal live only while
+        // the container still exists. Classification needs this evidence.
+        if let Ok(out) = result.as_mut() {
+            let timed_out = out.timed_out;
+            out.exec = self.inspect_exec_evidence(&id, timed_out).await;
+        }
         // Always clean up, even when the run failed: a leaked container pins
         // its volumes and the workspace bind.
         if let Err(e) = self
@@ -312,6 +326,32 @@ impl Sandbox {
             tracing::warn!(container = %id, error = %e, "failed to remove container");
         }
         result
+    }
+
+    /// Read OOMKilled / exit signal. `worker_killed` is set when *we* timed
+    /// out the container — not when the kernel did.
+    async fn inspect_exec_evidence(&self, id: &str, worker_timed_out: bool) -> rc_core::pb::ExecEvidence {
+        let mut exec = rc_core::pb::ExecEvidence {
+            worker_killed: worker_timed_out,
+            ..Default::default()
+        };
+        match self.docker.inspect_container(id, None).await {
+            Ok(info) => {
+                if let Some(state) = info.state {
+                    exec.oom_killed = state.oom_killed.unwrap_or(false);
+                    // ExitCode is often signal+128 when killed by signal.
+                    if let Some(code) = state.exit_code {
+                        if (129..=159).contains(&code) {
+                            exec.term_signal = (code - 128) as i32;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(container = %id, error = %e, "inspect for exec evidence failed");
+            }
+        }
+        exec
     }
 
     async fn run_created(&self, id: &str, spec: &RunSpec) -> Result<RunOutput> {
@@ -332,22 +372,43 @@ impl Sandbox {
         let mut out = RunOutput::default();
         let deadline = std::time::Duration::from_secs(spec.timeout_secs.max(1) as u64);
         let started = std::time::Instant::now();
+        let mut unit = rc_core::progress::UnitProgress::default();
+        // Incomplete line buffer so Compiling lines split across chunks still match.
+        let mut line_buf = String::new();
 
         let collect = async {
             while let Some(chunk) = logs.next().await {
-                match chunk {
+                let piece = match chunk {
                     Ok(bollard::container::LogOutput::StdOut { message }) => {
-                        out.stdout.push_str(&String::from_utf8_lossy(&message));
+                        let s = String::from_utf8_lossy(&message).into_owned();
+                        out.stdout.push_str(&s);
+                        s
                     }
                     Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        out.stderr.push_str(&String::from_utf8_lossy(&message));
+                        let s = String::from_utf8_lossy(&message).into_owned();
+                        out.stderr.push_str(&s);
+                        s
                     }
                     Ok(other) => {
-                        out.stdout.push_str(&other.to_string());
+                        let s = other.to_string();
+                        out.stdout.push_str(&s);
+                        s
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "log stream error");
                         break;
+                    }
+                };
+                line_buf.push_str(&piece);
+                while let Some(pos) = line_buf.find('\n') {
+                    let line = line_buf[..pos].to_string();
+                    line_buf.drain(..=pos);
+                    if rc_core::progress::observe_line(&mut unit, &line) {
+                        out.units_seen = unit.units_seen;
+                        out.current_unit = unit.current_unit.clone();
+                        if let Some(tx) = &spec.progress {
+                            let _ = tx.send(unit.clone());
+                        }
                     }
                 }
             }
@@ -355,6 +416,7 @@ impl Sandbox {
 
         if tokio::time::timeout(deadline, collect).await.is_err() {
             out.timed_out = true;
+            out.exec.worker_killed = true;
             let _ = self
                 .docker
                 .kill_container(id, None::<KillContainerOptions>)
@@ -383,6 +445,7 @@ impl Sandbox {
             Ok(None) => out.exit_code = 0,
             Err(_) => {
                 out.timed_out = true;
+                out.exec.worker_killed = true;
                 out.exit_code = 137;
                 let _ = self
                     .docker

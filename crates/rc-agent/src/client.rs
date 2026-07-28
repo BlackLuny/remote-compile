@@ -128,11 +128,22 @@ impl AgentClient {
     }
 
     pub async fn get_task(&mut self, task_id: &str, wait_secs: u32) -> Result<TaskStatus> {
+        self.get_task_ex(task_id, wait_secs, "auto").await
+    }
+
+    pub async fn get_task_ex(
+        &mut self,
+        task_id: &str,
+        wait_secs: u32,
+        baseline: &str,
+    ) -> Result<TaskStatus> {
         Ok(self
             .inner
             .get_task(self.authed(TaskQuery {
                 task_id: task_id.to_string(),
                 wait_secs,
+                baseline: baseline.to_string(),
+                ..Default::default()
             }))
             .await
             .map_err(status_error)?
@@ -143,6 +154,19 @@ impl AgentClient {
         Ok(self
             .inner
             .get_log(self.authed(query))
+            .await
+            .map_err(status_error)?
+            .into_inner())
+    }
+
+    pub async fn cancel_task(&mut self, task_id: &str, project_id: &str) -> Result<CancelTaskResp> {
+        Ok(self
+            .inner
+            .cancel_task(self.authed(CancelTaskReq {
+                task_id: task_id.to_string(),
+                agent_session: self.token.clone(), // not used for auth; identity is project_id
+                project_id: project_id.to_string(),
+            }))
             .await
             .map_err(status_error)?
             .into_inner())

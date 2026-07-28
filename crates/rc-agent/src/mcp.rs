@@ -75,12 +75,20 @@ impl McpServer {
             }
             Err(McpError::InvalidParams(m)) => error_response(id, -32602, &m),
             // A failed build is a valid tool result, not a protocol error: the
-            // agent must be able to read it as content.
-            Err(McpError::Tool(m)) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "content": [{ "type": "text", "text": m }], "isError": true }
-            }),
+            // agent must be able to read it as content. Still goes through the
+            // budget gate (R3).
+            Err(McpError::Tool(m)) => {
+                let text = if self.engine.cfg.budget_gate {
+                    rc_core::budget::gate_response(&m)
+                } else {
+                    m
+                };
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": text }], "isError": true }
+                })
+            }
         })
     }
 
@@ -114,8 +122,17 @@ impl McpServer {
             "prepare_env" => self.tool_prepare_env(&args).await?,
             "get_env_status" => self.tool_env_status(&args).await?,
             "list_workers" => self.tool_list_workers().await?,
+            "cancel" => self.tool_cancel(&args).await?,
             other => return Err(McpError::InvalidParams(format!("unknown tool `{other}`"))),
         };
+        // Sole hard budget exit for every tool (R3). Errors also go through
+        // McpError::Tool → same gate below when re-mapped.
+        let text = if self.engine.cfg.budget_gate {
+            rc_core::budget::gate_response(&text)
+        } else {
+            text
+        };
+        debug_assert!(text.len() <= rc_core::budget::RESPONSE_BUDGET || !self.engine.cfg.budget_gate);
         Ok(json!({ "content": [{ "type": "text", "text": text }] }))
     }
 
@@ -126,12 +143,27 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .map(TaskType::parse_or_default)
             .unwrap_or(TaskType::Check);
+        let mut env = std::collections::BTreeMap::new();
+        if let Some(obj) = args.get("env").and_then(|v| v.as_object()) {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    env.insert(k.clone(), s.to_string());
+                }
+            }
+        }
         let req = CheckRequest {
             path,
             task,
             command: args.get("command").and_then(|v| v.as_str()).map(String::from),
             wait_secs: args.get("wait_secs").and_then(|v| v.as_u64()).map(|v| v as u32),
             no_cache: args.get("no_cache").and_then(|v| v.as_bool()).unwrap_or(false),
+            env,
+            no_remediate: args.get("no_remediate").and_then(|v| v.as_bool()).unwrap_or(false),
+            baseline: args
+                .get("baseline")
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto")
+                .to_string(),
         };
         self.engine
             .check(req)
@@ -143,8 +175,12 @@ impl McpServer {
     async fn tool_get_result(&self, args: &Value) -> Result<String, McpError> {
         let task_id = required_str(args, "task_id")?;
         let wait = args.get("wait_secs").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let baseline = args
+            .get("baseline")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto");
         self.engine
-            .get_result(&task_id, wait)
+            .get_result_with_baseline(&task_id, wait, baseline)
             .await
             .map(|o| o.text)
             .map_err(|e| McpError::Tool(e.to_string()))
@@ -167,6 +203,7 @@ impl McpServer {
                     .unwrap_or_default()
                     .to_string(),
                 tail: args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false),
+                ..Default::default()
             })
             .await
             .map_err(|e| McpError::Tool(e.to_string()))?;
@@ -174,20 +211,61 @@ impl McpServer {
         if chunk.total_lines == 0 {
             return Ok("(该任务没有日志：可能是缓存命中，或任务尚未执行)".into());
         }
+        let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+        let gated = if self.engine.cfg.budget_gate {
+            {
+                let line_byte_offset = args.get("line_byte_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                // Reserve room for header + pagination footer so final ≤ 8KB.
+                let header_reserve = 180;
+                rc_core::budget::gate_log_lines(
+                    &chunk.lines,
+                    chunk.offset + 1,
+                    raw,
+                    line_byte_offset,
+                    header_reserve,
+                )
+            }
+        } else {
+            rc_core::budget::BudgetedText {
+                text: chunk.lines.join("\n"),
+                next_offset: chunk.offset + chunk.lines.len() as u64,
+                ..Default::default()
+            }
+        };
+        let next = if gated.next_offset > 0 {
+            gated.next_offset
+        } else {
+            chunk.next_offset.max(chunk.offset + chunk.lines.len() as u64)
+        };
         let mut text = format!(
-            "lines {}..{} of {}\n",
+            "lines {}..{} of {}  next_offset={next}  bytes_omitted={}\n",
             chunk.offset,
             chunk.offset + chunk.lines.len() as u64,
-            chunk.total_lines
+            chunk.total_lines,
+            gated.bytes_omitted
         );
-        text.push_str(&chunk.lines.join("\n"));
-        if chunk.truncated {
-            text.push_str(&format!(
-                "\n… 还有更多；下一页: get_log(task_id=\"{task_id}\", offset={}, limit={limit})",
-                chunk.offset + chunk.lines.len() as u64
-            ));
+        text.push_str(&gated.text);
+        if chunk.truncated || gated.next_byte_offset > 0 {
+            if gated.next_byte_offset > 0 {
+                text.push_str(&format!(
+                    "\n… 行内续读: get_log(task_id=\"{task_id}\", offset={}, raw=true, line_byte_offset={})",
+                    chunk.offset, gated.next_byte_offset
+                ));
+            } else {
+                text.push_str(&format!(
+                    "\n… 还有更多；下一页: get_log(task_id=\"{task_id}\", offset={next}, limit={limit})"
+                ));
+            }
         }
         Ok(text)
+    }
+
+    async fn tool_cancel(&self, args: &Value) -> Result<String, McpError> {
+        let task_id = required_str(args, "task_id")?;
+        self.engine
+            .cancel(&task_id)
+            .await
+            .map_err(|e| McpError::Tool(e.to_string()))
     }
 
     async fn tool_build_profile(&self, args: &Value) -> Result<String, McpError> {
@@ -386,7 +464,10 @@ pub fn tool_definitions() -> Vec<Value> {
                     "task": { "type": "string", "enum": ["check", "build", "test", "clippy"], "default": "check" },
                     "command": { "type": "string", "description": "覆盖默认命令（少用；优先写进 .remote-compile.toml）" },
                     "wait_secs": { "type": "integer", "description": "同步等待秒数，默认 4" },
-                    "no_cache": { "type": "boolean", "description": "跳过指纹缓存强制重编，默认 false" }
+                    "no_cache": { "type": "boolean", "description": "跳过指纹缓存强制重编，默认 false" },
+                    "env": { "type": "object", "description": "请求级环境变量（分层叠加；有 denylist）", "additionalProperties": { "type": "string" } },
+                    "no_remediate": { "type": "boolean", "description": "关闭 OOM 自动降配重试，默认 false" },
+                    "baseline": { "type": "string", "description": "诊断增量基线：auto|none|last_success|<task_id>，默认 auto" }
                 },
                 "required": ["path"]
             }
@@ -404,6 +485,15 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "cancel",
+            "description": "取消仍在执行的任务（镜像管理端 cancel 路径）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "task_id": { "type": "string" } },
+                "required": ["task_id"]
+            }
+        }),
+        json!({
             "name": "get_log",
             "description": "分页取全量构建日志。必须带 limit/grep —— 完整日志动辄上万行，\
                             全量拉取会挤爆上下文。定位问题优先用 grep=\"error\"。",
@@ -414,7 +504,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "offset": { "type": "integer", "default": 0 },
                     "limit": { "type": "integer", "default": 100, "maximum": 1000 },
                     "grep": { "type": "string", "description": "只返回包含该子串的行（不区分大小写）" },
-                    "tail": { "type": "boolean", "description": "从末尾取，默认 false" }
+                    "tail": { "type": "boolean", "description": "从末尾取，默认 false" },
+                    "raw": { "type": "boolean", "description": "跳过单行省略，仍受响应总上限约束" },
+                    "line_byte_offset": { "type": "integer", "description": "raw 模式下单行内续读的字节偏移" }
                 },
                 "required": ["task_id"]
             }
@@ -533,10 +625,11 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        // §12 table.
+        // §12 table (+ cancel for mechanism five).
         for expected in [
             "check",
             "get_result",
+            "cancel",
             "get_log",
             "get_build_profile",
             "list_envs",
@@ -546,7 +639,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing tool {expected}");
         }
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 9);
     }
 
     #[test]

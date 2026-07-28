@@ -177,6 +177,12 @@ impl ResultCache {
     }
 
     pub fn put(&self, fingerprint: &str, task_id: &str, result: &rc_core::pb::TaskResult) -> Result<()> {
+        // Same cacheable set as the server (§1.3): only success / compile_error.
+        // Caching OOM or env failures would freeze a resource verdict for 24h.
+        let kind = rc_core::ResultKind::parse_or_default(&result.kind);
+        if !kind.is_cacheable() {
+            return Ok(());
+        }
         let json = serde_json::to_string(result).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO results (fingerprint, task_id, summary, kind, result, at)
@@ -372,14 +378,12 @@ mod tests {
 
     #[test]
     fn a_cache_hit_replays_the_whole_verdict_not_just_its_kind() {
-        // The cached answer has to be as useful as the one it stands in for.
-        // An env_error replayed as the bare word "env_error" would drop the
-        // missing dependency the first answer named — right when the agent is
-        // retrying because of it.
-        //
         // Stored as data, not as rendered text: rendering at write time freezes
         // that call's `max_diagnostics` and its `synced=` byte count into an
         // answer replayed later by a hit that synced nothing.
+        //
+        // Only success/compile_error are cacheable (§1.3); env_error (OOM etc.)
+        // must not stick for 24h.
         let cache = ResultCache::open_memory().unwrap();
         let env = rc_core::pb::TaskResult {
             kind: "env_error".into(),
@@ -387,12 +391,28 @@ mod tests {
             env_hints: vec!["  - pkg-config 模块 `librrd` 未找到".into()],
             ..Default::default()
         };
-        cache.put("fp", "t9", &env).unwrap();
+        cache.put("fp-env", "t9", &env).unwrap();
+        assert!(cache.get("fp-env", 3600).is_none(), "env_error must not be cached");
+
+        let compile = rc_core::pb::TaskResult {
+            kind: "compile_error".into(),
+            summary: "1 errors".into(),
+            diagnostics: vec![rc_core::pb::Diagnostic {
+                level: "error".into(),
+                code: "E0308".into(),
+                message: "mismatched types".into(),
+                file: "src/lib.rs".into(),
+                line: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cache.put("fp", "t9", &compile).unwrap();
         let (task_id, kind, cached) = cache.get("fp", 3600).unwrap();
-        assert_eq!((task_id.as_str(), kind.as_str()), ("t9", "env_error"));
+        assert_eq!((task_id.as_str(), kind.as_str()), ("t9", "compile_error"));
         let cached = cached.expect("the result itself must come back");
-        assert_eq!(cached.env_hints.len(), 1);
-        assert!(cached.env_hints[0].contains("librrd"));
+        assert_eq!(cached.diagnostics.len(), 1);
+        assert_eq!(cached.diagnostics[0].code, "E0308");
     }
 
     #[test]

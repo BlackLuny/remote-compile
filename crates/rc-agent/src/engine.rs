@@ -10,12 +10,54 @@ use crate::index::{KnownBlobs, ResultCache, StatIndex};
 use crate::scanner::{self, ScanError};
 use anyhow::{anyhow, Context, Result};
 use rc_core::model::TaskType;
+use rc_core::notice::{Notice, NoticeSeverity, NoticeState};
 use rc_core::pb;
 use rc_core::profile::{BuildProfile, ProfileSource, Resolution};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 pub struct Engine {
     pub cfg: AgentConfig,
+}
+
+fn notice_state() -> &'static Mutex<NoticeState> {
+    static STATE: OnceLock<Mutex<NoticeState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(NoticeState::new()))
+}
+
+/// Process-local auto-remediation state (R5): any path that first sees a
+/// terminal RESOURCE verdict can trigger exactly one retry.
+#[derive(Debug, Clone)]
+struct RemediateSlot {
+    first_task_id: String,
+    first_result: Option<pb::TaskResult>,
+    first_env: std::collections::BTreeMap<String, String>,
+    retry_task_id: Option<String>,
+    /// Template submit (env will be patched).
+    submit: pb::SubmitTaskReq,
+    no_remediate: bool,
+    project_id: String,
+}
+
+fn rem_state() -> &'static Mutex<HashMap<String, RemediateSlot>> {
+    static STATE: OnceLock<Mutex<HashMap<String, RemediateSlot>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn task_projects() -> &'static Mutex<HashMap<String, String>> {
+    static STATE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_task_project(task_id: &str, project_id: &str) {
+    if let Ok(mut m) = task_projects().lock() {
+        m.insert(task_id.to_string(), project_id.to_string());
+    }
+}
+
+fn project_of(task_id: &str) -> Option<String> {
+    task_projects().lock().ok().and_then(|m| m.get(task_id).cloned())
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +67,12 @@ pub struct CheckRequest {
     pub command: Option<String>,
     pub wait_secs: Option<u32>,
     pub no_cache: bool,
+    /// Request-level env (denylist applied in resolve_env).
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Disable auto-remediation for this call.
+    pub no_remediate: bool,
+    /// Baseline for diagnostic delta: auto | none | last_success | <task_id>
+    pub baseline: String,
 }
 
 /// What the agent is told. Deliberately three tiers: a verdict, a short
@@ -197,13 +245,7 @@ impl Engine {
         // git to ignore them and this overrides that, so what got uploaded is
         // named rather than left to be discovered.
         let (egress_hosts, egress_problems) = self.repo_egress(&root);
-        let config_note = join_notes(
-            join_notes(
-                describe_exclusions(&self.repo_excludes(&root)),
-                describe_inclusions(includes.patterns()),
-            ),
-            describe_egress_problems(&egress_problems),
-        );
+        let excludes = self.repo_excludes(&root);
 
         // ---- local result cache: answer without touching the network ----
         //
@@ -234,9 +276,23 @@ impl Engine {
                     }
                     None => kind.clone(),
                 };
-                let text = with_note(
+                let (critical_notes, info_notes) = present_notices_split(
+                    &project_id,
+                    &worktree_id,
+                    &collect_notices(
+                        &scan,
+                        &excludes,
+                        includes.patterns(),
+                        &egress_problems,
+                        &[],
+                        &[],
+                        &[],
+                    ),
+                );
+                let text = attach_notices(
                     format!("{rendered}\n(本地指纹缓存命中，未重新编译；task_id={task_id})"),
-                    &config_note,
+                    &critical_notes,
+                    &info_notes,
                 );
                 return Ok(Outcome {
                     task_id: task_id.clone(),
@@ -293,11 +349,8 @@ impl Engine {
             // the build with a network error, which is a far better answer than
             // refusing to compile anything until someone clicks.
             egress: egress_hosts,
+            env: req.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
-
-        // What actually got synced beyond the named directory. Approval was
-        // given once, in the repo config; this keeps it visible afterwards.
-        let root_note = describe_roots(&scan);
 
         let mut handle = client.submit(submit.clone()).await?;
         if handle.status == "needs_blobs" {
@@ -310,7 +363,7 @@ impl Engine {
             self.upload_specific(&mut client, &scan, &handle.missing_blobs, &mut known)
                 .await?;
             submit.fingerprint = fingerprint.clone();
-            handle = client.submit(submit).await?;
+            handle = client.submit(submit.clone()).await?;
             if handle.status == "needs_blobs" {
                 return Err(anyhow!(
                     "控制面反复报告缺少 blob（{} 个），同步无法收敛",
@@ -318,14 +371,36 @@ impl Engine {
                 ));
             }
         }
+        // Register for async rememediation / cancel ownership (R5/R6).
+        // first_env is the full effective env written into the profile (R5').
+        if !handle.task_id.is_empty() {
+            let first_effective: std::collections::BTreeMap<String, String> = submit
+                .profile
+                .as_ref()
+                .map(|p| p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            self.register_remediate_slot(
+                &handle.task_id,
+                &project_id,
+                submit.clone(),
+                first_effective,
+                req.no_remediate,
+            );
+            remember_task_project(&handle.task_id, &project_id);
+        }
 
-        // Named on the result, not logged and forgotten: a build that cannot
-        // reach a host it asked for fails with an ordinary network error, and
-        // nothing in that error says an approval is sitting in a queue.
-        let config_note = join_notes(
-            join_notes(config_note, describe_pending_egress(&handle.egress_pending)),
-            describe_refused_egress(&handle.egress_refused),
+        // Snapshot notices → Critical vs Info for budget slots (R3').
+        let notice_snapshot = collect_notices(
+            &scan,
+            &excludes,
+            includes.patterns(),
+            &egress_problems,
+            &handle.egress_pending,
+            &handle.egress_refused,
+            &scan.warnings,
         );
+        let (critical_notes, info_notes) =
+            present_notices_split(&project_id, &worktree_id, &notice_snapshot);
 
         if handle.cache_hit {
             let result = handle.result.clone().unwrap_or_default();
@@ -335,9 +410,7 @@ impl Engine {
             if local_cache {
                 results.put(&fingerprint, &handle.task_id, &result).ok();
             }
-            let mut text = with_note(rendered, &root_note);
-            text = with_note(text, &config_note);
-            text = with_warnings(text, &scan.warnings);
+            let text = attach_notices(rendered, &critical_notes, &info_notes);
             return Ok(Outcome {
                 task_id: handle.task_id,
                 kind: Some(rc_core::ResultKind::parse_or_default(&result.kind)),
@@ -350,11 +423,7 @@ impl Engine {
         let wait = req.wait_secs.unwrap_or(self.cfg.default_wait_secs);
         let status = client.get_task(&handle.task_id, wait).await?;
         let mut outcome = self.render(&status, bytes);
-        outcome.text = with_note(outcome.text, &root_note);
-        outcome.text = with_note(outcome.text, &config_note);
-        // §4.3: a degraded enumeration is exactly the situation where a
-        // remote/local divergence appears, so never hide it.
-        outcome.text = with_warnings(outcome.text, &scan.warnings);
+        outcome.text = attach_notices(outcome.text, &critical_notes, &info_notes);
         if let Some(result) = &status.result {
             // A build that failed *because* an egress approval had not landed
             // yet must not be cached: the fingerprint does not change when the
@@ -375,9 +444,254 @@ impl Engine {
                 if result.kind == "success" && !client_profile.found {
                     self.publish_profile(&mut client, &project_id, &resolution).await;
                 }
+
+                // Auto-remediation: shared with get_result (R5).
+                if let Some(retry) = self
+                    .maybe_remediate_on_terminal(&status.task_id, result, &mut client)
+                    .await?
+                {
+                    let text = attach_notices(retry.text, &critical_notes, &info_notes);
+                    return Ok(Outcome {
+                        task_id: retry.task_id,
+                        kind: retry.kind,
+                        status: retry.status,
+                        text,
+                    });
+                }
             }
         }
         Ok(outcome)
+    }
+
+    /// Register a submitted task so get_result can auto-remediate (R5).
+    fn register_remediate_slot(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        submit: pb::SubmitTaskReq,
+        first_env: std::collections::BTreeMap<String, String>,
+        no_remediate: bool,
+    ) {
+        if !self.cfg.auto_remediate || no_remediate {
+            return;
+        }
+        remember_task_project(task_id, project_id);
+        if let Ok(mut m) = rem_state().lock() {
+            m.insert(
+                task_id.to_string(),
+                RemediateSlot {
+                    first_task_id: task_id.to_string(),
+                    first_result: None,
+                    first_env,
+                    retry_task_id: None,
+                    submit,
+                    no_remediate,
+                    project_id: project_id.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Shared rememediation entry for check() and get_result() (R5).
+    async fn maybe_remediate_on_terminal(
+        &self,
+        task_id: &str,
+        result: &pb::TaskResult,
+        client: &mut AgentClient,
+    ) -> Result<Option<Outcome>> {
+        if !self.cfg.auto_remediate || !self.cfg.task_contract_env {
+            return Ok(None);
+        }
+        let rule = result
+            .verdict
+            .as_ref()
+            .map(|v| v.rule.as_str())
+            .unwrap_or("");
+
+        // Is this a retry completion?
+        let retry_of = {
+            let m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
+            m.values()
+                .find(|s| s.retry_task_id.as_deref() == Some(task_id))
+                .map(|s| s.first_task_id.clone())
+        };
+        if let Some(first_id) = retry_of {
+            let slot = {
+                let m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
+                m.get(&first_id).cloned()
+            };
+            if let Some(slot) = slot {
+                let first = slot.first_result.clone().unwrap_or_else(|| result.clone());
+                let rem_note = rc_core::contract::for_task(TaskType::parse_or_default(
+                    &slot.submit.task_type,
+                ))
+                .remediation(
+                    first
+                        .verdict
+                        .as_ref()
+                        .map(|v| v.rule.as_str())
+                        .unwrap_or(""),
+                )
+                .map(|r| r.note)
+                .unwrap_or_else(|| "已自动重试".into());
+                if result.kind == "success" {
+                    let text = format!(
+                        "⚠ {}并成功\n{}",
+                        rem_note,
+                        format_result(task_id, result, self.cfg.max_diagnostics, false, 0)
+                    );
+                    return Ok(Some(Outcome {
+                        task_id: task_id.to_string(),
+                        kind: Some(rc_core::ResultKind::Success),
+                        status: "done".into(),
+                        text,
+                    }));
+                }
+                // Dual failure: first verdict primary, first task_id (R5).
+                let first_text =
+                    format_result(&first_id, &first, self.cfg.max_diagnostics, false, 0);
+                let second_text =
+                    format_result(task_id, result, self.cfg.max_diagnostics, false, 0);
+                let text = format!(
+                    "{first_text}\n⚠ 自动补救仍失败（第二次 task_id={task_id}）\n{second_text}"
+                );
+                return Ok(Some(Outcome {
+                    task_id: first_id,
+                    kind: Some(rc_core::ResultKind::parse_or_default(&first.kind)),
+                    status: "done".into(),
+                    text,
+                }));
+            }
+            return Ok(None);
+        }
+
+        // First terminal: maybe start a retry.
+        if !rc_core::contract::auto_remediate_allowed(rule) {
+            return Ok(None);
+        }
+        let mut slot = {
+            let m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
+            m.get(task_id).cloned()
+        };
+        let Some(ref mut slot) = slot else {
+            return Ok(None);
+        };
+        if slot.no_remediate || slot.retry_task_id.is_some() {
+            return Ok(None);
+        }
+        slot.first_result = Some(result.clone());
+        let task_ty = TaskType::parse_or_default(&slot.submit.task_type);
+        // Compare full effective envs (R5'): first_env is profile.env from the
+        // original submit, not the bare request env map.
+        let Some((rem, second_effective)) = plan_remediation(&slot.first_env, rule, task_ty) else {
+            return Ok(None);
+        };
+
+        let mut submit = slot.submit.clone();
+        // Request env carries only the patch keys (denylist applies there);
+        // profile.env holds the full effective map for fingerprint.
+        submit.env = rem
+            .env_patch
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        submit.no_cache = true;
+        if let Some(ref mut prof) = submit.profile {
+            prof.env = second_effective.into_iter().collect();
+            prof.canonical.clear();
+        }
+        submit.fingerprint.clear();
+
+        let handle = client.submit(submit).await?;
+        slot.retry_task_id = Some(handle.task_id.clone());
+        remember_task_project(&handle.task_id, &slot.project_id);
+        {
+            let mut m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
+            m.insert(task_id.to_string(), slot.clone());
+        }
+
+        if handle.cache_hit {
+            if let Some(r) = handle.result {
+                let text = format!(
+                    "⚠ {}\n{}",
+                    rem.note,
+                    format_result(&handle.task_id, &r, self.cfg.max_diagnostics, true, 0)
+                );
+                return Ok(Some(Outcome {
+                    task_id: handle.task_id,
+                    kind: Some(rc_core::ResultKind::parse_or_default(&r.kind)),
+                    status: "done".into(),
+                    text,
+                }));
+            }
+        }
+        // Short wait for retry; if still running, tell the caller to poll the retry id.
+        let status = client.get_task(&handle.task_id, 30).await?;
+        if let Some(second) = &status.result {
+            if rc_core::TaskState::parse_or_default(&status.status).is_terminal() {
+                // Inline dual-result merge (no recursive async).
+                let first = slot.first_result.clone().unwrap_or_else(|| result.clone());
+                if second.kind == "success" {
+                    let text = format!(
+                        "⚠ {}并成功\n{}",
+                        rem.note,
+                        format_result(
+                            &handle.task_id,
+                            second,
+                            self.cfg.max_diagnostics,
+                            false,
+                            0
+                        )
+                    );
+                    return Ok(Some(Outcome {
+                        task_id: handle.task_id,
+                        kind: Some(rc_core::ResultKind::Success),
+                        status: "done".into(),
+                        text,
+                    }));
+                }
+                let first_text =
+                    format_result(task_id, &first, self.cfg.max_diagnostics, false, 0);
+                let second_text = format_result(
+                    &handle.task_id,
+                    second,
+                    self.cfg.max_diagnostics,
+                    false,
+                    0,
+                );
+                let text = format!(
+                    "{first_text}\n⚠ 自动补救仍失败（第二次 task_id={}）\n{second_text}",
+                    handle.task_id
+                );
+                return Ok(Some(Outcome {
+                    task_id: task_id.to_string(),
+                    kind: Some(rc_core::ResultKind::parse_or_default(&first.kind)),
+                    status: "done".into(),
+                    text,
+                }));
+            }
+        }
+        Ok(Some(Outcome {
+            task_id: handle.task_id.clone(),
+            kind: None,
+            status: status.status,
+            text: format!(
+                "⚠ {}\n⏳ 补救任务仍在执行 task_id={}\n用 get_result 轮询。",
+                rem.note, handle.task_id
+            ),
+        }))
+    }
+
+    pub async fn cancel(&self, task_id: &str) -> Result<String> {
+        let project_id = project_of(task_id).ok_or_else(|| {
+            anyhow!("unknown task_id for cancel (must be a task this agent submitted)")
+        })?;
+        let mut client = self.client().await?;
+        let resp = client.cancel_task(task_id, &project_id).await?;
+        Ok(format!(
+            "任务 {} → {} ({})",
+            resp.task_id, resp.status, resp.message
+        ))
     }
 
     /// Store what worked so the next agent — or the next worktree — inherits
@@ -419,9 +733,29 @@ impl Engine {
     }
 
     pub async fn get_result(&self, task_id: &str, wait_secs: u32) -> Result<Outcome> {
+        self.get_result_with_baseline(task_id, wait_secs, "auto").await
+    }
+
+    pub async fn get_result_with_baseline(
+        &self,
+        task_id: &str,
+        wait_secs: u32,
+        baseline: &str,
+    ) -> Result<Outcome> {
         let mut client = self.client().await?;
-        let status = client.get_task(task_id, wait_secs).await?;
-        Ok(self.render(&status, 0))
+        let status = client.get_task_ex(task_id, wait_secs, baseline).await?;
+        let mut outcome = self.render(&status, 0);
+        if let Some(result) = &status.result {
+            if rc_core::TaskState::parse_or_default(&status.status).is_terminal() {
+                if let Some(merged) = self
+                    .maybe_remediate_on_terminal(task_id, result, &mut client)
+                    .await?
+                {
+                    return Ok(merged);
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     fn render(&self, status: &pb::TaskStatus, bytes: u64) -> Outcome {
@@ -432,14 +766,41 @@ impl Engine {
                 .last()
                 .map(|p| p.phase.clone())
                 .unwrap_or_else(|| status.status.clone());
+            let elapsed = if status.created_at > 0 {
+                ((rc_core::now_ms() - status.created_at).max(0) / 1000) as u64
+            } else {
+                0
+            };
+            let mut text = if self.cfg.unit_progress
+                && (status.units_seen > 0 || !status.current_unit.is_empty())
+            {
+                rc_core::progress::render_progress(
+                    &status.current_unit,
+                    status.units_seen,
+                    elapsed,
+                    if status.history_units_p50 > 0 {
+                        Some(status.history_units_p50)
+                    } else {
+                        None
+                    },
+                    if status.history_build_ms_p50 > 0 {
+                        Some(status.history_build_ms_p50)
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                format!("⏳ 仍在执行（当前阶段: {phase}）")
+            };
+            text.push_str(&format!(
+                "\ntask_id={}\n用 get_result(task_id) 继续轮询，成本极低。",
+                status.task_id
+            ));
             return Outcome {
                 task_id: status.task_id.clone(),
                 kind: None,
                 status: status.status.clone(),
-                text: format!(
-                    "⏳ 仍在执行（当前阶段: {phase}）\ntask_id={}\n用 get_result(task_id) 继续轮询，成本极低。",
-                    status.task_id
-                ),
+                text,
             };
         }
         if state == rc_core::TaskState::Superseded {
@@ -685,13 +1046,32 @@ impl Engine {
             )));
         };
 
+        let contract = rc_core::contract::for_task(req.task);
         let command = match &req.command {
             Some(c) => c.clone(),
             None => match merged.tasks.get(req.task.as_str()) {
                 Some(c) => c.clone(),
-                None => adapter.command_for(&merged, req.task).line,
+                None => contract.default_command(&rc_core::contract::TaskFlags {
+                    profile: merged.clone(),
+                }),
             },
         };
+
+        // Effective env: adapter defaults (none here) < contract < profile < request.
+        // Written back into the profile so fingerprint and worker share one view.
+        if self.cfg.task_contract_env {
+            let effective = match rc_core::contract::resolve_env(
+                &std::collections::BTreeMap::new(),
+                contract.default_env(),
+                &merged.env,
+                &req.env,
+            ) {
+                Ok(e) => e,
+                Err(e) => return Ok(Err(format!("✗ env 参数无效：{e}"))),
+            };
+            merged.env = effective;
+        }
+
         let toolchain = merged.toolchain.clone().unwrap_or_default();
 
         Ok(Ok(Resolution {
@@ -860,120 +1240,193 @@ impl Engine {
     }
 }
 
-/// One line naming every directory beyond the primary root that took part in
-/// this build. Silent when there is only one, which is the common case — the
-/// point is that syncing a sibling checkout never becomes invisible routine.
-fn describe_roots(scan: &multiroot::MultiScan) -> String {
-    if scan.scanned.len() < 2 {
-        return String::new();
+/// Collect config/scan notices for the notice state machine (§3.2).
+fn collect_notices(
+    scan: &multiroot::MultiScan,
+    exclude: &[String],
+    include: &[String],
+    egress_problems: &[String],
+    egress_pending: &[String],
+    egress_refused: &[String],
+    warnings: &[String],
+) -> Vec<Notice> {
+    let mut out = Vec::new();
+    if scan.scanned.len() >= 2 {
+        let others: Vec<&str> = scan
+            .scanned
+            .iter()
+            .filter(|r| !r.primary)
+            .map(|r| r.mount.as_str())
+            .collect();
+        let full = format!(
+            "同步了 {} 个目录，除主仓库外还有: {}",
+            scan.scanned.len(),
+            others.join(", ")
+        );
+        out.push(Notice::new(
+            "sync_roots",
+            NoticeSeverity::Info,
+            full,
+            format!("同步多根: {}", others.join(",")),
+            &others,
+        ));
     }
-    let others: Vec<String> = scan
-        .scanned
-        .iter()
-        .filter(|r| !r.primary)
-        .map(|r| r.mount.clone())
-        .collect();
-    format!("同步了 {} 个目录，除主仓库外还有: {}", scan.scanned.len(), others.join(", "))
+    if !exclude.is_empty() {
+        let parts: Vec<&str> = exclude.iter().map(|s| s.as_str()).collect();
+        let full = format!(
+            "已按 exclude 排除 ({})：这些文件没有同步，若构建需要它们，远程会失败而本地不会。",
+            exclude.join(", ")
+        );
+        out.push(Notice::new(
+            "exclude",
+            NoticeSeverity::Critical,
+            full,
+            format!("exclude: {}", exclude.join(",")),
+            &parts,
+        ));
+    }
+    if !include.is_empty() {
+        let parts: Vec<&str> = include.iter().map(|s| s.as_str()).collect();
+        let full = format!(
+            "已按 include 附加同步 ({})：这些文件被 .gitignore 忽略，但仓库声明构建需要它们。",
+            include.join(", ")
+        );
+        out.push(Notice::new(
+            "include",
+            NoticeSeverity::Info,
+            full,
+            format!("include: {}", include.join(",")),
+            &parts,
+        ));
+    }
+    if !egress_problems.is_empty() {
+        let parts: Vec<&str> = egress_problems.iter().map(|s| s.as_str()).collect();
+        let full = format!(
+            "⚠ egress 配置有误，以下条目已被忽略：\n  {}",
+            egress_problems.join("\n  ")
+        );
+        out.push(Notice::new(
+            "egress_config",
+            NoticeSeverity::Warning,
+            full,
+            "egress 配置有误".to_string(),
+            &parts,
+        ));
+    }
+    if !egress_pending.is_empty() {
+        let parts: Vec<&str> = egress_pending.iter().map(|s| s.as_str()).collect();
+        let full = format!(
+            "⏳ egress 待审批 ({})：这些域名在构建里仍然不可达，需要管理员批准后才生效。",
+            egress_pending.join(", ")
+        );
+        out.push(Notice::new(
+            "egress_pending",
+            NoticeSeverity::Critical,
+            full,
+            format!("egress 待审批: {}", egress_pending.join(",")),
+            &parts,
+        ));
+    }
+    if !egress_refused.is_empty() {
+        let parts: Vec<&str> = egress_refused.iter().map(|s| s.as_str()).collect();
+        let full = format!(
+            "✗ egress 未受理 ({})：该 project 的审批队列已满，这些域名没有被登记，\
+             需要管理员先清理已有条目。",
+            egress_refused.join(", ")
+        );
+        out.push(Notice::new(
+            "egress_refused",
+            NoticeSeverity::Critical,
+            full,
+            format!("egress 未受理: {}", egress_refused.join(",")),
+            &parts,
+        ));
+    }
+    // Aggregate scanner warnings into one Notice so they don't thrash the
+    // identity map; baseline-off is its own Critical category (R9).
+    let mut scanner_parts: Vec<&str> = Vec::new();
+    for w in warnings {
+        if w.contains("基线") || w.to_lowercase().contains("baseline") {
+            out.push(Notice::new(
+                "baseline_off",
+                NoticeSeverity::Critical,
+                format!("⚠ {w}"),
+                format!("[baseline-off] {w}"),
+                &[w.as_str()],
+            ));
+        } else {
+            scanner_parts.push(w.as_str());
+        }
+    }
+    if !scanner_parts.is_empty() {
+        let full = format!("⚠ {}", scanner_parts.join("\n⚠ "));
+        out.push(Notice::new(
+            "scanner",
+            NoticeSeverity::Warning,
+            full,
+            format!("[scanner] {} 条警告", scanner_parts.len()),
+            &scanner_parts,
+        ));
+    }
+    out
 }
 
-/// Named on every result, not just the first: an excluded file the build turns
-/// out to need fails remotely and passes locally, and the diagnostics for that
-/// look like an ordinary missing-file error with no hint of the cause.
-fn describe_exclusions(patterns: &[String]) -> String {
-    if patterns.is_empty() {
-        return String::new();
+/// Present notices and split Critical vs Info/Warning for the budget slots.
+fn present_notices_split(
+    project_id: &str,
+    worktree_id: &str,
+    snapshot: &[Notice],
+) -> (String, String) {
+    let mut st = notice_state().lock().unwrap_or_else(|e| e.into_inner());
+    let texts = st.present(project_id, worktree_id, snapshot);
+    let mut critical = Vec::new();
+    let mut info = Vec::new();
+    for t in texts {
+        let is_crit = snapshot.iter().any(|n| {
+            (n.text == t || n.compact == t) && n.severity == NoticeSeverity::Critical
+        });
+        if is_crit {
+            critical.push(t);
+        } else {
+            info.push(t);
+        }
     }
-    format!(
-        "已按 exclude 排除 ({})：这些文件没有同步，若构建需要它们，远程会失败而本地不会。",
-        patterns.join(", ")
-    )
+    (critical.join("\n"), info.join("\n"))
 }
 
-/// The mirror of `describe_exclusions`: `include` uploads files the repository
-/// told git to ignore, which is a disclosure the caller should see named rather
-/// than infer from a byte count.
-fn describe_inclusions(patterns: &[String]) -> String {
-    if patterns.is_empty() {
-        return String::new();
+/// Attach notices via the slotted budget assembler so Critical survives (R3').
+fn attach_notices(body: String, critical: &str, info: &str) -> String {
+    if critical.is_empty() && info.is_empty() {
+        return body;
     }
-    format!(
-        "已按 include 附加同步 ({})：这些文件被 .gitignore 忽略，但仓库声明构建需要它们。",
-        patterns.join(", ")
-    )
-}
-
-/// Egress the repository asked for and nobody has approved yet (§7.1).
-fn describe_pending_egress(hosts: &[String]) -> String {
-    if hosts.is_empty() {
-        return String::new();
-    }
-    format!(
-        "⏳ egress 待审批 ({})：这些域名在构建里仍然不可达，需要管理员批准后才生效。",
-        hosts.join(", ")
-    )
-}
-
-/// Egress entries that were never sent because they are not host names. Said
-/// here, at submit time, rather than left to surface as a network failure in a
-/// build log — the control plane would only log a warning nobody reads.
-fn describe_egress_problems(problems: &[String]) -> String {
-    if problems.is_empty() {
-        return String::new();
-    }
-    format!(
-        "⚠ egress 配置有误，以下条目已被忽略：\n  {}",
-        problems.join("\n  ")
-    )
+    rc_core::budget::assemble_result_with_notices(&body, critical, info)
 }
 
 /// Whether this project's verdicts may be remembered on this machine (§7.1).
-///
-/// A named function rather than an inline `is_empty()` because the reasoning is
-/// not obvious from the expression: the local cache is keyed on a fingerprint
-/// that contains what the repository *asked* to reach, while the outcome
-/// depends on what an administrator *granted* — state this process cannot see.
-/// Anything that can be settled later by a decision made elsewhere must not be
-/// remembered here, or an approval arrives and the developer keeps being handed
-/// the failure that preceded it.
 fn local_cache_allowed(egress_hosts: &[String]) -> bool {
     egress_hosts.is_empty()
 }
 
-/// Hosts the control plane would not even queue for approval, because this
-/// project is at its cap. They are not pending, so nothing else will ever
-/// mention them — and the build will fail with a network error that looks
-/// exactly like a host nobody has got round to approving yet.
-fn describe_refused_egress(hosts: &[String]) -> String {
-    if hosts.is_empty() {
-        return String::new();
+/// Plan an OOM remediation: returns the remediation note + the second
+/// effective env, or `None` if the patch would be a no-op against the first
+/// full effective env (R5').
+pub(crate) fn plan_remediation(
+    first_effective: &std::collections::BTreeMap<String, String>,
+    rule: &str,
+    task_type: TaskType,
+) -> Option<(rc_core::contract::Remediation, std::collections::BTreeMap<String, String>)> {
+    if !rc_core::contract::auto_remediate_allowed(rule) {
+        return None;
     }
-    format!(
-        "✗ egress 未受理 ({})：该 project 的审批队列已满，这些域名没有被登记，\
-         需要管理员先清理已有条目。",
-        hosts.join(", ")
-    )
-}
-
-fn join_notes(a: String, b: String) -> String {
-    match (a.is_empty(), b.is_empty()) {
-        (true, _) => b,
-        (_, true) => a,
-        _ => format!("{a}\n{b}"),
+    let rem = rc_core::contract::for_task(task_type).remediation(rule)?;
+    let mut second = first_effective.clone();
+    for (k, v) in &rem.env_patch {
+        second.insert(k.clone(), v.clone());
     }
-}
-
-fn with_note(text: String, note: &str) -> String {
-    if note.is_empty() {
-        return text;
+    if second == *first_effective {
+        return None;
     }
-    format!("{text}\n{note}")
-}
-
-fn with_warnings(text: String, warnings: &[String]) -> String {
-    if warnings.is_empty() {
-        return text;
-    }
-    format!("{text}\n\n⚠ {}", warnings.join("\n⚠ "))
+    Some((rem, second))
 }
 
 fn provisional_project_id(root: &Path) -> String {
@@ -1007,6 +1460,9 @@ fn shellexpand_home(path: &str) -> String {
 
 /// L0 verdict + L1 structured summary + a pointer to L2 (§11). Everything an
 /// agent does not need is left out: no ANSI, no rustc notes, no full log.
+///
+/// When `result.verdict` is present, the headline and agent hint are driven by
+/// attribution; otherwise the legacy `kind` path is kept for old results.
 pub fn format_result(
     task_id: &str,
     result: &pb::TaskResult,
@@ -1017,9 +1473,32 @@ pub fn format_result(
     let kind = rc_core::ResultKind::parse_or_default(&result.kind);
     let mut out = String::new();
 
-    let headline = match kind {
-        rc_core::ResultKind::Success => format!("✓ {}", result.summary),
-        _ => format!("✗ {} [{}]", result.summary, kind.as_str()),
+    let (headline, hint) = if let Some(v) = &result.verdict {
+        let st = pb::Status::try_from(v.status).unwrap_or(pb::Status::Unspecified);
+        let attr = pb::Attribution::try_from(v.attribution).unwrap_or(pb::Attribution::AttrUnknown);
+        let label = match st {
+            pb::Status::Success => "成功".to_string(),
+            pb::Status::Timeout => "超时".to_string(),
+            pb::Status::Canceled => "已取消".to_string(),
+            _ => match attr {
+                pb::Attribution::AttrCode => "代码问题".to_string(),
+                pb::Attribution::AttrProjectConfig => "环境/配置".to_string(),
+                pb::Attribution::AttrResource => "资源不足".to_string(),
+                pb::Attribution::AttrInfra => "基础设施".to_string(),
+                pb::Attribution::AttrUnknown => "原因未知".to_string(),
+            },
+        };
+        let head = match st {
+            pb::Status::Success => format!("✓ {}", result.summary),
+            _ => format!("✗ {} [{}]", result.summary, label),
+        };
+        (head, rc_core::diag::agent_hint_for(st, attr))
+    } else {
+        let head = match kind {
+            rc_core::ResultKind::Success => format!("✓ {}", result.summary),
+            _ => format!("✗ {} [{}]", result.summary, kind.as_str()),
+        };
+        (head, kind.agent_hint())
     };
     out.push_str(&headline);
     out.push('\n');
@@ -1038,8 +1517,25 @@ pub fn format_result(
     out.push('\n');
 
     if kind != rc_core::ResultKind::Success {
-        out.push_str(kind.agent_hint());
+        out.push_str(hint);
         out.push('\n');
+        // Evidence line (I1): never convict without showing the grounds.
+        if let Some(v) = &result.verdict {
+            if let Some(ev) = &v.evidence {
+                if !ev.excerpt.is_empty() {
+                    if ev.line_no > 0 {
+                        out.push_str(&format!("  证据 (log:{}): {}\n", ev.line_no, ev.excerpt));
+                    } else {
+                        out.push_str(&format!("  证据 ({}): {}\n", ev.source, ev.excerpt));
+                    }
+                }
+            }
+            for r in &v.remediation {
+                out.push_str("  ");
+                out.push_str(r);
+                out.push('\n');
+            }
+        }
     }
     // Named before the diagnostics, because for an env_error there are none —
     // and this is the only thing in the result an agent can act on without
@@ -1049,7 +1545,52 @@ pub fn format_result(
         out.push('\n');
     }
 
-    let shown: Vec<&pb::Diagnostic> = result.diagnostics.iter().take(max_diagnostics).collect();
+    // Test summary when present (mechanism two outcome rendering).
+    if let Some(ts) = &result.test_summary {
+        if ts.summary_seen {
+            if ts.failed == 0 {
+                out.push_str(&format!(
+                    "✓ 测试通过：{} passed, {} ignored（{} 个二进制）\n",
+                    ts.passed, ts.ignored, ts.binaries
+                ));
+            } else if !ts.failed_names.is_empty() {
+                out.push_str("失败用例:\n");
+                for n in ts.failed_names.iter().take(20) {
+                    out.push_str(&format!("  - {n}\n"));
+                }
+            }
+        }
+    }
+
+    if let Some(delta) = &result.diag_delta {
+        let block = rc_core::delta::render_delta(delta, max_diagnostics);
+        if !block.is_empty() {
+            out.push('\n');
+            out.push_str(&block);
+        }
+    }
+
+    // Prefer delta's new diagnostics when present (max_diagnostics budget).
+    let diag_source: Vec<&pb::Diagnostic> = if let Some(delta) = &result.diag_delta {
+        if !delta.new_diagnostics.is_empty() {
+            delta
+                .new_diagnostics
+                .iter()
+                .chain(result.diagnostics.iter().filter(|d| {
+                    !delta
+                        .new_diagnostics
+                        .iter()
+                        .any(|n| n.file == d.file && n.line == d.line && n.message == d.message)
+                }))
+                .take(max_diagnostics)
+                .collect()
+        } else {
+            result.diagnostics.iter().take(max_diagnostics).collect()
+        }
+    } else {
+        result.diagnostics.iter().take(max_diagnostics).collect()
+    };
+    let shown = diag_source;
     if !shown.is_empty() {
         out.push('\n');
         for d in &shown {
@@ -1268,8 +1809,14 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("IP address")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("host names")), "{problems:?}");
 
-        let note = describe_egress_problems(&problems);
-        assert!(note.contains("127.0.0.1"), "{note}");
+        let n = Notice::new(
+            "egress_config",
+            NoticeSeverity::Warning,
+            format!("⚠ egress 配置有误，以下条目已被忽略：\n  {}", problems.join("\n  ")),
+            "egress 配置有误",
+            &problems.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        );
+        assert!(n.text.contains("127.0.0.1"), "{}", n.text);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1278,6 +1825,142 @@ mod tests {
         assert_eq!(human_bytes(512), "512B");
         assert_eq!(human_bytes(1536), "1.5KB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0MB");
+    }
+
+    #[test]
+    fn green_test_classify_to_format_carries_passed_count() {
+        // R11': libtest success → classify_with_exec → format_result.
+        let log = "test result: ok. 47 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out";
+        let c = rc_core::diag::classify_with_exec(
+            TaskType::Test,
+            0,
+            false,
+            &pb::ExecEvidence::default(),
+            &[],
+            log,
+            true,
+        );
+        assert!(c.summary.contains("47 passed"), "{}", c.summary);
+        let result = pb::TaskResult {
+            kind: c.kind.as_str().into(),
+            summary: c.summary.clone(),
+            test_summary: c.test_summary.clone(),
+            verdict: Some(c.verdict.clone()),
+            ..Default::default()
+        };
+        let text = format_result("t-green", &result, 10, false, 0);
+        assert!(text.contains("47 passed"), "final agent text must show count:\n{text}");
+        assert!(text.contains('✓') || text.contains("测试通过"), "{text}");
+    }
+
+    #[test]
+    fn remediation_skips_when_effective_env_already_has_jobs() {
+        // R5'/R11': profile already carries CARGO_BUILD_JOBS=2 → no-op, no fake declare.
+        let first = std::collections::BTreeMap::from([
+            ("CARGO_BUILD_JOBS".into(), "2".into()),
+            ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
+        ]);
+        assert!(
+            plan_remediation(&first, "oom_killed", TaskType::Test).is_none(),
+            "must not re-submit when effective env already has the patch"
+        );
+        // Without JOBS=2, planning yields a new env.
+        let first2 = std::collections::BTreeMap::from([("CARGO_PROFILE_TEST_DEBUG".into(), "0".into())]);
+        let (rem, second) =
+            plan_remediation(&first2, "oom_killed", TaskType::Test).expect("should remediate");
+        assert!(rem.note.contains("CARGO_BUILD_JOBS=2"));
+        assert_eq!(second.get("CARGO_BUILD_JOBS").map(|s| s.as_str()), Some("2"));
+        assert_ne!(first2, second);
+    }
+
+    #[test]
+    fn dual_fail_text_uses_first_task_id() {
+        // R5/R11': dual-fail formatting keeps first task_id on the primary block.
+        let first = pb::TaskResult {
+            kind: "env_error".into(),
+            summary: "进程被 OOM killer 终止（exit 137）".into(),
+            verdict: Some(pb::Verdict {
+                status: pb::Status::Failed as i32,
+                attribution: pb::Attribution::AttrResource as i32,
+                rule: "oom_killed".into(),
+                evidence: Some(pb::Evidence {
+                    source: "docker_state".into(),
+                    excerpt: "OOMKilled=true".into(),
+                    line_no: 0,
+                }),
+                remediation: vec![],
+            }),
+            ..Default::default()
+        };
+        let second = pb::TaskResult {
+            kind: "env_error".into(),
+            summary: "still oom".into(),
+            verdict: Some(pb::Verdict {
+                status: pb::Status::Failed as i32,
+                attribution: pb::Attribution::AttrResource as i32,
+                rule: "oom_killed".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let first_text = format_result("task-first", &first, 10, false, 0);
+        let second_text = format_result("task-retry", &second, 10, false, 0);
+        let text = format!(
+            "{first_text}\n⚠ 自动补救仍失败（第二次 task_id=task-retry）\n{second_text}"
+        );
+        assert!(text.contains("task_id=task-first"), "{text}");
+        assert!(text.contains("第二次 task_id=task-retry"), "{text}");
+        // Primary headline block is first's, not only the retry id.
+        let first_pos = text.find("task_id=task-first").unwrap();
+        let retry_pos = text.find("第二次 task_id=task-retry").unwrap();
+        assert!(first_pos < retry_pos);
+    }
+
+    #[test]
+    fn critical_notice_survives_budget_attach() {
+        // R3': attach_notices keeps Critical under an oversize body.
+        let body = "D".repeat(10_000);
+        let out = attach_notices(body, "CRITICAL: egress 未受理 (x.com)", "info line");
+        assert!(out.len() <= rc_core::budget::RESPONSE_BUDGET);
+        assert!(out.contains("CRITICAL"), "critical must survive:\n{}", &out[..out.len().min(200)]);
+    }
+
+    #[test]
+    fn async_remediate_state_machine_registers_and_plans() {
+        // R11': get_result path shares the same plan_remediation + rem_state
+        // registration that check() uses — simulate first terminal OOM decision.
+        let first_effective = std::collections::BTreeMap::from([(
+            "CARGO_PROFILE_TEST_DEBUG".into(),
+            "0".into(),
+        )]);
+        let plan = plan_remediation(&first_effective, "oom_killed", TaskType::Test)
+            .expect("OOM must plan a retry when JOBS not set");
+        assert!(plan.0.note.contains("降并发"));
+        // Register a slot as check() would after submit.
+        {
+            let mut m = rem_state().lock().unwrap();
+            m.insert(
+                "task-first".into(),
+                RemediateSlot {
+                    first_task_id: "task-first".into(),
+                    first_result: None,
+                    first_env: first_effective.clone(),
+                    retry_task_id: None,
+                    submit: pb::SubmitTaskReq {
+                        task_type: "test".into(),
+                        project_id: "p1".into(),
+                        ..Default::default()
+                    },
+                    no_remediate: false,
+                    project_id: "p1".into(),
+                },
+            );
+        }
+        let slot = rem_state().lock().unwrap().get("task-first").cloned().unwrap();
+        assert!(slot.retry_task_id.is_none());
+        assert!(plan_remediation(&slot.first_env, "oom_killed", TaskType::Test).is_some());
+        // Clean up so other tests are not polluted.
+        rem_state().lock().unwrap().remove("task-first");
     }
 
     #[test]

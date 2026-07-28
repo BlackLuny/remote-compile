@@ -39,6 +39,27 @@ pub struct App {
     /// so it lives here rather than in SQLite: a restart drops the worker
     /// channels too, and re-dispatching then is the correct behaviour.
     building: Mutex<HashMap<String, (String, i64)>>,
+    /// In-memory unit progress (not written to task_events). Keyed by task_id.
+    pub progress: Mutex<HashMap<String, ProgressSnapshot>>,
+    /// Terminal extras (delta + history_ref) memoized per (task_id, baseline)
+    /// so repeated get_task does not recompute (R10').
+    pub terminal_cache: Mutex<HashMap<String, TerminalExtras>>,
+}
+
+/// Latest unit progress for a running task (mechanism five).
+#[derive(Debug, Clone, Default)]
+pub struct ProgressSnapshot {
+    pub current_unit: String,
+    pub units_seen: u32,
+    pub progress_version: u64,
+}
+
+/// Cached terminal-only fields for a completed task.
+#[derive(Debug, Clone, Default)]
+pub struct TerminalExtras {
+    pub diag_delta: Option<pb::DiagDelta>,
+    pub history_units_p50: u32,
+    pub history_build_ms_p50: u64,
 }
 
 /// Worker features a task cannot run without.
@@ -97,7 +118,22 @@ impl App {
             dispatch_signal: Notify::new(),
             log_cache: Mutex::new(HashMap::new()),
             building: Mutex::new(HashMap::new()),
+            progress: Mutex::new(HashMap::new()),
+            terminal_cache: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Update in-memory progress from a worker event. Does not touch task_events.
+    pub fn update_progress(&self, task_id: &str, current_unit: &str, units_seen: u32) {
+        let mut map = self.progress.lock();
+        let snap = map.entry(task_id.to_string()).or_default();
+        if !current_unit.is_empty() {
+            snap.current_unit = current_unit.to_string();
+        }
+        if units_seen > snap.units_seen {
+            snap.units_seen = units_seen;
+        }
+        snap.progress_version = snap.progress_version.saturating_add(1);
     }
 
     /// Claim the right to dispatch a build for `env_id`, unless one is already
@@ -199,10 +235,39 @@ impl App {
         self.check_image_admissible(&profile.image, &policy)?;
         self.check_capabilities_available(manifest)?;
 
-        // The server computes the fingerprint itself. Trusting the client's
-        // value would let one buggy agent poison every other agent's cache.
+        let task_type = TaskType::parse_or_default(&req.task_type);
+        let command = if req.command_override.is_empty() {
+            profile
+                .tasks
+                .get(task_type.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    rc_core::adapter::for_name(&profile.adapter)
+                        .command_for(&Default::default(), task_type)
+                        .line
+                })
+        } else {
+            req.command_override.clone()
+        };
+
+        // Authoritative effective profile (R2): ignore client `canonical`,
+        // rebuild env via resolve_env (denylist on request env only), then
+        // canonicalize from structured fields. Worker receives this profile.
+        let request_env: std::collections::BTreeMap<String, String> =
+            req.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let profile = rc_core::contract::effective_profile(
+            profile,
+            task_type,
+            &command,
+            &request_env,
+            &req.egress,
+            policy.task_contract_env,
+        )
+        .map_err(|e| anyhow!("invalid request env: {e}"))?;
+
+        // The server computes the fingerprint itself from the rebuilt profile.
         let fingerprint =
-            rc_core::fingerprint::compute_for(&manifest.root_hash, profile, &manifest.anchor_mount)
+            rc_core::fingerprint::compute_for(&manifest.root_hash, &profile, &manifest.anchor_mount)
             .map_err(|e| anyhow!("{e}"))?;
         if !req.fingerprint.is_empty() && req.fingerprint != fingerprint {
             tracing::warn!(
@@ -252,27 +317,12 @@ impl App {
             });
         }
 
-        let task_type = TaskType::parse_or_default(&req.task_type);
-        let command = if req.command_override.is_empty() {
-            profile
-                .tasks
-                .get(task_type.as_str())
-                .cloned()
-                .unwrap_or_else(|| {
-                    rc_core::adapter::for_name(&profile.adapter)
-                        .command_for(&Default::default(), task_type)
-                        .line
-                })
-        } else {
-            req.command_override.clone()
-        };
-
         // §5.1 task cache.
         if !req.no_cache {
             if let Some(prev) = self.store.find_cached_result(&fingerprint, &egress_key, policy.task_cache_ttl_secs)? {
                 let id = ids::task_id();
                 let row = self.new_row(&id, req, &fingerprint, &egress_key, &command, TaskState::Done);
-                self.persist_new(&row, req)?;
+                self.persist_new(&row, req, &profile)?;
                 self.store.record_cache_hit(&id, &prev)?;
                 self.metrics.incr("tasks_cache_hit_total", 1.0);
                 self.store.add_timeline(&id, "cache_hit", "", &prev.id)?;
@@ -292,7 +342,7 @@ impl App {
 
         let id = ids::task_id();
         let row = self.new_row(&id, req, &fingerprint, &egress_key, &command, TaskState::Queued);
-        self.persist_new(&row, req)?;
+        self.persist_new(&row, req, &profile)?;
         self.store.add_subscriber(&id, &req.agent_session)?;
         self.store.set_image(&id, &profile.image)?;
 
@@ -344,9 +394,16 @@ impl App {
         }
     }
 
-    fn persist_new(&self, row: &TaskRow, req: &pb::SubmitTaskReq) -> Result<()> {
+    fn persist_new(
+        &self,
+        row: &TaskRow,
+        req: &pb::SubmitTaskReq,
+        effective_profile: &pb::ResolvedProfile,
+    ) -> Result<()> {
         let manifest_json = serde_json::to_string(&req.manifest)?;
-        let profile_json = serde_json::to_string(&req.profile)?;
+        // Store the server-rebuilt profile so the worker never sees a client
+        // canonical/env mismatch.
+        let profile_json = serde_json::to_string(effective_profile)?;
         let base = req
             .manifest
             .as_ref()
@@ -555,7 +612,9 @@ impl App {
             .await;
         if !ok {
             self.workers.note_finished(&choice.worker_id, &task.id);
-            self.store.requeue(&task.id, &choice.worker_id, "worker channel closed")?;
+            let _ = self
+                .store
+                .requeue(&task.id, &choice.worker_id, "worker channel closed")?;
             return Ok(false);
         }
         self.publish_task(&task.id);
@@ -649,7 +708,10 @@ impl App {
                 worker_id,
                 &done.missing_blobs.join(","),
             )?;
-            self.store.requeue(&done.task_id, worker_id, "blob_missing")?;
+            if !self.store.requeue(&done.task_id, worker_id, "blob_missing")? {
+                // Cancel (or another terminal) won the race (R6').
+                return Ok(());
+            }
             self.store.set_status(&done.task_id, TaskState::Syncing.as_str())?;
             self.set_missing_blobs(&done.task_id, &done.missing_blobs)?;
             self.publish_task(&done.task_id);
@@ -663,7 +725,10 @@ impl App {
         // §6.2: infrastructure failures move to a different machine and are
         // invisible to the agent until the retries run out.
         if kind.is_retryable() && task.attempt < policy.max_infra_retries {
-            self.store.requeue(&done.task_id, worker_id, &result.summary)?;
+            if !self.store.requeue(&done.task_id, worker_id, &result.summary)? {
+                // Cancel already terminalized the row; drop the late result.
+                return Ok(());
+            }
             self.store
                 .add_timeline(&done.task_id, "infra_retry", worker_id, &result.summary)?;
             self.metrics.incr("tasks_retried_total", 1.0);
@@ -682,8 +747,21 @@ impl App {
         } else {
             TaskState::Done
         };
-        self.store
+        let won = self
+            .store
             .complete_task(&task.id, status.as_str(), result, log_ref, &task.image)?;
+        if !won {
+            // Lost the race to cancel (or another complete). Drop late result.
+            tracing::info!(task = %task.id, "complete_task lost race; discarding late result");
+            self.progress.lock().remove(&task.id);
+            // Do not clear terminal_cache: the winner may already have populated it.
+            return Ok(());
+        }
+        self.progress.lock().remove(&task.id);
+        // Fresh terminal: drop any stale cache from a prior attempt id reuse.
+        self.terminal_cache
+            .lock()
+            .retain(|k, _| !k.starts_with(&format!("{}\0", task.id)));
         self.store.unpin_task_blobs(&task.id)?;
         self.store.add_timeline(&task.id, "finished", &task.worker_id, &result.kind)?;
 
@@ -732,18 +810,27 @@ impl App {
         } else {
             TaskState::Done
         };
-        self.store.complete_task(task_id, status.as_str(), &result, "", "")?;
-        self.store.unpin_task_blobs(task_id)?;
-        self.store.add_timeline(task_id, "failed", "", message)?;
-        self.publish_task(task_id);
+        if self
+            .store
+            .complete_task(task_id, status.as_str(), &result, "", "")?
+        {
+            self.progress.lock().remove(task_id);
+            self.store.unpin_task_blobs(task_id)?;
+            self.store.add_timeline(task_id, "failed", "", message)?;
+            self.publish_task(task_id);
+        }
         Ok(())
     }
 
     /// A worker vanished; its in-flight tasks go back to the queue.
     pub fn reclaim_worker_tasks(&self, worker_id: &str) -> Result<()> {
         for task in self.store.tasks_on_worker(worker_id)? {
-            self.store
-                .requeue(&task.id, worker_id, "worker disconnected")?;
+            if !self
+                .store
+                .requeue(&task.id, worker_id, "worker disconnected")?
+            {
+                continue; // already terminal (e.g. canceled)
+            }
             self.store
                 .add_timeline(&task.id, "worker_lost", worker_id, "requeued")?;
             self.publish_task(&task.id);
@@ -784,6 +871,7 @@ impl App {
                 offset: 0,
                 total_lines: 0,
                 truncated: false,
+                ..Default::default()
             });
         }
         let lines = self.log_lines(&task.log_ref)?;
@@ -804,11 +892,14 @@ impl App {
             (q.offset as usize).min(filtered.len())
         };
         let end = (start + limit).min(filtered.len());
+        let next_offset = end as u64;
         Ok(pb::LogChunk {
             lines: filtered[start..end].iter().map(|s| (*s).clone()).collect(),
             offset: start as u64,
             total_lines: total,
             truncated: end < filtered.len(),
+            next_offset,
+            ..Default::default()
         })
     }
 
@@ -847,13 +938,99 @@ impl App {
     }
 
     pub fn task_status(&self, task_id: &str) -> Result<Option<pb::TaskStatus>> {
+        self.task_status_with_baseline(task_id, "auto")
+    }
+
+    pub fn task_status_with_baseline(
+        &self,
+        task_id: &str,
+        baseline_mode: &str,
+    ) -> Result<Option<pb::TaskStatus>> {
         let Some(t) = self.store.get_task(task_id)? else {
             return Ok(None);
         };
+        let terminal = TaskState::parse_or_default(&t.status).is_terminal();
+        let snap = if terminal {
+            // Drop progress snapshot at terminal (R7).
+            self.progress.lock().remove(&t.id);
+            ProgressSnapshot::default()
+        } else {
+            self.progress.lock().get(&t.id).cloned().unwrap_or_default()
+        };
+        let mode = if baseline_mode.is_empty() {
+            "auto"
+        } else {
+            baseline_mode
+        };
+        let cache_key = format!("{}\0{mode}", t.id);
+
+        let mut result = t.result();
+        let (hist_ms, hist_units, delta) = if terminal {
+            // Memoize delta + history_ref (R10'): recompute only on first hit.
+            let cached = self.terminal_cache.lock().get(&cache_key).cloned();
+            if let Some(c) = cached {
+                (c.history_build_ms_p50, c.history_units_p50, c.diag_delta)
+            } else {
+                let (hm, hu) = self
+                    .store
+                    .history_ref(&t.project_id, &t.task_type, 20)
+                    .unwrap_or((None, None));
+                let mut d = None;
+                if self.policy.read().diag_delta {
+                    if let Some(ref res) = result {
+                        if res.diag_delta.is_none() {
+                            if let Ok(Some(base)) = self.store.resolve_baseline(
+                                &t.project_id,
+                                &t.worktree_id,
+                                &t.task_type,
+                                mode,
+                                &t.id,
+                                t.finished_at,
+                            ) {
+                                if let Some(base_res) = base.result() {
+                                    d = Some(rc_core::delta::compute_delta(
+                                        rc_core::delta::DeltaInput {
+                                            current: &res.diagnostics,
+                                            baseline: &base_res.diagnostics,
+                                            baseline_task_id: &base.id,
+                                            current_truncated: res.truncated_diagnostics,
+                                            baseline_truncated: base_res
+                                                .truncated_diagnostics,
+                                        },
+                                    ));
+                                }
+                            }
+                        } else {
+                            d = res.diag_delta.clone();
+                        }
+                    }
+                }
+                let extras = TerminalExtras {
+                    diag_delta: d.clone(),
+                    history_units_p50: hu.unwrap_or(0),
+                    history_build_ms_p50: hm.unwrap_or(0),
+                };
+                self.terminal_cache.lock().insert(cache_key, extras.clone());
+                (
+                    extras.history_build_ms_p50,
+                    extras.history_units_p50,
+                    extras.diag_delta,
+                )
+            }
+        } else {
+            (0, 0, None)
+        };
+        if let Some(d) = delta {
+            if let Some(ref mut res) = result {
+                if res.diag_delta.is_none() {
+                    res.diag_delta = Some(d);
+                }
+            }
+        }
         Ok(Some(pb::TaskStatus {
             task_id: t.id.clone(),
             status: t.status.clone(),
-            result: t.result(),
+            result,
             timeline: self.store.timeline(&t.id)?,
             attempt: t.attempt as u32,
             worker_id: t.worker_id.clone(),
@@ -861,6 +1038,11 @@ impl App {
             finished_at: t.finished_at,
             missing_blobs: self.missing_blobs(&t.id),
             superseded_by: t.superseded_by.clone(),
+            current_unit: snap.current_unit,
+            units_seen: snap.units_seen,
+            progress_version: snap.progress_version,
+            history_units_p50: hist_units,
+            history_build_ms_p50: hist_ms,
         }))
     }
 }
@@ -1067,6 +1249,114 @@ mod tests {
             }
             _ => panic!("expected CacheHit"),
         }
+    }
+
+    #[test]
+    fn second_task_in_worktree_gets_diag_delta() {
+        // R11.1 / R4: same worktree, two completed checks → second has delta.
+        let app = test_app();
+        let id1 = queued_id(app.submit(&request(&app, "s1", "check", b"delta-a")).unwrap());
+        app.store
+            .complete_task(
+                &id1,
+                "done",
+                &pb::TaskResult {
+                    kind: "compile_error".into(),
+                    diagnostics: vec![pb::Diagnostic {
+                        level: "error".into(),
+                        code: "E0308".into(),
+                        message: "mismatched types".into(),
+                        file: "src/a.rs".into(),
+                        line: 1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "",
+                "",
+            )
+            .unwrap();
+        let id2 = queued_id(app.submit(&request(&app, "s1", "check", b"delta-b")).unwrap());
+        app.store
+            .complete_task(
+                &id2,
+                "done",
+                &pb::TaskResult {
+                    kind: "compile_error".into(),
+                    diagnostics: vec![pb::Diagnostic {
+                        level: "error".into(),
+                        code: "E0001".into(),
+                        message: "new boom".into(),
+                        file: "src/b.rs".into(),
+                        line: 1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "",
+                "",
+            )
+            .unwrap();
+        let st = app
+            .task_status_with_baseline(&id2, "auto")
+            .unwrap()
+            .expect("status");
+        let delta = st.result.expect("result").diag_delta.expect("delta");
+        assert_eq!(delta.baseline_task_id, id1);
+        assert_eq!(delta.new_count, 1);
+        assert_eq!(delta.fixed_count, 1);
+
+        // First task has no prior baseline.
+        let st1 = app
+            .task_status_with_baseline(&id1, "auto")
+            .unwrap()
+            .expect("status");
+        assert!(st1.result.unwrap().diag_delta.is_none());
+    }
+
+    #[test]
+    fn lying_canonical_does_not_change_fingerprint() {
+        // R2: server rebuilds canonical; client lie is ignored.
+        let app = test_app();
+        let mut req = request(&app, "s1", "check", b"lie");
+        let honest = req.profile.as_ref().unwrap().canonical.clone();
+        req.profile.as_mut().unwrap().canonical = "command=LIES\n".into();
+        let a = queued_id(app.submit(&req).unwrap());
+        // Same content + same real fields → same fingerprint key as honest.
+        let mut req2 = request(&app, "s2", "check", b"lie");
+        req2.profile.as_mut().unwrap().canonical = honest;
+        match app.submit(&req2).unwrap() {
+            Admission::Subscribed { task_id } | Admission::CacheHit { task_id, .. } => {
+                // Either subscribed to a (or cache if completed) — same key.
+                let _ = task_id;
+            }
+            Admission::Queued { task_id } => {
+                // If a is still queued and fingerprints match, should have been Subscribed.
+                // Allow Queued only if fingerprint somehow differs — fail then.
+                let t1 = app.store.get_task(&a).unwrap().unwrap();
+                let t2 = app.store.get_task(&task_id).unwrap().unwrap();
+                assert_eq!(
+                    t1.fingerprint, t2.fingerprint,
+                    "lying canonical must not fork the fingerprint"
+                );
+            }
+            Admission::NeedsBlobs { .. } => panic!("needs blobs"),
+        }
+    }
+
+    #[test]
+    fn unit_progress_does_not_write_task_events() {
+        // R7: unit updates stay in memory.
+        let app = test_app();
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"prog")).unwrap());
+        let before = app.store.timeline(&id).unwrap().len();
+        app.update_progress(&id, "foo", 3);
+        app.update_progress(&id, "bar", 5);
+        let after = app.store.timeline(&id).unwrap().len();
+        assert_eq!(before, after, "unit progress must not grow task_events");
+        let st = app.task_status(&id).unwrap().unwrap();
+        assert_eq!(st.units_seen, 5);
+        assert_eq!(st.current_unit, "bar");
     }
 
     #[test]
@@ -1307,5 +1597,60 @@ mod tests {
             .unwrap();
         assert_eq!(page.lines.len(), 200, "an unset limit still pages");
         assert!(page.truncated);
+    }
+
+    #[test]
+    fn terminal_delta_is_memoized_across_queries() {
+        // R10': second task_status_with_baseline hits terminal_cache.
+        let app = test_app();
+        let id1 = queued_id(app.submit(&request(&app, "s1", "check", b"mem-a")).unwrap());
+        app.store
+            .complete_task(
+                &id1,
+                "done",
+                &pb::TaskResult {
+                    kind: "compile_error".into(),
+                    diagnostics: vec![pb::Diagnostic {
+                        level: "error".into(),
+                        code: "E0308".into(),
+                        message: "mismatched types".into(),
+                        file: "a.rs".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "",
+                "",
+            )
+            .unwrap();
+        let id2 = queued_id(app.submit(&request(&app, "s1", "check", b"mem-b")).unwrap());
+        app.store
+            .complete_task(
+                &id2,
+                "done",
+                &pb::TaskResult {
+                    kind: "compile_error".into(),
+                    diagnostics: vec![pb::Diagnostic {
+                        level: "error".into(),
+                        code: "E0001".into(),
+                        message: "new".into(),
+                        file: "b.rs".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "",
+                "",
+            )
+            .unwrap();
+        let st1 = app.task_status_with_baseline(&id2, "auto").unwrap().unwrap();
+        let d1 = st1.result.as_ref().unwrap().diag_delta.clone().unwrap();
+        assert_eq!(app.terminal_cache.lock().len(), 1);
+        let st2 = app.task_status_with_baseline(&id2, "auto").unwrap().unwrap();
+        let d2 = st2.result.as_ref().unwrap().diag_delta.clone().unwrap();
+        assert_eq!(d1.baseline_task_id, d2.baseline_task_id);
+        assert_eq!(d1.new_count, d2.new_count);
+        // Still a single cache entry — no growth on re-query.
+        assert_eq!(app.terminal_cache.lock().len(), 1);
     }
 }

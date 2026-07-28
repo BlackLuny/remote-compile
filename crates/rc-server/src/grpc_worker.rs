@@ -246,11 +246,26 @@ async fn handle_event(app: &Arc<App>, worker_id: &str, event: WorkerEvent) -> an
             app.dispatch_signal.notify_one();
         }
         worker_event::Body::Progress(p) => {
-            app.store.add_timeline(&p.task_id, &p.phase, worker_id, &p.detail)?;
-            if !p.phase.is_empty() {
-                app.store.set_status(&p.task_id, &normalize_phase(&p.phase))?;
+            // Unit progress: phase empty + units_seen/current_unit set.
+            // Must not write task_events or set_status (R7 / F26.3).
+            let is_unit = p.phase.is_empty()
+                && (p.units_seen > 0 || !p.current_unit.is_empty());
+            if is_unit {
+                if app.policy().unit_progress {
+                    app.update_progress(&p.task_id, &p.current_unit, p.units_seen);
+                    app.publish_task(&p.task_id);
+                }
+                // kill-switch off: drop silently; worker may still send.
+                return Ok(());
             }
-            app.publish_task(&p.task_id);
+            // Real phase transitions only.
+            if !p.phase.is_empty() {
+                app.store
+                    .add_timeline(&p.task_id, &p.phase, worker_id, &p.detail)?;
+                app.store
+                    .set_status(&p.task_id, &normalize_phase(&p.phase))?;
+                app.publish_task(&p.task_id);
+            }
         }
         worker_event::Body::Done(done) => {
             app.on_task_done(worker_id, done).await?;

@@ -80,6 +80,69 @@ message TaskStats {
   uint64 bytes_synced = 6;
 }
 
+// ---- Verdict v2: evidence-backed attribution (additive; kind remains derived) ----
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_SUCCESS = 1;
+  STATUS_FAILED = 2;
+  STATUS_TIMEOUT = 3;
+  STATUS_CANCELED = 4;
+}
+
+// Who should act. Default 0 is "unknown" — no evidence, no conviction.
+// Enum value 5 is reserved for a future attribution.
+enum Attribution {
+  ATTR_UNKNOWN = 0;
+  ATTR_CODE = 1;            // author: fix source
+  ATTR_PROJECT_CONFIG = 2;  // project config / declared deps
+  ATTR_RESOURCE = 3;        // task's own resource demand (OOM etc.)
+  ATTR_INFRA = 4;           // fleet / network / image / disk
+}
+
+message Evidence {
+  string source = 1;   // "docker_state" | "log_line" | "diagnostic" | "outcome"
+  string excerpt = 2;  // ≤400 bytes after budget gate
+  uint32 line_no = 3;  // log line number when source=log_line
+}
+
+message Verdict {
+  Status status = 1;
+  Attribution attribution = 2;
+  Evidence evidence = 3;
+  repeated string remediation = 4;
+  string rule = 5;     // matched classifier rule name
+}
+
+// Collected by the worker before remove_container; feeds the classifier.
+message ExecEvidence {
+  bool oom_killed = 1;     // docker inspect .State.OOMKilled
+  int32 term_signal = 2;   // main-process terminate signal when known
+  bool worker_killed = 3;  // set only on the worker's own kill path
+}
+
+// Minimal libtest summary for classification evidence and test conclusions.
+message TestSummary {
+  uint32 passed = 1;
+  uint32 failed = 2;
+  uint32 ignored = 3;
+  uint32 binaries = 4;
+  repeated string failed_names = 5; // "binary::test_name", cap 20
+  bool truncated = 6;
+  bool summary_seen = 7;   // false ⇒ no summary line recognized
+}
+
+// Delta of diagnostics vs a baseline task (computed on read).
+message DiagDelta {
+  uint32 new_count = 1;
+  uint32 fixed_count = 2;          // omitted (0) when approximate/truncated
+  uint32 preexisting_count = 3;
+  repeated Diagnostic new_diagnostics = 4;
+  repeated string preexisting_summary = 5;
+  string baseline_task_id = 6;
+  bool approximate = 7;
+}
+
 message TaskResult {
   string kind = 1;             // success|compile_error|env_error|infra_error|timeout
   repeated Diagnostic diagnostics = 2;
@@ -93,6 +156,12 @@ message TaskResult {
   // Missing system dependencies lifted out of the build log, already rendered
   // for an agent to read. Only ever populated for env_error.
   repeated string env_hints = 10;
+  // Evidence-backed verdict; empty on results from pre-verdict workers.
+  Verdict verdict = 11;
+  TestSummary test_summary = 12;
+  // Units observed during the build (Compiling/Checking lines).
+  uint32 units_seen_total = 13;
+  DiagDelta diag_delta = 14;
 }
 
 message Empty {}
@@ -153,6 +222,8 @@ message SubmitTaskReq {
   // not a grant: the control plane decides, and only what it approves is ever
   // handed to a worker.
   repeated string egress = 14;
+  // Request-level env (layered under profile; denylist applies here only).
+  map<string, string> env = 15;
 }
 
 message TaskHandle {
@@ -174,6 +245,12 @@ message TaskHandle {
 message TaskQuery {
   string task_id = 1;
   uint32 wait_secs = 2;          // long-poll window
+  // When true, return as soon as progress_version advances past
+  // seen_progress_version, or the task reaches a terminal state.
+  bool return_on_progress = 3;
+  uint64 seen_progress_version = 4;
+  // Diagnostic baseline mode: auto | none | last_success | <task_id>
+  string baseline = 5;
 }
 
 message TaskPhase {
@@ -194,6 +271,13 @@ message TaskStatus {
   int64 finished_at = 8;
   repeated string missing_blobs = 9;  // server asks the agent to re-upload
   string superseded_by = 10;
+  // In-memory unit progress (not persisted to task_events).
+  string current_unit = 11;
+  uint32 units_seen = 12;
+  uint64 progress_version = 13;
+  // Historical reference for long-running builds (not an ETA).
+  uint32 history_units_p50 = 14;
+  uint64 history_build_ms_p50 = 15;
 }
 
 message LogQuery {
@@ -202,12 +286,35 @@ message LogQuery {
   uint32 limit = 3;
   string grep = 4;
   bool tail = 5;
+  // When true, skip per-line elision but still respect the response budget.
+  bool raw = 6;
+  // Byte offset within a single oversize line (raw inline continuation).
+  uint64 line_byte_offset = 7;
 }
 message LogChunk {
   repeated string lines = 1;
   uint64 offset = 2;
   uint64 total_lines = 3;
   bool truncated = 4;
+  uint64 next_offset = 5;
+  uint64 bytes_omitted = 6;
+  // Inline continuation for a single oversize line under raw=true.
+  uint64 line_byte_offset = 7;
+  uint64 next_byte_offset = 8;
+  string line_no = 9;            // original server line number when continuing
+}
+
+message CancelTaskReq {
+  string task_id = 1;
+  string agent_session = 2;
+  // Caller's project identity for ownership check (§5.5). Token remains
+  // fleet-wide; this is mis-cancel protection, not a cryptographic bound.
+  string project_id = 3;
+}
+message CancelTaskResp {
+  string task_id = 1;
+  string status = 2;
+  string message = 3;
 }
 
 message GetProfileReq {
@@ -312,6 +419,7 @@ service AgentApi {
   rpc PrepareEnv(PrepareEnvReq) returns (EnvStatus);
   rpc GetEnvStatus(EnvQuery) returns (EnvStatus);
   rpc ListWorkers(Empty) returns (ListWorkersResp);
+  rpc CancelTask(CancelTaskReq) returns (CancelTaskResp);
 }
 
 // ============================ worker api ============================
@@ -357,6 +465,9 @@ message TaskProgress {
   string task_id = 1;
   string phase = 2;
   string detail = 3;
+  // Unit progress parsed from cargo Compiling/Checking lines.
+  string current_unit = 4;
+  uint32 units_seen = 5;
 }
 
 message TaskDone {

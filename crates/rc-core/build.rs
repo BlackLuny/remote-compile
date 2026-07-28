@@ -17,6 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // builds the wrong thing. A new persisted field needs its own line
         // here, and needs the same argument made for it.
         .field_attribute(".rc.v1.TaskResult.env_hints", "#[serde(default)]")
+        // Verdict v2 fields: rows written before evidence-backed attribution
+        // must still load. Same rationale as env_hints — one field at a time.
+        .field_attribute(".rc.v1.TaskResult.verdict", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskResult.test_summary", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskResult.units_seen_total", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskResult.diag_delta", "#[serde(default)]")
         .compile_protos(&["proto/rc.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/rc.proto");
     Ok(())

@@ -24,6 +24,24 @@ pub struct AgentConfig {
     /// Diagnostics returned inline in the L1 summary (§11).
     #[serde(default = "default_max_diagnostics")]
     pub max_diagnostics: usize,
+    /// Auto-remediate OOM once with CARGO_PROFILE_*_DEBUG=0 (§2.5).
+    #[serde(default = "default_true")]
+    pub auto_remediate: bool,
+    // ---- per-mechanism kill-switches (§6); all default on ----
+    #[serde(default = "default_true")]
+    pub verdict_v2: bool,
+    #[serde(default = "default_true")]
+    pub task_contract_env: bool,
+    #[serde(default = "default_true")]
+    pub budget_gate: bool,
+    #[serde(default = "default_true")]
+    pub diag_delta: bool,
+    #[serde(default = "default_true")]
+    pub unit_progress: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_wait() -> u32 {
@@ -42,6 +60,12 @@ impl Default for AgentConfig {
             cache_dir: None,
             default_wait_secs: default_wait(),
             max_diagnostics: default_max_diagnostics(),
+            auto_remediate: true,
+            verdict_v2: true,
+            task_contract_env: true,
+            budget_gate: true,
+            diag_delta: true,
+            unit_progress: true,
         }
     }
 }

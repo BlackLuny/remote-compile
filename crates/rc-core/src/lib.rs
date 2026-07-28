@@ -6,7 +6,10 @@
 
 pub mod adapter;
 pub mod ansi;
+pub mod budget;
 pub mod cas;
+pub mod contract;
+pub mod delta;
 pub mod diag;
 pub mod discover;
 pub mod egress;
@@ -15,7 +18,9 @@ pub mod fingerprint;
 pub mod ids;
 pub mod manifest;
 pub mod model;
+pub mod notice;
 pub mod profile;
+pub mod progress;
 pub mod roots;
 pub mod transport;
 
