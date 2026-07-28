@@ -269,19 +269,43 @@ impl App {
         self.check_capabilities_available(manifest)?;
 
         let task_type = TaskType::parse_or_default(&req.task_type);
-        let command = if req.command_override.is_empty() {
-            profile
-                .tasks
-                .get(task_type.as_str())
-                .cloned()
-                .unwrap_or_else(|| {
-                    rc_core::adapter::for_name(&profile.adapter)
-                        .command_for(&Default::default(), task_type)
-                        .line
-                })
-        } else {
-            req.command_override.clone()
+        // Authoritative command resolution (intent-and-query-surface §3.4):
+        // consume PathContext; never Default::default() away target/features.
+        let path_ctx = rc_core::scope::path_context_from_pb(
+            req.path_context.as_ref(),
+            &req.project_root,
+        );
+        let mut bp = rc_core::profile::BuildProfile {
+            adapter: Some(profile.adapter.clone()),
+            target: if profile.target.is_empty() {
+                None
+            } else {
+                Some(profile.target.clone())
+            },
+            features: if profile.features.is_empty() {
+                None
+            } else {
+                Some(profile.features.clone())
+            },
+            path: if profile.path.is_empty() {
+                None
+            } else {
+                Some(profile.path.clone())
+            },
+            ..Default::default()
         };
+        for (k, v) in &profile.tasks {
+            bp.tasks.insert(k.clone(), v.clone());
+        }
+        let resolved_cmd = rc_core::scope::resolve_command(
+            &bp,
+            task_type,
+            &path_ctx,
+            &req.command_override,
+        );
+        let command = resolved_cmd.command.clone();
+        let command_is_default = resolved_cmd.command_is_default;
+        let scope_hash = resolved_cmd.scope_hash.clone();
 
         // Authoritative effective profile (R2): ignore client `canonical`,
         // rebuild env via resolve_env (denylist on request env only), then
@@ -354,13 +378,29 @@ impl App {
         if !req.no_cache {
             if let Some(prev) = self.store.find_cached_result(&fingerprint, &egress_key, policy.task_cache_ttl_secs)? {
                 let id = ids::task_id();
-                let row = self.new_row(&id, req, &fingerprint, &egress_key, &command, TaskState::Done);
+                let row = self.new_row(
+                    &id,
+                    req,
+                    &fingerprint,
+                    &egress_key,
+                    &command,
+                    TaskState::Done,
+                    &scope_hash,
+                );
                 self.persist_new(&row, req, &profile)?;
                 self.store.record_cache_hit(&id, &prev)?;
                 self.metrics.incr("tasks_cache_hit_total", 1.0);
                 self.store.add_timeline(&id, "cache_hit", "", &prev.id)?;
                 self.publish_task(&id);
-                let result = prev.result().unwrap_or_default();
+                let mut result = prev.result().unwrap_or_default();
+                // Always stamp the authoritative plan on cache hit so Receipt
+                // shows package scope even if the cached plan had path=None.
+                result.effective_plan = Some(rc_core::scope::effective_plan_pb(
+                    &resolved_cmd,
+                    task_type.as_str(),
+                    "cache",
+                    None,
+                ));
                 return Ok(Admission::CacheHit { task_id: id, result });
             }
         }
@@ -374,7 +414,24 @@ impl App {
         }
 
         let id = ids::task_id();
-        let row = self.new_row(&id, req, &fingerprint, &egress_key, &command, TaskState::Queued);
+        let row = self.new_row(
+            &id,
+            req,
+            &fingerprint,
+            &egress_key,
+            &command,
+            TaskState::Queued,
+            &scope_hash,
+        );
+        // Persist path_context + flags for assignment / Receipt (must not be best-effort).
+        let path_json = serde_json::to_string(&resolved_cmd.path)
+            .map_err(|e| anyhow!("serialize path_context: {e}"))?;
+        self.store
+            .set_setting(
+                &format!("task_meta:{id}"),
+                &format!("{command_is_default}\n{scope_hash}\n{path_json}"),
+            )
+            .map_err(|e| anyhow!("persist task_meta: {e}"))?;
         self.persist_new(&row, req, &profile)?;
         self.store.add_subscriber(&id, &req.agent_session)?;
         self.store.set_image(&id, &profile.image)?;
@@ -404,6 +461,7 @@ impl App {
         egress_key: &str,
         command: &str,
         status: TaskState,
+        scope_hash: &str,
     ) -> TaskRow {
         let bytes = req
             .manifest
@@ -418,11 +476,17 @@ impl App {
             agent_session: req.agent_session.clone(),
             fingerprint: fingerprint.to_string(),
             egress_key: egress_key.to_string(),
-            supersede_key: ids::supersede_key(&req.worktree_id, &req.agent_session, &req.task_type),
+            supersede_key: ids::supersede_key(
+                &req.worktree_id,
+                &req.agent_session,
+                &req.task_type,
+                scope_hash,
+            ),
             status: status.as_str().to_string(),
             command: command.to_string(),
             created_at: now_ms(),
             bytes_synced: bytes,
+            scope_hash: scope_hash.to_string(),
             ..Default::default()
         }
     }
@@ -609,6 +673,22 @@ impl App {
         };
         self.store.set_dispatched_egress(&task.id, &egress_allow)?;
 
+        let (command_is_default, scope_hash, path_context) =
+            match self.store.get_setting(&format!("task_meta:{}", task.id))? {
+                Some(s) => {
+                    let mut lines = s.lines();
+                    let d = lines.next().unwrap_or("false") == "true";
+                    let h = lines.next().unwrap_or("").to_string();
+                    let path_json = lines.collect::<Vec<_>>().join("\n");
+                    let pc = serde_json::from_str(&path_json).ok();
+                    (d, h, pc)
+                }
+                None => {
+                    // Pre-upgrade tasks: no meta → treat as non-default (parser off).
+                    (false, task.scope_hash.clone(), None)
+                }
+            };
+
         let assignment = pb::TaskAssignment {
             task_id: task.id.clone(),
             project_id: task.project_id.clone(),
@@ -620,6 +700,9 @@ impl App {
             profile,
             bundle_blobs: self.store.bundles_for(&task.project_id)?,
             egress_allow,
+            command_is_default,
+            scope_hash,
+            path_context,
         };
 
         self.store.assign_to_worker(&task.id, &choice.worker_id)?;
@@ -916,10 +999,13 @@ impl App {
                 offset: 0,
                 total_lines: 0,
                 truncated: false,
+                matched_lines: 0,
+                empty_reason: "no_log".into(),
                 ..Default::default()
             });
         }
         let lines = self.log_lines(&task.log_ref)?;
+        let raw_total = lines.len() as u64;
         let filtered: Vec<&String> = if q.grep.is_empty() {
             lines.iter().collect()
         } else {
@@ -929,7 +1015,12 @@ impl App {
                 .filter(|l| l.to_lowercase().contains(&needle))
                 .collect()
         };
-        let total = filtered.len() as u64;
+        let matched = filtered.len() as u64;
+        let empty_reason = if matched == 0 && !q.grep.is_empty() {
+            "no_match".to_string()
+        } else {
+            String::new()
+        };
         let limit = if q.limit == 0 { 200 } else { q.limit.min(2000) } as usize;
         let start = if q.tail {
             filtered.len().saturating_sub(limit)
@@ -941,9 +1032,12 @@ impl App {
         Ok(pb::LogChunk {
             lines: filtered[start..end].iter().map(|s| (*s).clone()).collect(),
             offset: start as u64,
-            total_lines: total,
+            // Honest total: raw log line count when grepping; matched when not.
+            total_lines: if q.grep.is_empty() { matched } else { raw_total },
             truncated: end < filtered.len(),
             next_offset,
+            matched_lines: matched,
+            empty_reason,
             ..Default::default()
         })
     }
@@ -1072,6 +1166,25 @@ impl App {
                 }
             }
         }
+        let (queue_depth, running, capacity) = self.queue_nav();
+        let suggest_wait_secs = if terminal {
+            0
+        } else {
+            let p50 = if hist_ms > 0 {
+                hist_ms
+            } else {
+                self.store
+                    .history_ref(&t.project_id, &t.task_type, 20)
+                    .ok()
+                    .and_then(|(ms, _)| ms)
+                    .unwrap_or(0)
+            };
+            if p50 > 0 {
+                (((p50 as f64) * 1.2 / 1000.0).round() as u32).clamp(15, 120)
+            } else {
+                60
+            }
+        };
         Ok(Some(pb::TaskStatus {
             task_id: t.id.clone(),
             status: t.status.clone(),
@@ -1088,7 +1201,19 @@ impl App {
             progress_version: snap.progress_version,
             history_units_p50: hist_units,
             history_build_ms_p50: hist_ms,
+            queue_depth,
+            running,
+            capacity,
+            suggest_wait_secs,
         }))
+    }
+
+    fn queue_nav(&self) -> (u32, u32, u32) {
+        let counters = self.store.overview_counters(3600).unwrap_or_default();
+        let workers = self.workers.snapshot();
+        let capacity: u32 = workers.iter().map(|w| w.max_parallel).sum();
+        let running: u32 = workers.iter().map(|w| w.stats.running_tasks).sum();
+        (counters.queued as u32, running, capacity)
     }
 }
 

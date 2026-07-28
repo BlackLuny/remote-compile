@@ -40,6 +40,8 @@ pub struct Remediation {
 #[derive(Debug, Default, Clone)]
 pub struct TaskFlags {
     pub profile: BuildProfile,
+    /// Intent path scope; empty = workspace default.
+    pub path: crate::pb::PathContext,
 }
 
 pub trait TaskContract: Send + Sync {
@@ -121,7 +123,10 @@ pub fn command_is_default_resolved(
         },
         ..Default::default()
     };
-    let default = for_task(task_type).default_command(&TaskFlags { profile: bp });
+    let default = for_task(task_type).default_command(&TaskFlags {
+        profile: bp,
+        path: crate::pb::PathContext::default(),
+    });
     command == default
 }
 
@@ -218,8 +223,7 @@ impl TaskContract for CheckContract {
         TaskType::Check
     }
     fn default_command(&self, flags: &TaskFlags) -> String {
-        let adapter = crate::adapter::for_name(flags.profile.adapter.as_deref().unwrap_or("rust"));
-        adapter.command_for(&flags.profile, TaskType::Check).line
+        crate::scope::resolve_command(&flags.profile, TaskType::Check, &flags.path, "").command
     }
     fn default_env(&self) -> &[(&'static str, &'static str)] {
         &[]
@@ -259,8 +263,7 @@ impl TaskContract for BuildContract {
         TaskType::Build
     }
     fn default_command(&self, flags: &TaskFlags) -> String {
-        let adapter = crate::adapter::for_name(flags.profile.adapter.as_deref().unwrap_or("rust"));
-        adapter.command_for(&flags.profile, TaskType::Build).line
+        crate::scope::resolve_command(&flags.profile, TaskType::Build, &flags.path, "").command
     }
     fn default_env(&self) -> &[(&'static str, &'static str)] {
         &[]
@@ -298,8 +301,7 @@ impl TaskContract for TestContract {
         TaskType::Test
     }
     fn default_command(&self, flags: &TaskFlags) -> String {
-        let adapter = crate::adapter::for_name(flags.profile.adapter.as_deref().unwrap_or("rust"));
-        adapter.command_for(&flags.profile, TaskType::Test).line
+        crate::scope::resolve_command(&flags.profile, TaskType::Test, &flags.path, "").command
     }
     fn default_env(&self) -> &[(&'static str, &'static str)] {
         TEST_DEFAULT_ENV

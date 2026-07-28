@@ -350,6 +350,8 @@ impl Engine {
             // refusing to compile anything until someone clicks.
             egress: egress_hosts,
             env: req.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            path_context: Some(resolution.path_context.clone()),
+            command_is_default: resolution.command_is_default,
         };
 
         let mut handle = client.submit(submit.clone()).await?;
@@ -702,9 +704,13 @@ impl Engine {
             image: Some(resolution.image_digest.clone()),
             ..Default::default()
         };
-        profile
-            .tasks
-            .insert(resolution.task_type.as_str().to_string(), resolution.command.clone());
+        // F3: never materialize intent-scoped defaults into fleet tasks.
+        // Only human/profile overrides (command_is_default=false) teach the fleet.
+        if !resolution.command_is_default {
+            profile
+                .tasks
+                .insert(resolution.task_type.as_str().to_string(), resolution.command.clone());
+        }
         if !resolution.profile.env.is_empty() {
             profile.env = resolution.profile.env.clone();
         }
@@ -730,6 +736,141 @@ impl Engine {
         if let Err(e) = client.upsert_profile(req).await {
             tracing::debug!(error = %e, "could not publish the build profile");
         }
+    }
+
+    /// Structured diagnostic paging (intent-and-query-surface §4.3).
+    /// Implemented client-side over get_task — no new RPC.
+    pub async fn get_diagnostics(
+        &self,
+        task_id: &str,
+        severity: &str,
+        offset: u32,
+        limit: u32,
+        code: &str,
+        file_prefix: &str,
+        only_new: bool,
+        baseline: &str,
+    ) -> Result<String> {
+        let mut client = self.client().await?;
+        let status = client.get_task_ex(task_id, 0, baseline).await?;
+        let Some(result) = status.result else {
+            return Ok(format!(
+                "task_id={task_id}  status={}  (no result yet)",
+                status.status
+            ));
+        };
+        let source: Vec<&pb::Diagnostic> = if only_new {
+            if let Some(delta) = &result.diag_delta {
+                if delta.baseline_task_id.is_empty() && delta.new_diagnostics.is_empty() {
+                    return Ok(format!(
+                        "task_id={task_id}  only_new=true  (no baseline / delta unavailable)"
+                    ));
+                }
+                delta.new_diagnostics.iter().collect()
+            } else {
+                return Ok(format!(
+                    "task_id={task_id}  only_new=true  (no baseline / delta unavailable)"
+                ));
+            }
+        } else {
+            result.diagnostics.iter().collect()
+        };
+        let filtered: Vec<&pb::Diagnostic> = source
+            .into_iter()
+            .filter(|d| {
+                let sev_ok = match severity {
+                    "error" => d.level == "error",
+                    "warning" => d.level == "warning",
+                    "all" | "" => true,
+                    _ => d.level == severity,
+                };
+                let code_ok = code.is_empty() || d.code == code;
+                let file_ok = file_prefix.is_empty() || d.file.starts_with(file_prefix);
+                sev_ok && code_ok && file_ok
+            })
+            .collect();
+        let total = filtered.len();
+        let limit = limit.clamp(1, 100) as usize;
+        let start = (offset as usize).min(total);
+        if start >= total && total == 0 {
+            let trunc = result.truncated_diagnostics;
+            return Ok(format!(
+                "task_id={task_id}  severity={severity}  showing 0 of 0 stored\
+                 {}\n(no more stored diagnostics{})",
+                if only_new { "  only_new=true" } else { "" },
+                if trunc > 0 {
+                    format!("; +{trunc} truncated not stored — use get_log if needed")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if start >= total {
+            return Ok(format!(
+                "task_id={task_id}  (no more stored diagnostics; +{} truncated not stored — use get_log if needed)",
+                result.truncated_diagnostics
+            ));
+        }
+        let end = (start + limit).min(total);
+        let mut out = format!(
+            "task_id={task_id}  severity={severity}  showing {}..{} of {total} stored",
+            start + 1,
+            end
+        );
+        if result.truncated_diagnostics > 0 {
+            out.push_str(&format!(
+                "  (+{} truncated not stored)",
+                result.truncated_diagnostics
+            ));
+        }
+        out.push('\n');
+        for d in &filtered[start..end] {
+            let location = if d.file.is_empty() {
+                String::new()
+            } else if d.line > 0 {
+                format!("{}:{}:{}  ", d.file, d.line, d.column)
+            } else {
+                format!("{}  ", d.file)
+            };
+            let c = if d.code.is_empty() {
+                String::new()
+            } else {
+                format!("{}  ", d.code)
+            };
+            out.push_str(&format!(
+                "{}{}{}{}\n",
+                if d.level == "error" {
+                    "E "
+                } else if d.level == "warning" {
+                    "W "
+                } else {
+                    "  "
+                },
+                location,
+                c,
+                d.message
+            ));
+        }
+        if end < total {
+            let mut next = format!(
+                "next: get_diagnostics(task_id=\"{task_id}\", severity=\"{severity}\", offset={end}, limit={limit}"
+            );
+            if !code.is_empty() {
+                next.push_str(&format!(", code=\"{code}\""));
+            }
+            if !file_prefix.is_empty() {
+                next.push_str(&format!(", file_prefix=\"{file_prefix}\""));
+            }
+            if only_new {
+                next.push_str(", only_new=true");
+            }
+            if !baseline.is_empty() && baseline != "auto" {
+                next.push_str(&format!(", baseline=\"{baseline}\""));
+            }
+            next.push(')');
+            out.push_str(&next);
+        }
+        Ok(out)
     }
 
     pub async fn get_result(&self, task_id: &str, wait_secs: u32) -> Result<Outcome> {
@@ -792,8 +933,29 @@ impl Engine {
             } else {
                 format!("⏳ 仍在执行（当前阶段: {phase}）")
             };
+            let suggest = if status.suggest_wait_secs > 0 {
+                status.suggest_wait_secs
+            } else {
+                60
+            };
             text.push_str(&format!(
-                "\ntask_id={}\n用 get_result(task_id) 继续轮询，成本极低。",
+                "\ntask_id={}\nphase={}  queue_depth={}  running={}  capacity={}",
+                status.task_id,
+                phase,
+                status.queue_depth,
+                status.running,
+                status.capacity
+            ));
+            if status.history_build_ms_p50 > 0 {
+                text.push_str(&format!(
+                    "\nhistory_build_ms_p50={}  suggest_wait_secs={suggest}",
+                    status.history_build_ms_p50
+                ));
+            } else {
+                text.push_str(&format!("\nsuggest_wait_secs={suggest}"));
+            }
+            text.push_str(&format!(
+                "\nnext: get_result(task_id=\"{}\", wait_secs={suggest})",
                 status.task_id
             ));
             return Outcome {
@@ -1047,15 +1209,11 @@ impl Engine {
         };
 
         let contract = rc_core::contract::for_task(req.task);
-        let command = match &req.command {
-            Some(c) => c.clone(),
-            None => match merged.tasks.get(req.task.as_str()) {
-                Some(c) => c.clone(),
-                None => contract.default_command(&rc_core::contract::TaskFlags {
-                    profile: merged.clone(),
-                }),
-            },
-        };
+        let path_ctx =
+            rc_core::scope::resolve_path_context(root, Path::new(&req.path), adapter_name);
+        let override_cmd = req.command.clone().unwrap_or_default();
+        let resolved =
+            rc_core::scope::resolve_command(&merged, req.task, &path_ctx, &override_cmd);
 
         // Effective env: adapter defaults (none here) < contract < profile < request.
         // Written back into the profile so fingerprint and worker share one view.
@@ -1078,10 +1236,13 @@ impl Engine {
             profile: merged,
             source,
             task_type: req.task,
-            command,
+            command: resolved.command,
             adapter: adapter_name.to_string(),
             image_digest,
             toolchain,
+            path_context: resolved.path,
+            command_is_default: resolved.command_is_default,
+            scope_hash: resolved.scope_hash,
         }))
     }
 
@@ -1473,6 +1634,19 @@ pub fn format_result(
     let kind = rc_core::ResultKind::parse_or_default(&result.kind);
     let mut out = String::new();
 
+    let scope_tag = result
+        .effective_plan
+        .as_ref()
+        .and_then(|p| p.path.as_ref())
+        .map(rc_core::scope::scope_label)
+        .unwrap_or_default();
+    let pkg_prefix = result
+        .effective_plan
+        .as_ref()
+        .and_then(|p| p.path.as_ref())
+        .and_then(|p| p.packages.first().cloned())
+        .unwrap_or_default();
+
     let (headline, hint) = if let Some(v) = &result.verdict {
         let st = pb::Status::try_from(v.status).unwrap_or(pb::Status::Unspecified);
         let attr = pb::Attribution::try_from(v.attribution).unwrap_or(pb::Attribution::AttrUnknown);
@@ -1489,8 +1663,20 @@ pub fn format_result(
             },
         };
         let head = match st {
-            pb::Status::Success => format!("✓ {}", result.summary),
-            _ => format!("✗ {} [{}]", result.summary, label),
+            pb::Status::Success => {
+                if !pkg_prefix.is_empty() && scope_tag.starts_with("package:") {
+                    format!("✓ {pkg_prefix}: {} [成功, scope=package]", result.summary)
+                } else {
+                    format!("✓ {}", result.summary)
+                }
+            }
+            _ => {
+                if !pkg_prefix.is_empty() && scope_tag.starts_with("package:") {
+                    format!("✗ {pkg_prefix}: {} [{label}, scope=package]", result.summary)
+                } else {
+                    format!("✗ {} [{label}]", result.summary)
+                }
+            }
         };
         (head, rc_core::diag::agent_hint_for(st, attr))
     } else {
@@ -1515,6 +1701,33 @@ pub fn format_result(
         }
     }
     out.push('\n');
+    // Execution receipt (I7) — never silent about what actually ran.
+    if let Some(plan) = &result.effective_plan {
+        let scope = plan
+            .path
+            .as_ref()
+            .map(rc_core::scope::scope_label)
+            .unwrap_or_else(|| "unknown".into());
+        if !plan.command.is_empty() {
+            out.push_str(&format!("scope={scope}  command={}\n", plan.command));
+        }
+        if let Some(pre) = &plan.pre_commands {
+            if pre.skipped > 0 {
+                out.push_str(&format!(
+                    "⚠ pre_commands skipped ({}): ×{}\n",
+                    if pre.skip_reason.is_empty() {
+                        "unknown"
+                    } else {
+                        &pre.skip_reason
+                    },
+                    pre.skipped
+                ));
+                for c in pre.skipped_commands.iter().take(5) {
+                    out.push_str(&format!("  - {c}\n"));
+                }
+            }
+        }
+    }
 
     if kind != rc_core::ResultKind::Success {
         out.push_str(hint);
@@ -1570,30 +1783,35 @@ pub fn format_result(
         }
     }
 
-    // Prefer delta's new diagnostics when present (max_diagnostics budget).
-    let diag_source: Vec<&pb::Diagnostic> = if let Some(delta) = &result.diag_delta {
+    // Error-first packing: show errors fully (budget), fold warnings by code.
+    let mut errors: Vec<&pb::Diagnostic> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.level == "error")
+        .collect();
+    if let Some(delta) = &result.diag_delta {
         if !delta.new_diagnostics.is_empty() {
-            delta
+            // Prefer new errors first.
+            let mut new_err: Vec<&pb::Diagnostic> = delta
                 .new_diagnostics
                 .iter()
-                .chain(result.diagnostics.iter().filter(|d| {
-                    !delta
-                        .new_diagnostics
-                        .iter()
-                        .any(|n| n.file == d.file && n.line == d.line && n.message == d.message)
-                }))
-                .take(max_diagnostics)
-                .collect()
-        } else {
-            result.diagnostics.iter().take(max_diagnostics).collect()
+                .filter(|d| d.level == "error")
+                .collect();
+            for e in &errors {
+                if !new_err
+                    .iter()
+                    .any(|n| n.file == e.file && n.line == e.line && n.message == e.message)
+                {
+                    new_err.push(e);
+                }
+            }
+            errors = new_err;
         }
-    } else {
-        result.diagnostics.iter().take(max_diagnostics).collect()
-    };
-    let shown = diag_source;
-    if !shown.is_empty() {
+    }
+    let shown_errors: Vec<&pb::Diagnostic> = errors.iter().copied().take(max_diagnostics).collect();
+    if !shown_errors.is_empty() {
         out.push('\n');
-        for d in &shown {
+        for d in &shown_errors {
             let location = if d.file.is_empty() {
                 String::new()
             } else if d.line > 0 {
@@ -1610,18 +1828,50 @@ pub fn format_result(
         }
     }
 
-    let hidden = result
+    // Fold warnings: W×N (code×count, …)
+    let warnings: Vec<&pb::Diagnostic> = result
         .diagnostics
-        .len()
-        .saturating_sub(shown.len()) as u32
+        .iter()
+        .filter(|d| d.level == "warning")
+        .collect();
+    if !warnings.is_empty() {
+        let mut by_code: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+        for w in &warnings {
+            let key = if w.code.is_empty() { "other" } else { w.code.as_str() };
+            *by_code.entry(key).or_default() += 1;
+        }
+        let mut parts: Vec<String> = by_code
+            .into_iter()
+            .map(|(c, n)| format!("{c}×{n}"))
+            .collect();
+        parts.truncate(5);
+        out.push_str(&format!(
+            "\nW×{} ({})\n",
+            warnings.len(),
+            parts.join(", ")
+        ));
+    }
+
+    let hidden_errors = errors.len().saturating_sub(shown_errors.len()) as u32
         + result.truncated_diagnostics;
-    if hidden > 0 {
-        out.push_str(&format!("\n… 另有 {hidden} 条诊断未展示。"));
+    if hidden_errors > 0 {
+        out.push_str(&format!("\n… 另有 {hidden_errors} 条 error 诊断未展示。"));
     }
     if kind != rc_core::ResultKind::Success {
-        out.push_str(&format!(
-            "\n需要细节: get_log(task_id=\"{task_id}\", grep=\"error\", limit=50)"
-        ));
+        if result.error_count > 0 || !errors.is_empty() {
+            out.push_str(&format!(
+                "\n需要细节: get_diagnostics(task_id=\"{task_id}\", severity=\"error\", offset=0, limit=20)"
+            ));
+        } else if let Some(v) = &result.verdict {
+            if let Some(ev) = &v.evidence {
+                if ev.line_no > 0 {
+                    out.push_str(&format!(
+                        "\n需要细节: get_log(task_id=\"{task_id}\", offset={}, limit=30, raw=true)",
+                        ev.line_no.saturating_sub(1)
+                    ));
+                }
+            }
+        }
     }
     out
 }
@@ -1699,7 +1949,8 @@ mod tests {
         let text = format_result("t-1", &result, 10, false, 0);
         assert!(text.contains("src/main.rs:7:5  E0308  mismatched types"));
         assert!(text.contains("修改源码"), "the next action must be spelled out:\n{text}");
-        assert!(text.contains("get_log"));
+        // Prefer get_diagnostics over get_log for structured compile errors.
+        assert!(text.contains("get_diagnostics"), "{text}");
         assert!(
             !text.contains("rendered text"),
             "the rendered block is pure token cost inline (§11)"
@@ -1737,7 +1988,10 @@ mod tests {
         };
         let text = format_result("t-1", &result, 10, false, 0);
         assert_eq!(text.matches("E0001").count(), 10);
-        assert!(text.contains("另有 35 条诊断未展示"));
+        assert!(
+            text.contains("另有 35 条 error 诊断未展示") || text.contains("另有 35 条诊断未展示"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -207,6 +207,11 @@ pub struct Resolution {
     pub adapter: String,
     pub image_digest: String,
     pub toolchain: String,
+    /// Intent path scope (monorepo package selection).
+    pub path_context: crate::pb::PathContext,
+    /// Whether `command` is the contract/adapter default (not human override).
+    pub command_is_default: bool,
+    pub scope_hash: String,
 }
 
 impl Resolution {
@@ -370,6 +375,9 @@ clippy = "cargo clippy -- -D warnings"
             adapter: "rust".into(),
             image_digest: "img@sha256:x".into(),
             toolchain: "rustc 1.85.0".into(),
+            path_context: crate::pb::PathContext::default(),
+            command_is_default: true,
+            scope_hash: String::new(),
         }
     }
 

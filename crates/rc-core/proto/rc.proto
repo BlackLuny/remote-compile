@@ -143,6 +143,43 @@ message DiagDelta {
   bool approximate = 7;
 }
 
+// Intent scope for monorepo package selection (intent-and-query-surface).
+enum ScopeKind {
+  SCOPE_UNSPECIFIED = 0;
+  SCOPE_WORKSPACE = 1;
+  SCOPE_PACKAGE = 2;
+  SCOPE_PROFILE_OVERRIDE = 3;
+  SCOPE_EXPLICIT_COMMAND = 4;
+}
+
+message PathContext {
+  string intent_path = 1;
+  string repo_root = 2;
+  string relative_path = 3;
+  ScopeKind scope = 4;
+  repeated string packages = 5;
+  string resolve_note = 7;
+}
+
+message PreCommandsStatus {
+  uint32 total = 1;
+  uint32 ran = 2;
+  uint32 skipped = 3;
+  string skip_reason = 4;
+  repeated string skipped_commands = 5;
+}
+
+message EffectivePlan {
+  PathContext path = 1;
+  string task = 2;
+  string command = 3;
+  bool command_is_default = 4;
+  string profile_source = 5;
+  PreCommandsStatus pre_commands = 6;
+  string cache_key_note = 7;
+  string scope_hash = 8;
+}
+
 message TaskResult {
   string kind = 1;             // success|compile_error|env_error|infra_error|timeout
   repeated Diagnostic diagnostics = 2;
@@ -162,6 +199,8 @@ message TaskResult {
   // Units observed during the build (Compiling/Checking lines).
   uint32 units_seen_total = 13;
   DiagDelta diag_delta = 14;
+  // Execution receipt: what actually ran (intent-and-query-surface §5).
+  EffectivePlan effective_plan = 15;
 }
 
 message Empty {}
@@ -224,6 +263,10 @@ message SubmitTaskReq {
   repeated string egress = 14;
   // Request-level env (layered under profile; denylist applies here only).
   map<string, string> env = 15;
+  // Intent path → package scope (agent-resolved; server re-consumes for command).
+  PathContext path_context = 16;
+  // Agent precompute for cross-check only; server re-resolves authoritatively.
+  bool command_is_default = 17;
 }
 
 message TaskHandle {
@@ -278,6 +321,11 @@ message TaskStatus {
   // Historical reference for long-running builds (not an ETA).
   uint32 history_units_p50 = 14;
   uint64 history_build_ms_p50 = 15;
+  // Queue navigation for pending tasks (intent-and-query-surface §7).
+  uint32 queue_depth = 16;
+  uint32 running = 17;
+  uint32 capacity = 18;
+  uint32 suggest_wait_secs = 19;
 }
 
 message LogQuery {
@@ -302,6 +350,9 @@ message LogChunk {
   uint64 line_byte_offset = 7;
   uint64 next_byte_offset = 8;
   string line_no = 9;            // original server line number when continuing
+  // Honest empty states: matched vs raw total (intent-and-query-surface §4.4).
+  uint64 matched_lines = 10;
+  string empty_reason = 11;      // "no_log" | "no_match" | ""
 }
 
 message CancelTaskReq {
@@ -337,6 +388,8 @@ message ProfileResp {
   // 这里给出控制面认为可用的那一个；为空表示还没有可用环境。
   string resolved_image = 6;
   string adapter = 7;
+  // pre_commands still waiting for admin approval (concrete command lines).
+  repeated string pending_pre_commands = 8;
 }
 message UpsertProfileReq {
   string project_id = 1;
@@ -509,6 +562,12 @@ message TaskAssignment {
   // unions this with its own allowlist for this task only; it never reads the
   // agent's request, which arrives unvetted.
   repeated string egress_allow = 10;
+  // Server-authoritative: whether `command` is the contract/adapter default
+  // (including intent package scope). Worker parser gates on this; do not recompute.
+  bool command_is_default = 11;
+  string scope_hash = 12;
+  // Authoritative path context for Receipt (must reach the worker result).
+  PathContext path_context = 13;
 }
 
 message ImageBuildOrder {

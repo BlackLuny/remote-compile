@@ -5,8 +5,9 @@
 //! output, and which caches make it fast.
 
 use crate::model::TaskType;
-use crate::pb::{Diagnostic, ResolvedProfile};
+use crate::pb::{Diagnostic, PathContext, ResolvedProfile, ScopeKind};
 use crate::profile::BuildProfile;
+use crate::scope;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -51,8 +52,11 @@ pub trait Adapter: Send + Sync {
     /// Directories excluded from the sync scan.
     fn default_exclude(&self) -> &[&str];
 
-    /// Command for a task type, honouring profile overrides.
-    fn command_for(&self, profile: &BuildProfile, task: TaskType) -> CommandSpec;
+    /// Command for a task type, honouring profile overrides and intent scope.
+    ///
+    /// Profile `[tasks]` overrides are handled by [`crate::scope::resolve_command`];
+    /// this method synthesises the **default** adapter command for `path`.
+    fn command_for(&self, profile: &BuildProfile, task: TaskType, path: &PathContext) -> CommandSpec;
 
     fn parse_diagnostics(&self, stdout: &str, stderr: &str) -> Vec<Diagnostic>;
 
@@ -136,15 +140,8 @@ impl Adapter for RustAdapter {
         RUST_EXCLUDE
     }
 
-    fn command_for(&self, profile: &BuildProfile, task: TaskType) -> CommandSpec {
-        if let Some(custom) = profile.tasks.get(task.as_str()) {
-            // A custom command may or may not emit JSON; assume it does not,
-            // and fall back to text parsing.
-            return CommandSpec {
-                line: custom.clone(),
-                json_stdout: custom.contains("--message-format=json"),
-            };
-        }
+    fn command_for(&self, profile: &BuildProfile, task: TaskType, path: &PathContext) -> CommandSpec {
+        // Profile task overrides are applied in scope::resolve_command, not here.
         let mut flags = String::new();
         if let Some(t) = &profile.target {
             if !t.is_empty() {
@@ -156,12 +153,29 @@ impl Adapter for RustAdapter {
                 flags.push_str(&format!(" --features {}", f.join(",")));
             }
         }
+        let pkg = scope::package_flags(path);
+        let use_workspace = pkg.is_empty()
+            || path.scope == ScopeKind::ScopeWorkspace as i32
+            || path.scope == ScopeKind::ScopeUnspecified as i32;
+        let select = if use_workspace {
+            " --workspace".to_string()
+        } else {
+            pkg
+        };
         let line = match task {
-            TaskType::Check => format!("cargo check --workspace --all-targets --message-format=json{flags}"),
-            TaskType::Build => format!("cargo build --workspace --message-format=json{flags}"),
-            TaskType::Clippy => format!("cargo clippy --workspace --all-targets --message-format=json{flags} -- -D warnings"),
-            TaskType::Test => format!("cargo test --workspace{flags}"),
-            TaskType::Custom => "cargo check --workspace --message-format=json".to_string(),
+            TaskType::Check => {
+                format!("cargo check{select} --all-targets --message-format=json{flags}")
+            }
+            TaskType::Build => format!("cargo build{select} --message-format=json{flags}"),
+            TaskType::Clippy => {
+                format!(
+                    "cargo clippy{select} --all-targets --message-format=json{flags} -- -D warnings"
+                )
+            }
+            TaskType::Test => format!("cargo test{select}{flags}"),
+            TaskType::Custom => {
+                format!("cargo check{select} --message-format=json")
+            }
         };
         CommandSpec {
             json_stdout: line.contains("--message-format=json"),
@@ -302,7 +316,7 @@ impl Adapter for GenericAdapter {
         GENERIC_EXCLUDE
     }
 
-    fn command_for(&self, profile: &BuildProfile, task: TaskType) -> CommandSpec {
+    fn command_for(&self, profile: &BuildProfile, task: TaskType, _path: &PathContext) -> CommandSpec {
         let line = profile
             .tasks
             .get(task.as_str())
@@ -372,18 +386,22 @@ mod tests {
 
     #[test]
     fn check_asks_for_json_diagnostics() {
-        let spec = RustAdapter.command_for(&BuildProfile::default(), TaskType::Check);
+        let pc = scope::workspace_context(Path::new("/r"), Path::new("/r"));
+        let spec = RustAdapter.command_for(&BuildProfile::default(), TaskType::Check, &pc);
         assert!(spec.line.contains("--message-format=json"));
         assert!(spec.json_stdout);
+        assert!(spec.line.contains("--workspace"));
     }
 
     #[test]
-    fn profile_task_overrides_the_default_command() {
-        let mut p = BuildProfile::default();
-        p.tasks.insert("test".into(), "cargo nextest run -p backend".into());
-        let spec = RustAdapter.command_for(&p, TaskType::Test);
-        assert_eq!(spec.line, "cargo nextest run -p backend");
-        assert!(!spec.json_stdout);
+    fn package_scope_uses_dash_p() {
+        let mut pc = scope::workspace_context(Path::new("/r"), Path::new("/r/crates/a"));
+        pc.scope = ScopeKind::ScopePackage as i32;
+        pc.packages = vec!["pkg-a".into()];
+        let spec = RustAdapter.command_for(&BuildProfile::default(), TaskType::Check, &pc);
+        assert!(spec.line.contains("-p pkg-a"));
+        assert!(!spec.line.contains("--workspace"));
+        assert!(spec.line.contains("--all-targets"));
     }
 
     #[test]
@@ -391,7 +409,8 @@ mod tests {
         let mut p = BuildProfile::default();
         p.target = Some("x86_64-unknown-linux-musl".into());
         p.features = Some(vec!["ssr".into()]);
-        let spec = RustAdapter.command_for(&p, TaskType::Check);
+        let pc = scope::workspace_context(Path::new("/r"), Path::new("/r"));
+        let spec = RustAdapter.command_for(&p, TaskType::Check, &pc);
         assert!(spec.line.contains("--target x86_64-unknown-linux-musl"));
         assert!(spec.line.contains("--features ssr"));
     }
