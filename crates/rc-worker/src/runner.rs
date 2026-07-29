@@ -281,11 +281,10 @@ impl Runner {
         let diagnostics = adapter.parse_diagnostics(&output.stdout, &output.stderr);
         let task_type = TaskType::parse_or_default(&assignment.task_type);
         let combined = output.combined();
-        let command_is_default = rc_core::contract::command_is_default_resolved(
-            task_type,
-            &assignment.command,
-            &profile,
-        );
+        // Server-authoritative only (intent-and-query-surface §3.4 F1).
+        // Do not recompute from command text — that would flip explicit overrides
+        // that happen to match the default line.
+        let command_is_default = assignment.command_is_default;
         let classification = rc_core::diag::classify_with_exec(
             task_type,
             output.exit_code,
@@ -332,6 +331,20 @@ impl Runner {
                 test_summary: classification.test_summary,
                 units_seen_total: output.units_seen,
                 diag_delta: None,
+                effective_plan: Some(rc_core::pb::EffectivePlan {
+                    path: assignment.path_context.clone(),
+                    task: assignment.task_type.clone(),
+                    command: assignment.command.clone(),
+                    command_is_default,
+                    profile_source: String::new(),
+                    pre_commands: None,
+                    cache_key_note: if assignment.scope_hash.is_empty() {
+                        String::new()
+                    } else {
+                        format!("scope_hash={}", assignment.scope_hash)
+                    },
+                    scope_hash: assignment.scope_hash.clone(),
+                }),
             }),
             log_blob,
             log_lines: combined.lines().count() as u64,

@@ -274,7 +274,8 @@ impl AgentApi for AgentService {
     async fn get_task(&self, req: Request<TaskQuery>) -> Result<Response<TaskStatus>, Status> {
         self.authenticate(&req)?;
         let req = req.into_inner();
-        let deadline = std::time::Duration::from_secs(req.wait_secs.min(60) as u64);
+        // Raised to 120s for cold monorepo long-poll (intent-and-query-surface §7.2).
+        let deadline = std::time::Duration::from_secs(req.wait_secs.min(120) as u64);
         let mut rx = self.app.events.subscribe();
 
         let baseline = if req.baseline.is_empty() {
@@ -410,6 +411,16 @@ impl AgentApi for AgentService {
             .store
             .pending_pre_commands(&req.project_id, &req.path)
             .unwrap_or(false);
+        let pending_pre_commands: Vec<String> = self
+            .app
+            .store
+            .list_pre_commands(Some("pending_approval"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.project_id == req.project_id && r.path == req.path)
+            .flat_map(|r| r.commands)
+            .take(10)
+            .collect();
 
         let message = if resolved.is_empty() {
             "控制面还没有已审批的可用镜像：用 prepare_env 提交 Dockerfile，管理员审批后即可使用（§8.3/§8.4）".to_string()
@@ -436,6 +447,7 @@ impl AgentApi for AgentService {
             message,
             resolved_image: resolved,
             adapter,
+            pending_pre_commands,
         }))
     }
 
@@ -538,9 +550,15 @@ impl AgentApi for AgentService {
     async fn get_env_status(&self, req: Request<EnvQuery>) -> Result<Response<EnvStatus>, Status> {
         self.authenticate(&req)?;
         let id = req.into_inner().env_id;
-        match self.app.store.get_image(&id).map_err(internal)? {
-            Some(row) => Ok(Response::new(images::env_status(&row))),
-            None => Err(Status::not_found(format!("unknown env {id}"))),
+        match images::resolve_image(&self.app, &id).map_err(internal)? {
+            images::ResolveImage::One(row) => Ok(Response::new(images::env_status(&row))),
+            images::ResolveImage::Ambiguous(cands) => Err(Status::invalid_argument(format!(
+                "ambiguous env ref `{id}`; candidates: {}",
+                cands.join(", ")
+            ))),
+            images::ResolveImage::None => Err(Status::not_found(format!(
+                "unknown env `{id}`; use list_envs and pass the env_id= field"
+            ))),
         }
     }
 

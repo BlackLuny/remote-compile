@@ -23,6 +23,7 @@ pub mod notice;
 pub mod profile;
 pub mod progress;
 pub mod roots;
+pub mod scope;
 pub mod transport;
 
 pub mod pb {

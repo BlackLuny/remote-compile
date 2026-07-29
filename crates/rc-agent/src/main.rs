@@ -52,6 +52,9 @@ enum Command {
         wait_secs: Option<u32>,
         #[arg(long)]
         no_cache: bool,
+        /// Override the default command (same as MCP `command`).
+        #[arg(long)]
+        command: Option<String>,
     },
 }
 
@@ -96,6 +99,11 @@ fn main() -> Result<()> {
         }
         Command::Status => {
             let cfg = AgentConfig::load_or_create()?;
+            let ver = env!("CARGO_PKG_VERSION");
+            let sha = option_env!("VERGEN_GIT_SHA")
+                .or(option_env!("GIT_SHA"))
+                .unwrap_or("unknown");
+            println!("version: {ver}+{sha}");
             println!("config:  {}", AgentConfig::config_path().display());
             println!("cache:   {}", cfg.cache_root().display());
             println!("server:  {}", cfg.server);
@@ -103,13 +111,19 @@ fn main() -> Result<()> {
             println!("token:   {}", if cfg.token.is_empty() { "(none)" } else { "(set)" });
             Ok(())
         }
-        Command::Check { path, task, wait_secs, no_cache } => {
+        Command::Check {
+            path,
+            task,
+            wait_secs,
+            no_cache,
+            command,
+        } => {
             let cfg = AgentConfig::load_or_create()?;
             let engine = Engine::new(cfg);
             let outcome = rt.block_on(engine.check(CheckRequest {
                 path,
                 task: TaskType::parse_or_default(&task),
-                command: None,
+                command,
                 wait_secs,
                 no_cache,
                 env: Default::default(),

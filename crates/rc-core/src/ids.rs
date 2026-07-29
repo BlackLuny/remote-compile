@@ -75,10 +75,16 @@ pub fn is_valid_worktree_id(id: &str) -> bool {
     has_shape(id, "w-")
 }
 
-/// Supersede scope: same worktree, same agent session, same task type (§5.2).
-/// Crucially *not* cross-session and *not* cross-type.
-pub fn supersede_key(worktree_id: &str, agent_session: &str, task_type: &str) -> String {
-    format!("{worktree_id}|{agent_session}|{task_type}")
+/// Supersede scope: same worktree, same agent session, same task type, same
+/// intent scope (§5.2 + intent-and-query-surface §3.7).
+/// Crucially *not* cross-session, *not* cross-type, and *not* cross-package.
+pub fn supersede_key(
+    worktree_id: &str,
+    agent_session: &str,
+    task_type: &str,
+    scope_hash: &str,
+) -> String {
+    format!("{worktree_id}|{agent_session}|{task_type}|{scope_hash}")
 }
 
 /// Monotonic-ish, sortable, collision-resistant task id.
@@ -164,13 +170,18 @@ mod tests {
     fn supersede_scope_separates_task_types_and_sessions() {
         // §5.2 #22: a clippy run must not cancel a queued check.
         assert_ne!(
-            supersede_key("w1", "s1", "check"),
-            supersede_key("w1", "s1", "clippy")
+            supersede_key("w1", "s1", "check", "sh"),
+            supersede_key("w1", "s1", "clippy", "sh")
         );
         // §5.2: agent A must not cancel agent B in a shared worktree.
         assert_ne!(
-            supersede_key("w1", "s1", "check"),
-            supersede_key("w1", "s2", "check")
+            supersede_key("w1", "s1", "check", "sh"),
+            supersede_key("w1", "s2", "check", "sh")
+        );
+        // Intent scope: different packages must not supersede each other.
+        assert_ne!(
+            supersede_key("w1", "s1", "check", "pkg-a"),
+            supersede_key("w1", "s1", "check", "pkg-b")
         );
     }
 

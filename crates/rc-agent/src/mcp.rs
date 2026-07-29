@@ -100,9 +100,12 @@ impl McpServer {
         json!({
             "protocolVersion": version,
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "远程编译检查。改完代码用 check(path) 拿结论；不要在本地跑 cargo check —— \
-                             它会把上万行日志灌进上下文。结果分级：结论 → 结构化诊断 → get_log 分页取全量。"
+            "serverInfo": {
+                "name": SERVER_NAME,
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "instructions": "远程编译检查。改完代码用 check(path) 拿结论；子 crate 路径自动 -p。\
+                             结果：结论 → 结构化诊断 → get_diagnostics 分页 → get_log 逃逸舱。不要本地 cargo check。"
         })
     }
 
@@ -117,6 +120,7 @@ impl McpServer {
             "check" => self.tool_check(&args).await?,
             "get_result" => self.tool_get_result(&args).await?,
             "get_log" => self.tool_get_log(&args).await?,
+            "get_diagnostics" => self.tool_get_diagnostics(&args).await?,
             "get_build_profile" => self.tool_build_profile(&args).await?,
             "list_envs" => self.tool_list_envs(&args).await?,
             "prepare_env" => self.tool_prepare_env(&args).await?,
@@ -208,8 +212,20 @@ impl McpServer {
             .await
             .map_err(|e| McpError::Tool(e.to_string()))?;
 
-        if chunk.total_lines == 0 {
-            return Ok("(该任务没有日志：可能是缓存命中，或任务尚未执行)".into());
+        if chunk.empty_reason == "no_log" || (chunk.total_lines == 0 && chunk.matched_lines == 0 && chunk.empty_reason.is_empty() && chunk.lines.is_empty()) {
+            let reason = if chunk.empty_reason.is_empty() {
+                "cache hit without log body, not started, or GC'd"
+            } else {
+                "no log stored"
+            };
+            return Ok(format!("(no log stored: {reason})"));
+        }
+        if chunk.empty_reason == "no_match" || (!args.get("grep").and_then(|v| v.as_str()).unwrap_or("").is_empty() && chunk.matched_lines == 0 && chunk.lines.is_empty()) {
+            let grep = args.get("grep").and_then(|v| v.as_str()).unwrap_or("");
+            return Ok(format!(
+                "(0 lines matched grep=\"{grep}\"; total_lines={}; matched_lines=0)",
+                chunk.total_lines
+            ));
         }
         let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
         let gated = if self.engine.cfg.budget_gate {
@@ -303,6 +319,36 @@ impl McpServer {
         Ok(text)
     }
 
+    async fn tool_get_diagnostics(&self, args: &Value) -> Result<String, McpError> {
+        let task_id = required_str(args, "task_id")?;
+        let severity = args
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+        let code = args.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        let file_prefix = args.get("file_prefix").and_then(|v| v.as_str()).unwrap_or("");
+        let only_new = args.get("only_new").and_then(|v| v.as_bool()).unwrap_or(false);
+        let baseline = args
+            .get("baseline")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto");
+        self.engine
+            .get_diagnostics(
+                &task_id,
+                severity,
+                offset,
+                limit,
+                code,
+                file_prefix,
+                only_new,
+                baseline,
+            )
+            .await
+            .map_err(|e| McpError::Tool(e.to_string()))
+    }
+
     async fn tool_list_envs(&self, args: &Value) -> Result<String, McpError> {
         let envs = self
             .engine
@@ -320,7 +366,8 @@ impl McpServer {
         for e in envs.iter().take(20) {
             let health = e.health.unwrap_or_default();
             text.push_str(&format!(
-                "{}  [{}]  成功率 {:.0}% / {} 次  最近成功 {}\n  {}\n",
+                "env_id={}  image={}  status={}  成功率 {:.0}% / {} 次  最近成功 {}\n  {}\n",
+                e.env_id,
                 e.image_ref,
                 e.status,
                 health.success_rate_7d * 100.0,
@@ -454,16 +501,16 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "check",
-            "description": "远程编译检查当前工作区。默认短等待，多数增量 check 直接同步返回结论；\
-                            超时则返回 task_id 转异步。返回结论 + 结构化诊断，不返回原始日志。\
-                            改完代码用这个，不要本地跑 cargo check。",
+            "description": "远程编译检查。path 落在 monorepo 子 crate 时默认 cargo check -p 该包；\
+                            仓库根则全 workspace。返回结论 + 结构化诊断，不返回原始日志。\
+                            冷 monorepo 建议 wait_secs=60~120。不要本地跑 cargo check。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "工作区内任意路径；会自动上溯到仓库根" },
+                    "path": { "type": "string", "description": "工作区内路径；子 crate 会自动 -p 该包" },
                     "task": { "type": "string", "enum": ["check", "build", "test", "clippy"], "default": "check" },
                     "command": { "type": "string", "description": "覆盖默认命令（少用；优先写进 .remote-compile.toml）" },
-                    "wait_secs": { "type": "integer", "description": "同步等待秒数，默认 4" },
+                    "wait_secs": { "type": "integer", "description": "同步等待秒数，默认 4；冷 monorepo 建议 60~120" },
                     "no_cache": { "type": "boolean", "description": "跳过指纹缓存强制重编，默认 false" },
                     "env": { "type": "object", "description": "请求级环境变量（分层叠加；有 denylist）", "additionalProperties": { "type": "string" } },
                     "no_remediate": { "type": "boolean", "description": "关闭 OOM 自动降配重试，默认 false" },
@@ -474,12 +521,12 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_result",
-            "description": "轮询一个异步任务的结果。token 成本极低，可以反复调用。",
+            "description": "轮询一个异步任务的结果。token 成本极低。冷任务用 wait_secs=60~120。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task_id": { "type": "string" },
-                    "wait_secs": { "type": "integer", "description": "长轮询等待秒数，默认 0（立即返回）" }
+                    "wait_secs": { "type": "integer", "description": "长轮询等待秒数，默认 0；上限 120" }
                 },
                 "required": ["task_id"]
             }
@@ -494,16 +541,35 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_diagnostics",
+            "description": "分页取结构化编译诊断（默认 severity=error）。定位错误优先用这个，\
+                            不要 get_log grep=error（会命中 thiserror 等 crate 名噪音）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "severity": { "type": "string", "enum": ["error", "warning", "all"], "default": "error" },
+                    "offset": { "type": "integer", "default": 0 },
+                    "limit": { "type": "integer", "default": 20, "maximum": 100 },
+                    "code": { "type": "string", "description": "如 E0063" },
+                    "file_prefix": { "type": "string" },
+                    "only_new": { "type": "boolean", "default": false },
+                    "baseline": { "type": "string", "description": "only_new 时的基线：auto|none|last_success|<task_id>" }
+                },
+                "required": ["task_id"]
+            }
+        }),
+        json!({
             "name": "get_log",
-            "description": "分页取全量构建日志。必须带 limit/grep —— 完整日志动辄上万行，\
-                            全量拉取会挤爆上下文。定位问题优先用 grep=\"error\"。",
+            "description": "分页取全量构建日志（逃逸舱）。编译错误请先 get_diagnostics。\
+                            必须带 limit。若必须 grep，优先 error[E 或具体 code/字段名。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task_id": { "type": "string" },
                     "offset": { "type": "integer", "default": 0 },
                     "limit": { "type": "integer", "default": 100, "maximum": 1000 },
-                    "grep": { "type": "string", "description": "只返回包含该子串的行（不区分大小写）" },
+                    "grep": { "type": "string", "description": "子串过滤（不区分大小写）；勿用裸 error" },
                     "tail": { "type": "boolean", "description": "从末尾取，默认 false" },
                     "raw": { "type": "boolean", "description": "跳过单行省略，仍受响应总上限约束" },
                     "line_byte_offset": { "type": "integer", "description": "raw 模式下单行内续读的字节偏移" }
@@ -631,6 +697,7 @@ mod tests {
             "get_result",
             "cancel",
             "get_log",
+            "get_diagnostics",
             "get_build_profile",
             "list_envs",
             "prepare_env",
@@ -639,7 +706,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing tool {expected}");
         }
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
     }
 
     #[test]

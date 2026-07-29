@@ -1545,7 +1545,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rc-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "rc-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "rc-worker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bollard",

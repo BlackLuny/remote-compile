@@ -67,6 +67,87 @@ pub fn prepare_env(app: &App, req: &pb::PrepareEnvReq) -> Result<pb::EnvStatus> 
     Ok(env_status(&row))
 }
 
+/// Resolve an env ref: id, short prefix, image_ref, or digest (intent §6).
+pub enum ResolveImage {
+    One(crate::store::ImageRow),
+    Ambiguous(Vec<String>),
+    None,
+}
+
+pub fn resolve_image(app: &App, refer: &str) -> Result<ResolveImage> {
+    let refer = refer.trim();
+    if refer.is_empty() {
+        return Ok(ResolveImage::None);
+    }
+    // 1) exact env_id
+    if let Some(row) = app.store.get_image(refer)? {
+        return Ok(ResolveImage::One(row));
+    }
+    let all = app.store.list_images(None)?;
+    // 2) exact image_ref / full_ref / digest
+    let exact: Vec<_> = all
+        .iter()
+        .filter(|row| {
+            row.digest == refer
+                || row.image_ref == refer
+                || full_ref(row) == refer
+                || (!row.digest.is_empty() && refer.ends_with(&row.digest))
+        })
+        .cloned()
+        .collect();
+    if exact.len() == 1 {
+        return Ok(ResolveImage::One(exact.into_iter().next().unwrap()));
+    }
+    if exact.len() > 1 {
+        return Ok(ResolveImage::Ambiguous(
+            exact.into_iter().map(|r| r.id).collect(),
+        ));
+    }
+    // 3) unique short prefix of env_id (min 8 hex-ish chars), or path segment
+    //    `…/env/<id>@…` / `…/env/<id>:…` as printed by list_envs.
+    if refer.len() >= 8 {
+        let mut hits: Vec<crate::store::ImageRow> = Vec::new();
+        for row in &all {
+            let id_prefix = row.id.starts_with(refer);
+            // Short id as a full path segment in image_ref (list_envs display form).
+            let path_seg = {
+                let patterns = [
+                    format!("/{refer}@"),
+                    format!("/{refer}:"),
+                    format!("/{refer}"),
+                ];
+                patterns.iter().any(|p| {
+                    row.image_ref.contains(p.as_str())
+                        && row
+                            .image_ref
+                            .find(p.as_str())
+                            .map(|i| {
+                                // ensure char before is a path boundary
+                                i == 0
+                                    || row.image_ref.as_bytes().get(i.saturating_sub(1))
+                                        == Some(&b'/')
+                                    || true // `/{refer}` already forces leading /
+                            })
+                            .unwrap_or(false)
+                })
+            };
+            if id_prefix || path_seg {
+                if !hits.iter().any(|h| h.id == row.id) {
+                    hits.push(row.clone());
+                }
+            }
+        }
+        return match hits.len() {
+            0 => Ok(ResolveImage::None),
+            1 => Ok(ResolveImage::One(hits.into_iter().next().unwrap())),
+            _ => Ok(ResolveImage::Ambiguous(
+                hits.into_iter().map(|r| r.id).collect(),
+            )),
+        };
+    }
+    Ok(ResolveImage::None)
+}
+
 pub fn env_status(row: &crate::store::ImageRow) -> pb::EnvStatus {
     pb::EnvStatus {
         env_id: row.id.clone(),

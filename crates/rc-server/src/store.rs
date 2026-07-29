@@ -69,6 +69,8 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX IF NOT EXISTS idx_pre_commands_status ON pre_commands(status);",
     // Unit progress totals for history_ref (mechanism five). Additive.
     "ALTER TABLE tasks ADD COLUMN units_seen_total INTEGER NOT NULL DEFAULT 0;",
+    // Intent scope hash for supersede/delta isolation (intent-and-query-surface §3.7).
+    "ALTER TABLE tasks ADD COLUMN scope_hash TEXT NOT NULL DEFAULT '';",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -143,6 +145,9 @@ pub struct TaskRow {
     /// this task produces is cached under a fingerprint that folded exactly
     /// these in, so the build must not be handed any others.
     pub egress_key: String,
+    /// Intent scope identity for delta baseline isolation.
+    #[serde(default)]
+    pub scope_hash: String,
 }
 
 impl TaskRow {
@@ -174,6 +179,7 @@ impl TaskRow {
             bytes_synced: r.get("bytes_synced")?,
             cache_hit: r.get("cache_hit")?,
             egress_key: r.get("egress_key")?,
+            scope_hash: r.get("scope_hash").unwrap_or_default(),
         })
     }
 
@@ -470,11 +476,11 @@ impl Store {
             "INSERT INTO tasks (id, task_type, project_id, worktree_id, agent_session, fingerprint,
                 supersede_key, status, result_kind, command, image, log_ref, worker_id, attempt,
                 created_at, started_at, finished_at, error, superseded_by, result_json,
-                queue_ms, sync_ms, build_ms, bytes_synced, cache_hit, egress_key)
+                queue_ms, sync_ms, build_ms, bytes_synced, cache_hit, egress_key, scope_hash)
              -- `image` is filled in by set_task_image once the task is placed;
              -- `command` must be bound here or the worker is handed an empty
              -- script and every task exits 0 having compiled nothing.
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9, '','','',0, ?10,0,0,'','','',0,0,0,?11,0,?12)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9, '','','',0, ?10,0,0,'','','',0,0,0,?11,0,?12,?13)",
             params![
                 row.id,
                 row.task_type,
@@ -488,6 +494,7 @@ impl Store {
                 row.created_at,
                 row.bytes_synced,
                 row.egress_key,
+                row.scope_hash,
             ],
         )?;
         conn.execute(
@@ -799,15 +806,25 @@ impl Store {
         } else {
             ""
         };
+        // Scope-aware baseline (intent-and-query-surface §3.7): same scope_hash.
+        // Empty scope_hash only matches empty (legacy tasks).
         let sql = format!(
             "SELECT * FROM tasks
              WHERE project_id = ?1 AND worktree_id = ?2 AND task_type = ?3
                AND status = 'done' AND id != ?4
                AND (finished_at < ?5 OR (finished_at = ?5 AND id < ?4))
+               AND scope_hash = ?6
                {kind_filter}
              ORDER BY finished_at DESC, id DESC LIMIT 1"
         );
         let conn = self.conn.lock();
+        let current_scope: String = conn
+            .query_row(
+                "SELECT scope_hash FROM tasks WHERE id = ?1",
+                params![exclude_task_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
         conn.query_row(
             &sql,
             params![
@@ -815,7 +832,8 @@ impl Store {
                 worktree_id,
                 task_type,
                 exclude_task_id,
-                before_finished_at
+                before_finished_at,
+                current_scope,
             ],
             TaskRow::from_row,
         )
@@ -2552,6 +2570,7 @@ mod tests {
                 "ALTER TABLE images DROP COLUMN last_env_error_project;
                  ALTER TABLE tasks DROP COLUMN egress_key;
                  ALTER TABLE tasks DROP COLUMN units_seen_total;
+                 ALTER TABLE tasks DROP COLUMN scope_hash;
                  INSERT INTO images (id, digest) VALUES ('e1', 'd');
                  INSERT INTO tasks (id, task_type, fingerprint) VALUES ('t1', 'check', 'fp1');",
             )
