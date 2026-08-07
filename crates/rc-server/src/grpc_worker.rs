@@ -273,6 +273,9 @@ async fn handle_event(app: &Arc<App>, worker_id: &str, event: WorkerEvent) -> an
         worker_event::Body::ImageDone(done) => {
             images::on_build_done(app, &done)?;
         }
+        worker_event::Body::MirrorDone(done) => {
+            images::on_mirror_done(app, worker_id, &done)?;
+        }
     }
     Ok(())
 }

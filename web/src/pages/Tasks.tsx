@@ -124,7 +124,7 @@ export function Tasks() {
               {q.data!.tasks.map((t) => (
                 <tr key={t.id} className="hover:bg-[var(--color-panel-2)]/50">
                   <Td>
-                    <Link to={`/tasks/${t.id}`} className="hover:text-[var(--color-accent)]">
+                    <Link to={`/tasks/${t.id}`} className="hover:text-[var(--color-accent)]" title={t.id}>
                       <Mono>{shortId(t.id, 14)}</Mono>
                     </Link>
                   </Td>
@@ -147,12 +147,22 @@ export function Tasks() {
                     )}
                   </Td>
                   <Td>
-                    <Mono className="text-[var(--color-ink-dim)]">{shortId(t.worktree_id, 12)}</Mono>
+                    <span title={t.worktree_id}>
+                      <Mono className="text-[var(--color-ink-dim)]">{shortId(t.worktree_id, 12)}</Mono>
+                    </span>
                   </Td>
                   <Td>
-                    <Mono className="text-[var(--color-ink-dim)]">
-                      {t.worker_id ? shortId(t.worker_id, 12) : "–"}
-                    </Mono>
+                    {t.worker_id ? (
+                      <Link
+                        to={`/workers/${t.worker_id}`}
+                        className="hover:text-[var(--color-accent)]"
+                        title={t.worker_id}
+                      >
+                        <Mono className="text-[var(--color-ink-dim)]">{shortId(t.worker_id, 14)}</Mono>
+                      </Link>
+                    ) : (
+                      <Mono className="text-[var(--color-ink-dim)]">–</Mono>
+                    )}
                   </Td>
                   <Td className="tnum text-right text-[var(--color-ink-dim)]">{ms(t.queue_ms)}</Td>
                   <Td className="tnum text-right text-[var(--color-ink-dim)]">{ms(t.sync_ms)}</Td>

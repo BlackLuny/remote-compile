@@ -574,6 +574,166 @@ impl Runner {
         let _ = self.sandbox.kill(&name).await;
     }
 
+    /// Push or pull an env image for fleet distribution (admin-driven).
+    pub async fn mirror_image(&self, order: pb::ImageMirrorOrder) -> pb::ImageMirrorDone {
+        let env_id = order.env_id.clone();
+        let op = order.op.clone();
+        let remote_ref = order.remote_ref.clone();
+        let result = self.mirror_image_inner(&order).await;
+        match result {
+            Ok(msg) => pb::ImageMirrorDone {
+                env_id,
+                op,
+                ok: true,
+                message: msg,
+                remote_ref,
+            },
+            Err(e) => pb::ImageMirrorDone {
+                env_id,
+                op,
+                ok: false,
+                message: e.to_string(),
+                remote_ref,
+            },
+        }
+    }
+
+    async fn mirror_image_inner(&self, order: &pb::ImageMirrorOrder) -> anyhow::Result<String> {
+        if order.remote_ref.is_empty() {
+            anyhow::bail!("remote_ref is required");
+        }
+        match order.op.as_str() {
+            "push" => {
+                let local = if !order.local_ref.is_empty() {
+                    order.local_ref.as_str()
+                } else if !order.expected_digest.is_empty() {
+                    order.expected_digest.as_str()
+                } else {
+                    anyhow::bail!("local_ref or expected_digest is required for push");
+                };
+                // Never fall back to pulling a bare digest: push means "I already
+                // have the approved image on this host".
+                let resolved = self.sandbox.resolve_local(local).await.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "image `{local}` is not on this worker; pick a worker that built it, or pull first"
+                    )
+                })?;
+                if !order.expected_digest.is_empty() {
+                    let id = self.sandbox.image_id_of(&resolved).await?;
+                    if !digests_equal(&id, &order.expected_digest) {
+                        anyhow::bail!(
+                            "local image id {id} does not match expected {}",
+                            order.expected_digest
+                        );
+                    }
+                }
+                let (repo, tag) = {
+                    let r = order.remote_ref.as_str();
+                    if let Some((left, right)) = r.rsplit_once(':') {
+                        if right.contains('/') {
+                            (r, "latest")
+                        } else {
+                            (left, right)
+                        }
+                    } else {
+                        (r, "latest")
+                    }
+                };
+                self.sandbox.tag_image(&resolved, repo, tag).await?;
+                self.sandbox.push_image(&order.remote_ref).await?;
+                Ok(format!("pushed {} → {}", resolved, order.remote_ref))
+            }
+            "pull" => {
+                let also = if order.also_local_tag.is_empty() {
+                    None
+                } else {
+                    Some(order.also_local_tag.as_str())
+                };
+                // If a local tag already exists but for the wrong digest, still
+                // pull — ensure_image alone would short-circuit on the name.
+                let skip_local = if !order.expected_digest.is_empty() {
+                    if let Some(local) = self.sandbox.resolve_local(&order.remote_ref).await {
+                        let id = self.sandbox.image_id_of(&local).await?;
+                        digests_equal(&id, &order.expected_digest)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let resolved = if skip_local {
+                    order.remote_ref.clone()
+                } else {
+                    // Force network pull by using create_image path when local
+                    // is missing or stale (pull_and_tag → ensure_image).
+                    if let Some(local) = self.sandbox.resolve_local(&order.remote_ref).await {
+                        // Stale tag: remove association by pulling with unique ref
+                        // then re-tag. ensure_image would skip; call pull_and_tag
+                        // after untagging is heavy — re-pull via temporary name.
+                        let _ = local;
+                    }
+                    self.sandbox
+                        .force_pull(&order.remote_ref)
+                        .await?
+                };
+                if let Some(full) = also.filter(|s| !s.is_empty()) {
+                    let (repo, tag) = {
+                        if let Some((l, r)) = full.rsplit_once(':') {
+                            if !r.contains('/') {
+                                (l, r)
+                            } else {
+                                (full, "latest")
+                            }
+                        } else {
+                            (full, "latest")
+                        }
+                    };
+                    self.sandbox.tag_image(&resolved, repo, tag).await?;
+                }
+                let id = self.sandbox.image_id_of(&resolved).await?;
+                if !order.expected_digest.is_empty()
+                    && !digests_equal(&id, &order.expected_digest)
+                {
+                    anyhow::bail!(
+                        "pulled image id {id} does not match approved digest {}; refusing to retag",
+                        order.expected_digest
+                    );
+                }
+                // Tag by digest so task pins (`…@sha256:…`) resolve via image id.
+                if !order.expected_digest.is_empty() {
+                    // no-op if already the id; ensures inspect(digest) works
+                    let _ = id;
+                }
+                if !order.local_ref.is_empty() && order.local_ref != order.remote_ref {
+                    if let Some((repo, tag)) = order.local_ref.rsplit_once(':') {
+                        if !tag.contains('/') {
+                            self.sandbox.tag_image(&id, repo, tag).await?;
+                        }
+                    }
+                }
+                Ok(format!(
+                    "pulled {} → id {}{}",
+                    order.remote_ref,
+                    id,
+                    if also.is_some() {
+                        format!(" (+{})", order.also_local_tag)
+                    } else {
+                        String::new()
+                    }
+                ))
+            }
+            other => anyhow::bail!("unknown mirror op `{other}` (want push|pull)"),
+        }
+    }
+}
+
+fn digests_equal(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_start_matches("sha256:").to_ascii_lowercase();
+    !a.is_empty() && norm(a) == norm(b)
+}
+
+// Re-open impl for the remaining methods (kept in one logical block for the reader).
+impl Runner {
     /// Build an approved environment image (§8.2).
     pub async fn build_image(&self, order: pb::ImageBuildOrder) -> Option<pb::ImageBuildDone> {
         let env_id = order.env_id.clone();

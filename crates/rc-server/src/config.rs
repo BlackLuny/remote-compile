@@ -69,6 +69,21 @@ pub struct Policy {
     pub diag_delta: bool,
     #[serde(default = "default_true")]
     pub unit_progress: bool,
+    /// External registry host for env image distribution (admin UI).
+    /// Empty disables push/pull. Example: `hub.covm.net`.
+    #[serde(default)]
+    pub image_registry: String,
+    /// Repository name under the registry. Example: `rc-env`
+    /// → `{image_registry}/{image_registry_prefix}:{env_short_id}`.
+    #[serde(default = "default_registry_prefix")]
+    pub image_registry_prefix: String,
+    /// Master switch for admin mirror actions.
+    #[serde(default)]
+    pub image_registry_enabled: bool,
+}
+
+fn default_registry_prefix() -> String {
+    "rc-env".into()
 }
 
 fn default_true() -> bool {
@@ -98,6 +113,9 @@ impl Default for Policy {
             budget_gate: true,
             diag_delta: true,
             unit_progress: true,
+            image_registry: String::new(),
+            image_registry_prefix: default_registry_prefix(),
+            image_registry_enabled: false,
         }
     }
 }
@@ -118,6 +136,27 @@ impl Policy {
     pub fn save(&self, store: &Store) -> anyhow::Result<()> {
         store.set_setting(POLICY_KEY, &serde_json::to_string(self)?)?;
         Ok(())
+    }
+
+    /// External tag for an env image, if registry distribution is enabled.
+    ///
+    /// Uses the same short id slice as `prepare_env` (`env_id[2..10]`).
+    pub fn image_remote_ref(&self, env_id: &str) -> Option<String> {
+        if !self.image_registry_enabled {
+            return None;
+        }
+        let host = self.image_registry.trim().trim_end_matches('/');
+        if host.is_empty() {
+            return None;
+        }
+        let prefix = self.image_registry_prefix.trim().trim_matches('/');
+        let prefix = if prefix.is_empty() { "rc-env" } else { prefix };
+        let short = if env_id.len() >= 10 {
+            &env_id[2..10]
+        } else {
+            env_id
+        };
+        Some(format!("{host}/{prefix}:{short}"))
     }
 }
 
@@ -151,5 +190,18 @@ mod tests {
     fn approval_is_required_by_default() {
         // §8.3: image build is its own attack surface; opt-out must be explicit.
         assert!(Policy::default().require_image_approval);
+    }
+
+    #[test]
+    fn image_remote_ref_is_none_until_enabled() {
+        let mut p = Policy::default();
+        assert!(p.image_remote_ref("e-0f5446c328b93fb7").is_none());
+        p.image_registry_enabled = true;
+        p.image_registry = "hub.covm.net".into();
+        p.image_registry_prefix = "rc-env".into();
+        assert_eq!(
+            p.image_remote_ref("e-0f5446c328b93fb7").as_deref(),
+            Some("hub.covm.net/rc-env:0f5446c3")
+        );
     }
 }

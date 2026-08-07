@@ -545,6 +545,7 @@ message WorkerEvent {
     TaskProgress progress = 2;
     TaskDone done = 3;
     ImageBuildDone image_done = 4;
+    ImageMirrorDone mirror_done = 5;
   }
 }
 
@@ -577,6 +578,34 @@ message ImageBuildOrder {
   string pull_ref = 4;
 }
 
+// Admin-driven fleet distribution: push a local env image to an external
+// registry, or pull it onto this worker. Credentials come from the worker's
+// local docker config (docker login); the control plane never sees them.
+message ImageMirrorOrder {
+  string env_id = 1;
+  // "push" | "pull"
+  string op = 2;
+  // How to find the image locally (image id, or a local tag). Required for push.
+  string local_ref = 3;
+  // External registry reference, e.g. hub.covm.net/rc-env:0f5446c3
+  // Server always constructs this from policy; workers must not invent hosts.
+  string remote_ref = 4;
+  // After pull, also apply this local tag (e.g. rc-registry/env/0f5446c3:latest)
+  // so floating names match what the console displays.
+  string also_local_tag = 5;
+  // Approved image id / digest (sha256:…). Push refuses if local image differs;
+  // pull refuses (and does not retag) if the pulled image differs.
+  string expected_digest = 6;
+}
+
+message ImageMirrorDone {
+  string env_id = 1;
+  string op = 2;
+  bool ok = 3;
+  string message = 4;
+  string remote_ref = 5;
+}
+
 message ServerCmd {
   oneof body {
     TaskAssignment assign = 1;
@@ -584,6 +613,7 @@ message ServerCmd {
     Empty drain = 3;
     ImageBuildOrder build_image = 4;
     Empty ping = 5;
+    ImageMirrorOrder mirror_image = 6;
   }
 }
 

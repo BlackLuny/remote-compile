@@ -250,6 +250,49 @@ export function Settings({ role }: { role: Role }) {
               readOnly={readOnly}
             />
           </Group>
+
+          <Group title="镜像仓库（分发）">
+            <label className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                checked={!!draft.image_registry_enabled}
+                disabled={readOnly}
+                onChange={(e) => set("image_registry_enabled", e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-[12px]">启用外部 registry 分发</span>
+                <span className="block text-[11px] text-[var(--color-ink-faint)]">
+                  开启后，镜像页可手动「推送 / 拉取」环境镜像。凭证在各 worker 本机{" "}
+                  <Mono>docker login</Mono>，控制面不存密码。
+                </span>
+              </span>
+            </label>
+            <TextField
+              label="Registry 主机"
+              hint="例如 hub.covm.net（不要带 https://）"
+              value={draft.image_registry ?? ""}
+              onChange={(v) => set("image_registry", v)}
+              readOnly={readOnly || !draft.image_registry_enabled}
+            />
+            <TextField
+              label="仓库前缀"
+              hint="完整 tag = {主机}/{前缀}:{env短id}，默认 rc-env"
+              value={draft.image_registry_prefix ?? "rc-env"}
+              onChange={(v) => set("image_registry_prefix", v)}
+              readOnly={readOnly || !draft.image_registry_enabled}
+            />
+            {draft.image_registry_enabled && draft.image_registry && (
+              <div className="rounded border border-[var(--color-line-soft)] bg-[var(--color-surface)] px-3 py-2 text-[11px] text-[var(--color-ink-dim)]">
+                示例：
+                <Mono className="ml-1">
+                  {(draft.image_registry || "").replace(/\/$/, "")}/
+                  {(draft.image_registry_prefix || "rc-env").replace(/^\//, "")}
+                  :0f5446c3
+                </Mono>
+              </div>
+            )}
+          </Group>
         </div>
       </Card>
 

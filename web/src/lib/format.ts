@@ -54,10 +54,28 @@ export function duration(secs: number): string {
   return `${secs} 秒`;
 }
 
-/** Shorten an id for display while keeping it recognisable. */
+/**
+ * Shorten an id for display while keeping it recognisable.
+ *
+ * Prefer the *suffix* of the payload when the id has a short type prefix
+ * (`worker-`, `t-`, `w-`, …). ULID / time-ordered prefixes are shared by
+ * near-simultaneous ids, so left-only truncation makes every row look
+ * identical (e.g. all workers render as `worker-01kyc…`).
+ */
 export function shortId(id: string, keep = 10): string {
-  if (id.length <= keep + 3) return id;
-  return `${id.slice(0, keep)}…`;
+  if (!id || id.length <= keep + 3) return id;
+
+  // type-prefix form: "worker-01ky…", "t-01ky…", "w-abc…"
+  const dash = id.indexOf("-");
+  if (dash > 0 && dash <= 8) {
+    const head = id.slice(0, dash + 1);
+    const tailKeep = Math.max(keep - head.length, 6);
+    if (id.length - head.length <= tailKeep) return id;
+    return `${head}…${id.slice(-tailKeep)}`;
+  }
+
+  // no prefix: keep the right end (higher entropy for random ids)
+  return `…${id.slice(-keep)}`;
 }
 
 export function shortDigest(ref: string): string {

@@ -11,10 +11,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest, VolumeCreateRequest};
+use bollard::auth::DockerCredentials;
 use bollard::query_parameters::{
     BuildImageOptions, CreateContainerOptions, CreateImageOptions, InspectNetworkOptions,
     KillContainerOptions, ListContainersOptions, ListVolumesOptions, LogsOptions,
-    RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions, WaitContainerOptions,
+    PushImageOptions, RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions,
+    TagImageOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -140,28 +142,117 @@ impl Sandbox {
     /// resolves locally and is just as immutable a handle (§8.3), so try it
     /// before reaching for the network.
     pub async fn ensure_image(&self, image: &str) -> Result<String> {
-        if self.docker.inspect_image(image).await.is_ok() {
-            return Ok(image.to_string());
-        }
-        if let Some((_, id)) = image.split_once('@') {
-            if self.docker.inspect_image(id).await.is_ok() {
-                tracing::debug!(%image, %id, "resolved to an image built on this worker");
-                return Ok(id.to_string());
-            }
+        if let Some(local) = self.resolve_local(image).await {
+            return Ok(local);
         }
         tracing::info!(%image, "pulling image");
+        let (from_image, tag) = split_repo_tag(image);
+        let credentials = registry_credentials_for(from_image);
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
+                from_image: Some(from_image.to_string()),
+                tag: tag.map(|t| t.to_string()),
                 ..Default::default()
             }),
             None,
-            None,
+            credentials,
         );
         while let Some(item) = stream.next().await {
             item.with_context(|| format!("pull {image}"))?;
         }
         Ok(image.to_string())
+    }
+
+    /// Resolve `image` only if it is already on this host — never reaches the network.
+    pub async fn resolve_local(&self, image: &str) -> Option<String> {
+        if self.docker.inspect_image(image).await.is_ok() {
+            return Some(image.to_string());
+        }
+        if let Some((_, id)) = image.split_once('@') {
+            if self.docker.inspect_image(id).await.is_ok() {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+
+    /// Image id (`sha256:…`) for a local name or id.
+    pub async fn image_id_of(&self, image: &str) -> Result<String> {
+        let info = self
+            .docker
+            .inspect_image(image)
+            .await
+            .with_context(|| format!("inspect {image}"))?;
+        info.id
+            .ok_or_else(|| anyhow!("image {image} has no id"))
+    }
+
+    /// Tag `source` (id or name) as `repo:tag`.
+    pub async fn tag_image(&self, source: &str, repo: &str, tag: &str) -> Result<()> {
+        self.docker
+            .tag_image(
+                source,
+                Some(TagImageOptions {
+                    repo: Some(repo.to_string()),
+                    tag: Some(tag.to_string()),
+                }),
+            )
+            .await
+            .with_context(|| format!("tag {source} as {repo}:{tag}"))
+    }
+
+    /// Push `image` (must already be tagged for the remote registry).
+    ///
+    /// Auth is taken from the worker host's docker config (`~/.docker/config.json`
+    /// or `$DOCKER_CONFIG/config.json`); the control plane never sees credentials.
+    pub async fn push_image(&self, image: &str) -> Result<()> {
+        let (repo, tag) = split_repo_tag(image);
+        let credentials = registry_credentials_for(repo);
+        tracing::info!(%image, "pushing image");
+        let mut stream = self.docker.push_image(
+            repo,
+            Some(PushImageOptions {
+                tag: tag.map(|t| t.to_string()),
+                platform: None,
+            }),
+            credentials,
+        );
+        while let Some(item) = stream.next().await {
+            item.with_context(|| format!("push {image}"))?;
+        }
+        Ok(())
+    }
+
+    /// Pull `remote`, then optionally apply `also_tag` (full `repo:tag`).
+    pub async fn pull_and_tag(&self, remote: &str, also_tag: Option<&str>) -> Result<String> {
+        let resolved = self.ensure_image(remote).await?;
+        if let Some(full) = also_tag.filter(|s| !s.is_empty() && *s != remote) {
+            let (repo, tag) = split_repo_tag(full);
+            let tag = tag.unwrap_or("latest");
+            self.tag_image(&resolved, repo, tag).await?;
+        }
+        Ok(resolved)
+    }
+
+    /// Always contact the registry (even if a local tag already exists).
+    pub async fn force_pull(&self, image: &str) -> Result<String> {
+        tracing::info!(%image, "force-pulling image");
+        let (from_image, tag) = split_repo_tag(image);
+        let credentials = registry_credentials_for(from_image);
+        let mut stream = self.docker.create_image(
+            Some(CreateImageOptions {
+                from_image: Some(from_image.to_string()),
+                tag: tag.map(|t| t.to_string()),
+                ..Default::default()
+            }),
+            None,
+            credentials,
+        );
+        while let Some(item) = stream.next().await {
+            item.with_context(|| format!("pull {image}"))?;
+        }
+        // Prefer the image id after pull so subsequent tags bind the right bytes.
+        self.image_id_of(image).await.or_else(|_| Ok(image.to_string()))
     }
 
     pub async fn ensure_volume(&self, name: &str, labels: HashMap<String, String>) -> Result<()> {
@@ -673,9 +764,122 @@ pub fn workspace_dir(work_root: &Path, worktree_id: &str) -> PathBuf {
     work_root.join(worktree_id)
 }
 
+/// Split `repo:tag` or `host/repo:tag`. Digests (`@sha256:`) keep the whole
+/// string as repo with no tag.
+fn split_repo_tag(image: &str) -> (&str, Option<&str>) {
+    if let Some((left, right)) = image.rsplit_once(':') {
+        // Avoid treating `sha256:abc` hostless digests as repo:tag when used alone.
+        if right.contains('/') {
+            return (image, None);
+        }
+        // `host:5000/repo` has a colon in the host — only split when the right
+        // side looks like a tag (no further path separators and not a digest).
+        if !right.is_empty() && !right.contains('/') && left.contains('/') {
+            return (left, Some(right));
+        }
+        // `repo:tag` without a registry host.
+        if !right.is_empty() && !right.contains('/') && !left.contains('@') {
+            return (left, Some(right));
+        }
+    }
+    (image, None)
+}
+
+/// Docker credentials for the registry hosting `image`, if the worker has
+/// logged in. Looks at `$DOCKER_CONFIG/config.json` then standard paths.
+fn registry_credentials_for(image: &str) -> Option<DockerCredentials> {
+    let host = image
+        .split_once('/')
+        .map(|(h, _)| h)
+        .filter(|h| h.contains('.') || h.contains(':'))
+        .unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    let paths = docker_config_paths();
+    for path in paths {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(auths) = json.get("auths").and_then(|a| a.as_object()) else {
+            continue;
+        };
+        // Keys may be `hub.covm.net` or `https://hub.covm.net/v2/`.
+        let entry = auths.iter().find(|(k, _)| {
+            k.trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .starts_with(host)
+                || k.contains(host)
+        });
+        let Some((_, v)) = entry else {
+            continue;
+        };
+        if let Some(auth_b64) = v.get("auth").and_then(|a| a.as_str()) {
+            if let Ok(decoded) = base64_decode(auth_b64) {
+                if let Some((user, pass)) = decoded.split_once(':') {
+                    return Some(DockerCredentials {
+                        username: Some(user.to_string()),
+                        password: Some(pass.to_string()),
+                        serveraddress: Some(host.to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        let username = v.get("username").and_then(|u| u.as_str()).map(str::to_string);
+        let password = v.get("password").and_then(|p| p.as_str()).map(str::to_string);
+        if username.is_some() || password.is_some() {
+            return Some(DockerCredentials {
+                username,
+                password,
+                serveraddress: Some(host.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    None
+}
+
+fn docker_config_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(dir) = std::env::var("DOCKER_CONFIG") {
+        out.push(PathBuf::from(dir).join("config.json"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        out.push(PathBuf::from(home).join(".docker/config.json"));
+    }
+    // Worker data dir is often the process home (`/var/lib/rc-worker`).
+    out.push(PathBuf::from("/var/lib/rc-worker/.docker/config.json"));
+    // Last resort when the install left credentials under root.
+    out.push(PathBuf::from("/root/.docker/config.json"));
+    out
+}
+
+fn base64_decode(input: &str) -> Result<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(input.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(input.trim()))
+        .context("decode docker config auth")?;
+    String::from_utf8(bytes).context("docker config auth is not utf-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_repo_tag_handles_registry_paths() {
+        assert_eq!(
+            split_repo_tag("hub.covm.net/rc-env:0f5446c3"),
+            ("hub.covm.net/rc-env", Some("0f5446c3"))
+        );
+        assert_eq!(split_repo_tag("alpine:3.19"), ("alpine", Some("3.19")));
+    }
 
     #[test]
     fn the_build_context_is_a_valid_single_entry_tar() {

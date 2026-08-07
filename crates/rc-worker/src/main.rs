@@ -314,6 +314,18 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
                     }
                 });
             }
+            pb::server_cmd::Body::MirrorImage(order) => {
+                let runner = runner.clone();
+                let tx = events_tx.clone();
+                tokio::spawn(async move {
+                    let done = runner.mirror_image(order).await;
+                    let _ = tx
+                        .send(pb::WorkerEvent {
+                            body: Some(pb::worker_event::Body::MirrorDone(done)),
+                        })
+                        .await;
+                });
+            }
             pb::server_cmd::Body::Ping(_) => {}
         }
     }

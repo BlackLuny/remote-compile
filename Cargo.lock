@@ -1623,6 +1623,7 @@ name = "rc-worker"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64",
  "bollard",
  "clap",
  "futures",

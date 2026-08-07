@@ -144,7 +144,7 @@ export function Overview() {
                 {d.workers.map((w) => (
                   <tr key={w.id}>
                     <Td>
-                      <Link to={`/workers/${w.id}`} className="hover:text-[var(--color-accent)]">
+                      <Link to={`/workers/${w.id}`} className="hover:text-[var(--color-accent)]" title={w.id}>
                         <Mono>{shortId(w.id, 14)}</Mono>
                       </Link>
                       <div className="mt-0.5">
@@ -190,7 +190,7 @@ export function Overview() {
                 {d.recent_tasks.map((t) => (
                   <tr key={t.id} className="hover:bg-[var(--color-panel-2)]/50">
                     <Td>
-                      <Link to={`/tasks/${t.id}`} className="hover:text-[var(--color-accent)]">
+                      <Link to={`/tasks/${t.id}`} className="hover:text-[var(--color-accent)]" title={t.id}>
                         <Mono>{shortId(t.id, 12)}</Mono>
                       </Link>
                     </Td>

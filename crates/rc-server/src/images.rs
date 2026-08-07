@@ -376,6 +376,204 @@ pub fn on_build_done(app: &App, done: &pb::ImageBuildDone) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ mirror
+
+fn mirror_setting_key(env_id: &str) -> String {
+    format!("image_mirror:{env_id}")
+}
+
+/// Last known registry distribution state for the admin UI.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MirrorStatus {
+    pub status: String,
+    pub remote_ref: String,
+    pub op: String,
+    pub worker_id: String,
+    pub message: String,
+    pub at: i64,
+}
+
+pub fn mirror_status(app: &App, env_id: &str) -> MirrorStatus {
+    app.store
+        .get_setting(&mirror_setting_key(env_id))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_mirror_status(app: &App, env_id: &str, st: &MirrorStatus) -> Result<()> {
+    app.store
+        .set_setting(&mirror_setting_key(env_id), &serde_json::to_string(st)?)?;
+    Ok(())
+}
+
+/// Admin: push a built image to the configured external registry from one worker.
+pub async fn dispatch_push(
+    app: &Arc<App>,
+    env_id: &str,
+    worker_id: Option<&str>,
+) -> Result<MirrorStatus> {
+    let policy = app.policy();
+    let remote = policy
+        .image_remote_ref(env_id)
+        .ok_or_else(|| anyhow!("image registry is not enabled; set it in Settings first"))?;
+    let row = app
+        .store
+        .get_image(env_id)?
+        .ok_or_else(|| anyhow!("unknown image"))?;
+    if row.digest.is_empty() {
+        return Err(anyhow!("image has no digest yet; build it first"));
+    }
+    let local_ref = row.digest.clone();
+    // Prefer an explicit worker; otherwise the first online worker. The worker
+    // refuses push if the digest is not local — admin can retry another machine.
+    let worker = pick_worker_for_mirror(app, worker_id)?;
+    let order = pb::ImageMirrorOrder {
+        env_id: env_id.to_string(),
+        op: "push".into(),
+        local_ref,
+        remote_ref: remote.clone(),
+        also_local_tag: String::new(),
+        expected_digest: row.digest.clone(),
+    };
+    let st = MirrorStatus {
+        status: "pushing".into(),
+        remote_ref: remote,
+        op: "push".into(),
+        worker_id: worker.clone(),
+        message: format!("pushing via {worker}"),
+        at: now_ms(),
+    };
+    save_mirror_status(app, env_id, &st)?;
+    send_mirror(app, &worker, order).await?;
+    Ok(st)
+}
+
+/// Admin: pull the image onto one or all online workers.
+pub async fn dispatch_pull(
+    app: &Arc<App>,
+    env_id: &str,
+    worker_ids: Option<Vec<String>>,
+) -> Result<Vec<MirrorStatus>> {
+    let policy = app.policy();
+    let remote = policy
+        .image_remote_ref(env_id)
+        .ok_or_else(|| anyhow!("image registry is not enabled; set it in Settings first"))?;
+    let row = app
+        .store
+        .get_image(env_id)?
+        .ok_or_else(|| anyhow!("unknown image"))?;
+    let also_local = row.image_ref.clone();
+    let targets: Vec<String> = if let Some(ids) = worker_ids.filter(|v| !v.is_empty()) {
+        ids
+    } else {
+        app.workers
+            .snapshot()
+            .into_iter()
+            .filter(|w| w.status == "online")
+            .map(|w| w.id)
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err(anyhow!("no online workers to pull onto"));
+    }
+    let mut out = Vec::new();
+    for worker in targets {
+        let order = pb::ImageMirrorOrder {
+            env_id: env_id.to_string(),
+            op: "pull".into(),
+            local_ref: also_local.clone(),
+            remote_ref: remote.clone(),
+            also_local_tag: also_local.clone(),
+            expected_digest: row.digest.clone(),
+        };
+        let st = MirrorStatus {
+            status: "pulling".into(),
+            remote_ref: remote.clone(),
+            op: "pull".into(),
+            worker_id: worker.clone(),
+            message: format!("pulling on {worker}"),
+            at: now_ms(),
+        };
+        // Last write wins for the shared status; UI still shows the latest op.
+        save_mirror_status(app, env_id, &st)?;
+        if send_mirror(app, &worker, order).await.is_ok() {
+            out.push(st);
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!("failed to reach any worker"));
+    }
+    Ok(out)
+}
+
+async fn send_mirror(app: &App, worker_id: &str, order: pb::ImageMirrorOrder) -> Result<()> {
+    let ok = app
+        .workers
+        .send(
+            worker_id,
+            pb::ServerCmd {
+                body: Some(pb::server_cmd::Body::MirrorImage(order)),
+            },
+        )
+        .await;
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!("worker {worker_id} is not connected"))
+    }
+}
+
+fn pick_worker_for_mirror(app: &App, worker_id: Option<&str>) -> Result<String> {
+    if let Some(id) = worker_id.filter(|s| !s.is_empty()) {
+        if app.workers.get(id).is_some_and(|w| w.status == "online") {
+            return Ok(id.to_string());
+        }
+        return Err(anyhow!("worker {id} is not online"));
+    }
+    app.workers
+        .snapshot()
+        .into_iter()
+        .find(|w| w.status == "online")
+        .map(|w| w.id)
+        .ok_or_else(|| anyhow!("no online worker"))
+}
+
+pub fn on_mirror_done(app: &App, worker_id: &str, done: &pb::ImageMirrorDone) -> Result<()> {
+    let st = MirrorStatus {
+        status: if done.ok {
+            if done.op == "push" {
+                "pushed".into()
+            } else {
+                "pulled".into()
+            }
+        } else {
+            "error".into()
+        },
+        remote_ref: done.remote_ref.clone(),
+        op: done.op.clone(),
+        worker_id: worker_id.to_string(),
+        message: done.message.clone(),
+        at: now_ms(),
+    };
+    save_mirror_status(app, &done.env_id, &st)?;
+    if !done.ok {
+        app.store.raise_alert(
+            &format!("image_mirror:{}:{}", done.op, done.env_id),
+            "error",
+            &done.message,
+        )?;
+    }
+    app.events.publish(Event::ImageUpdated {
+        env_id: done.env_id.clone(),
+        status: st.status.clone(),
+        message: done.message.clone(),
+        at: now_ms(),
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

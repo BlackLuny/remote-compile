@@ -203,9 +203,20 @@ export interface Image {
   message: string;
 }
 
+export interface MirrorStatus {
+  status: string;
+  remote_ref: string;
+  op: string;
+  worker_id: string;
+  message: string;
+  at: number;
+}
+
 export interface ImageRow {
   image: Image;
   full_ref: string;
+  remote_ref?: string;
+  mirror?: MirrorStatus;
   health: { last_success_at: number; success_rate_7d: number; total_runs: number };
 }
 
@@ -239,6 +250,12 @@ export interface Policy {
   min_disk_free_gb: number;
   alert_webhook: string;
   default_image: string;
+  /** External registry host, e.g. hub.covm.net */
+  image_registry?: string;
+  /** Repo name under the host, e.g. rc-env */
+  image_registry_prefix?: string;
+  /** Master switch for admin push/pull */
+  image_registry_enabled?: boolean;
 }
 
 export interface StorageInfo {

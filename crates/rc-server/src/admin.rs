@@ -132,6 +132,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/images/{id}/approve", post(approve_image))
         .route("/api/images/{id}/reject", post(reject_image))
         .route("/api/images/{id}/rebuild", post(rebuild_image))
+        .route("/api/images/{id}/push", post(push_image))
+        .route("/api/images/{id}/pull", post(pull_image))
         .route("/api/egress", get(list_egress))
         .route("/api/egress/decide", post(decide_egress))
         .route("/api/pre-commands", get(list_pre_commands))
@@ -656,13 +658,18 @@ async fn list_images(
         .store
         .list_images(q.status.as_deref())
         .map_err(ApiError::from)?;
+    let policy = app.policy();
     let enriched: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
             let health = images::health_of(&r);
+            let mirror = images::mirror_status(&app, &r.id);
+            let remote_ref = policy.image_remote_ref(&r.id).unwrap_or_default();
             json!({
                 "image": r,
                 "full_ref": images::full_ref(&r),
+                "remote_ref": remote_ref,
+                "mirror": mirror,
                 "health": {
                     "last_success_at": health.last_success_at,
                     "success_rate_7d": health.success_rate_7d,
@@ -671,7 +678,14 @@ async fn list_images(
             })
         })
         .collect();
-    Ok(Json(json!({ "images": enriched })))
+    Ok(Json(json!({
+        "images": enriched,
+        "registry": {
+            "enabled": policy.image_registry_enabled,
+            "host": policy.image_registry,
+            "prefix": policy.image_registry_prefix,
+        },
+    })))
 }
 
 async fn get_image(
@@ -859,6 +873,63 @@ async fn rebuild_image(
     app.store.audit(&u.username, "rebuild_image", &id, "").ok();
     let n = images::dispatch_pending_builds(&app).await.map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true, "dispatched": n })))
+}
+
+#[derive(Deserialize)]
+struct MirrorReq {
+    #[serde(default)]
+    worker_id: String,
+    #[serde(default)]
+    worker_ids: Vec<String>,
+}
+
+async fn push_image(
+    AdminUser(u): AdminUser,
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(req): Json<MirrorReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let worker = if req.worker_id.is_empty() {
+        None
+    } else {
+        Some(req.worker_id.as_str())
+    };
+    let st = images::dispatch_push(&app, &id, worker)
+        .await
+        .map_err(ApiError::from)?;
+    app.store
+        .audit(&u.username, "push_image", &id, &st.remote_ref)
+        .ok();
+    Ok(Json(json!({ "ok": true, "mirror": st })))
+}
+
+async fn pull_image(
+    AdminUser(u): AdminUser,
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(req): Json<MirrorReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ids = if req.worker_ids.is_empty() {
+        if req.worker_id.is_empty() {
+            None
+        } else {
+            Some(vec![req.worker_id])
+        }
+    } else {
+        Some(req.worker_ids)
+    };
+    let sts = images::dispatch_pull(&app, &id, ids)
+        .await
+        .map_err(ApiError::from)?;
+    app.store
+        .audit(
+            &u.username,
+            "pull_image",
+            &id,
+            &format!("{} worker(s)", sts.len()),
+        )
+        .ok();
+    Ok(Json(json!({ "ok": true, "mirrors": sts })))
 }
 
 // ------------------------------- profiles -------------------------------

@@ -19,10 +19,16 @@ import { agoSecs, percent, shortDigest, statusTone } from "../lib/format";
 export function Images({ role }: { role: Role }) {
   const qc = useQueryClient();
   const [review, setReview] = useState<ImageRow | null>(null);
+  const [actionMsg, setActionMsg] = useState("");
+  const [actionErr, setActionErr] = useState("");
 
   const q = useQuery({
     queryKey: ["images"],
-    queryFn: () => api.get<{ images: ImageRow[] }>("/api/images"),
+    queryFn: () =>
+      api.get<{
+        images: ImageRow[];
+        registry?: { enabled: boolean; host: string; prefix: string };
+      }>("/api/images"),
     refetchInterval: 15_000,
   });
 
@@ -35,15 +41,59 @@ export function Images({ role }: { role: Role }) {
     },
   });
 
+  const mirror = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: "push" | "pull" }) =>
+      api.post(`/api/images/${id}/${action}`, {}),
+    onSuccess: (_d, vars) => {
+      setActionErr("");
+      setActionMsg(vars.action === "push" ? "已下发推送" : "已下发拉取到在线 worker");
+      qc.invalidateQueries({ queryKey: ["images"] });
+      setTimeout(() => setActionMsg(""), 3000);
+    },
+    onError: (e: Error) => {
+      setActionMsg("");
+      setActionErr(e.message);
+    },
+  });
+
   if (q.isLoading) return <Spinner />;
   if (q.isError) return <ErrorBox message={(q.error as Error).message} />;
 
   const all = q.data!.images;
+  const registry = q.data!.registry;
+  const registryReady = !!(registry?.enabled && registry.host);
   const pending = all.filter((r) => r.image.status === "pending_approval");
   const rest = all.filter((r) => r.image.status !== "pending_approval");
 
   return (
     <div className="space-y-4">
+      {actionMsg && (
+        <div className="rounded border border-[var(--color-ok)]/40 bg-[var(--color-ok)]/10 px-3 py-2 text-[12px] text-[var(--color-ok)]">
+          {actionMsg}
+        </div>
+      )}
+      {actionErr && <ErrorBox message={actionErr} />}
+
+      {registry && (
+        <Card title="镜像仓库">
+          {registryReady ? (
+            <div className="text-[12px] text-[var(--color-ink-dim)]">
+              分发已启用：
+              <Mono className="ml-1">
+                {registry.host}/{registry.prefix || "rc-env"}:{"{short_id}"}
+              </Mono>
+              <span className="ml-2 text-[11px] text-[var(--color-ink-faint)]">
+                在下方对单条镜像执行推送 / 拉取。Worker 需本机 docker login。
+              </span>
+            </div>
+          ) : (
+            <div className="text-[12px] text-[var(--color-ink-dim)]">
+              外部 registry 未启用。到「设置 → 镜像仓库」配置主机（如 hub.covm.net）后再分发。
+            </div>
+          )}
+        </Card>
+      )}
+
       {/* §8.3: the approval queue is the gate between "an agent wrote a
           Dockerfile" and "that Dockerfile runs on our fleet". It goes first. */}
       <Card
@@ -120,10 +170,10 @@ export function Images({ role }: { role: Role }) {
               <tr>
                 <Th>镜像</Th>
                 <Th>状态</Th>
+                <Th>Hub</Th>
                 <Th>成功率</Th>
                 <Th>最近成功</Th>
                 <Th>审批人</Th>
-                <Th>说明</Th>
                 <Th />
               </tr>
             </thead>
@@ -132,6 +182,11 @@ export function Images({ role }: { role: Role }) {
                 <tr key={r.image.id} className="hover:bg-[var(--color-panel-2)]/50">
                   <Td>
                     <Mono>{shortDigest(r.full_ref)}</Mono>
+                    {r.remote_ref && (
+                      <div className="mt-0.5 text-[10px] text-[var(--color-ink-faint)]">
+                        <Mono>{r.remote_ref}</Mono>
+                      </div>
+                    )}
                   </Td>
                   <Td>
                     <Badge tone={statusTone[r.image.status] ?? "muted"}>{r.image.status}</Badge>
@@ -141,6 +196,9 @@ export function Images({ role }: { role: Role }) {
                       </Badge>
                     )}
                   </Td>
+                  <Td>
+                    <MirrorBadge row={r} />
+                  </Td>
                   <Td className="tnum">
                     {r.health.total_runs === 0 ? "–" : percent(r.health.success_rate_7d)}
                     <span className="ml-1 text-[11px] text-[var(--color-ink-faint)]">
@@ -149,7 +207,6 @@ export function Images({ role }: { role: Role }) {
                   </Td>
                   <Td className="text-[var(--color-ink-dim)]">{agoSecs(r.health.last_success_at)}</Td>
                   <Td className="text-[var(--color-ink-dim)]">{r.image.approved_by || "–"}</Td>
-                  <Td className="text-[var(--color-ink-dim)]">{r.image.description || "–"}</Td>
                   <Td>
                     <div className="flex justify-end gap-1.5">
                       <Button onClick={() => setReview(r)}>查看</Button>
@@ -157,6 +214,24 @@ export function Images({ role }: { role: Role }) {
                         <Button onClick={() => act.mutate({ id: r.image.id, action: "rebuild" })}>
                           重建
                         </Button>
+                      )}
+                      {role === "admin" && registryReady && r.image.digest && (
+                        <>
+                          <Button
+                            title="推送到外部 registry"
+                            disabled={mirror.isPending}
+                            onClick={() => mirror.mutate({ id: r.image.id, action: "push" })}
+                          >
+                            推送
+                          </Button>
+                          <Button
+                            title="从 registry 拉到全部在线 worker"
+                            disabled={mirror.isPending}
+                            onClick={() => mirror.mutate({ id: r.image.id, action: "pull" })}
+                          >
+                            拉取
+                          </Button>
+                        </>
                       )}
                     </div>
                   </Td>
@@ -184,7 +259,22 @@ export function Images({ role }: { role: Role }) {
                 }
               />
               <Kv label="构建于" value={review.image.built_at ? agoSecs(review.image.built_at) : "–"} />
+              {review.remote_ref && <Kv label="Hub 引用" value={review.remote_ref} mono />}
+              {review.mirror?.status && (
+                <Kv
+                  label="分发状态"
+                  value={`${review.mirror.status}${review.mirror.worker_id ? ` @ ${review.mirror.worker_id}` : ""}${
+                    review.mirror.at ? ` · ${agoSecs(review.mirror.at)}` : ""
+                  }`}
+                />
+              )}
             </div>
+
+            {review.mirror?.message && (
+              <div className="rounded border border-[var(--color-line-soft)] bg-[var(--color-surface)] px-3 py-2 text-[var(--color-ink-dim)]">
+                {review.mirror.message}
+              </div>
+            )}
 
             {review.image.message && (
               <div className="rounded border border-[var(--color-line-soft)] bg-[var(--color-surface)] px-3 py-2 text-[var(--color-ink-dim)]">
@@ -223,10 +313,47 @@ export function Images({ role }: { role: Role }) {
                 </Button>
               </div>
             )}
+
+            {role === "admin" && registryReady && review.image.digest && (
+              <div className="flex justify-end gap-2 border-t border-[var(--color-line-soft)] pt-3">
+                <Button
+                  disabled={mirror.isPending}
+                  onClick={() => mirror.mutate({ id: review.image.id, action: "push" })}
+                >
+                  推送到 Hub
+                </Button>
+                <Button
+                  disabled={mirror.isPending}
+                  onClick={() => mirror.mutate({ id: review.image.id, action: "pull" })}
+                >
+                  拉取到全部 Worker
+                </Button>
+              </div>
+            )}
           </div>
         </Modal>
       )}
     </div>
+  );
+}
+
+function MirrorBadge({ row }: { row: ImageRow }) {
+  const st = row.mirror?.status;
+  if (!st) {
+    return <span className="text-[var(--color-ink-faint)]">–</span>;
+  }
+  const tone =
+    st === "pushed" || st === "pulled"
+      ? "ok"
+      : st === "error"
+        ? "bad"
+        : st === "pushing" || st === "pulling"
+          ? "warn"
+          : "muted";
+  return (
+    <span title={row.mirror?.message || undefined}>
+      <Badge tone={tone}>{st}</Badge>
+    </span>
   );
 }
 
