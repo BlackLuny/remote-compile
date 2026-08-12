@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rc-core", "crates/rc-agent", "crates/rc-server", "crates/rc-worker"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.82"
