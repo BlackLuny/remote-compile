@@ -797,32 +797,109 @@ impl Runner {
     }
 
     /// Caches for worktrees nobody has touched in a while (§9).
-    pub async fn gc(&self, idle_days: i64) -> Result<u64> {
-        let cutoff = rc_core::now_secs() - idle_days * 24 * 3600;
-        let mut reclaimed = 0u64;
+    ///
+    /// `protect` holds worktree ids that currently have a running task on this
+    /// worker; those volumes are never removed, even when the operator asks to
+    /// reclaim "all unused".
+    pub async fn gc(&self, idle_days: i64, protect: &HashSet<String>) -> Result<GcReport> {
+        self.gc_with(
+            GcPolicy {
+                all_unused: false,
+                idle_days,
+            },
+            protect,
+        )
+        .await
+    }
+
+    /// Manual / emergency reclaim of worktree target volumes and workspace dirs.
+    /// Project registry volumes (no worktree label) are always kept.
+    pub async fn gc_with(&self, policy: GcPolicy, protect: &HashSet<String>) -> Result<GcReport> {
+        let now = rc_core::now_secs();
+        let mut report = GcReport::default();
 
         for (name, labels) in self.sandbox.our_volumes().await? {
             let Some(worktree) = labels.get(docker::LABEL_WORKTREE) else {
                 continue; // per-project registry caches are kept
             };
             let dir = docker::workspace_dir(&self.cfg.work_dir(), worktree);
-            let last_used = std::fs::metadata(&dir)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            if last_used > cutoff {
-                continue;
+            let last_used = workspace_last_used_secs(&dir);
+            match decide_reclaim(worktree, last_used, now, &policy, protect) {
+                ReclaimDecision::Reclaim => {}
+                ReclaimDecision::SkipActive => {
+                    report.skipped_active += 1;
+                    continue;
+                }
+                ReclaimDecision::SkipFresh => {
+                    report.skipped_fresh += 1;
+                    continue;
+                }
             }
-            tracing::info!(volume = %name, %worktree, "reclaiming idle worktree cache");
+            tracing::info!(volume = %name, %worktree, "reclaiming worktree cache");
             if self.sandbox.remove_volume(&name).await.is_ok() {
-                reclaimed += 1;
+                report.reclaimed += 1;
+                report.reclaimed_worktrees.push(worktree.clone());
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
-        Ok(reclaimed)
+        Ok(report)
     }
+}
+
+/// How aggressive a reclaim pass should be.
+#[derive(Debug, Clone, Copy)]
+pub struct GcPolicy {
+    /// When true, reclaim every cache that is not protected by a live task.
+    pub all_unused: bool,
+    /// Used when `all_unused` is false: keep caches used within this many days.
+    pub idle_days: i64,
+}
+
+/// Outcome of one reclaim pass (hourly or admin-triggered).
+#[derive(Debug, Clone, Default)]
+pub struct GcReport {
+    pub reclaimed: u64,
+    pub skipped_active: u64,
+    pub skipped_fresh: u64,
+    pub reclaimed_worktrees: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimDecision {
+    Reclaim,
+    SkipActive,
+    SkipFresh,
+}
+
+fn decide_reclaim(
+    worktree: &str,
+    last_used_secs: i64,
+    now_secs: i64,
+    policy: &GcPolicy,
+    protect: &HashSet<String>,
+) -> ReclaimDecision {
+    if protect.contains(worktree) {
+        return ReclaimDecision::SkipActive;
+    }
+    if policy.all_unused {
+        return ReclaimDecision::Reclaim;
+    }
+    let idle_days = policy.idle_days.max(0);
+    let cutoff = now_secs.saturating_sub(idle_days.saturating_mul(24 * 3600));
+    if last_used_secs > cutoff {
+        ReclaimDecision::SkipFresh
+    } else {
+        ReclaimDecision::Reclaim
+    }
+}
+
+fn workspace_last_used_secs(dir: &Path) -> i64 {
+    std::fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Where in the mounted workspace the primary root sits. Empty for the ordinary
@@ -1098,6 +1175,43 @@ mod tests {
         assert!(!env.iter().any(|e| e.starts_with("RUSTC_WRAPPER=")));
         // The rest of the cache configuration still applies.
         assert!(env.iter().any(|e| e == "CARGO_INCREMENTAL=0"));
+    }
+
+    #[test]
+    fn gc_protects_active_worktrees_even_when_all_unused() {
+        let protect = HashSet::from(["w-busy".to_string()]);
+        let policy = GcPolicy {
+            all_unused: true,
+            idle_days: 0,
+        };
+        assert_eq!(
+            decide_reclaim("w-busy", 0, 1_000_000, &policy, &protect),
+            ReclaimDecision::SkipActive
+        );
+        assert_eq!(
+            decide_reclaim("w-idle", 0, 1_000_000, &policy, &protect),
+            ReclaimDecision::Reclaim
+        );
+    }
+
+    #[test]
+    fn gc_idle_days_keeps_recent_caches() {
+        let protect = HashSet::new();
+        let policy = GcPolicy {
+            all_unused: false,
+            idle_days: 7,
+        };
+        let now = 1_000_000i64;
+        let recent = now - 2 * 24 * 3600;
+        let old = now - 14 * 24 * 3600;
+        assert_eq!(
+            decide_reclaim("w", recent, now, &policy, &protect),
+            ReclaimDecision::SkipFresh
+        );
+        assert_eq!(
+            decide_reclaim("w", old, now, &policy, &protect),
+            ReclaimDecision::Reclaim
+        );
     }
 
     #[tokio::test]

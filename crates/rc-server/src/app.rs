@@ -13,9 +13,9 @@ use rc_core::cas::FsCas;
 use rc_core::model::{ResultKind, TaskState, TaskType};
 use rc_core::pb;
 use rc_core::{ids, manifest, now_ms};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 
 pub struct App {
     pub cfg: Config,
@@ -49,6 +49,11 @@ pub struct App {
     /// Terminal extras (delta + history_ref) memoized per (task_id, baseline)
     /// so repeated get_task does not recompute (R10').
     pub terminal_cache: Mutex<HashMap<String, TerminalExtras>>,
+    /// Pending admin cleanup RPCs waiting on a worker `CleanupDone` event.
+    /// Keyed by request_id (unique per call).
+    pending_cleanups: Mutex<HashMap<String, oneshot::Sender<pb::CleanupDone>>>,
+    /// Workers currently running an admin cleanup (one at a time per id).
+    cleanup_inflight: Mutex<HashSet<String>>,
 }
 
 /// Latest unit progress for a running task (mechanism five).
@@ -142,7 +147,43 @@ impl App {
             building: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
             terminal_cache: Mutex::new(HashMap::new()),
+            pending_cleanups: Mutex::new(HashMap::new()),
+            cleanup_inflight: Mutex::new(HashSet::new()),
         }))
+    }
+
+    /// Try to claim exclusive cleanup for `worker_id`. Returns false if one is
+    /// already running (admins must not stack reclaim passes).
+    pub fn try_begin_cleanup(&self, worker_id: &str) -> bool {
+        self.cleanup_inflight.lock().insert(worker_id.to_string())
+    }
+
+    pub fn end_cleanup(&self, worker_id: &str) {
+        self.cleanup_inflight.lock().remove(worker_id);
+    }
+
+    /// Register a waiter for a worker cleanup reply. Returns the receiver side.
+    pub fn register_cleanup_wait(
+        &self,
+        request_id: &str,
+    ) -> oneshot::Receiver<pb::CleanupDone> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_cleanups
+            .lock()
+            .insert(request_id.to_string(), tx);
+        rx
+    }
+
+    /// Complete a cleanup wait if one is still registered for this request.
+    pub fn complete_cleanup(&self, done: pb::CleanupDone) {
+        if let Some(tx) = self.pending_cleanups.lock().remove(&done.request_id) {
+            let _ = tx.send(done);
+        }
+    }
+
+    /// Drop a waiter without delivering (timeout / send failure).
+    pub fn cancel_cleanup_wait(&self, request_id: &str) {
+        self.pending_cleanups.lock().remove(request_id);
     }
 
     /// Update in-memory progress from a worker event. Does not touch task_events.

@@ -16,8 +16,8 @@ use client::ServerClient;
 use config::WorkerConfig;
 use docker::Sandbox;
 use rc_core::pb;
-use runner::Runner;
-use std::collections::HashSet;
+use runner::{GcPolicy, Runner};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -206,8 +206,15 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
     let mut commands = client.open_channel(events_rx).await?;
     tracing::info!(server = %cfg.server, "channel open");
 
-    let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // task_id -> worktree_id for every assignment accepted on this session.
+    // Inserted *before* the semaphore wait so cleanup cannot reclaim a volume
+    // for a task that is only queued locally. Manual cleanup and the hourly GC
+    // both refuse to touch these worktrees.
+    let active: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Only one admin cleanup at a time; also aborts with the session.
+    let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let mut cleanup_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     let heartbeat = {
         let cfg = cfg.clone();
@@ -219,7 +226,7 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 ticker.tick().await;
-                let running: Vec<String> = active.lock().await.iter().cloned().collect();
+                let running: Vec<String> = active.lock().await.keys().cloned().collect();
                 let stats = collect_stats(&cfg, &runner, running.len() as u32).await;
                 let status = if draining.load(std::sync::atomic::Ordering::Relaxed) {
                     "draining"
@@ -240,13 +247,21 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
     // Idle caches are reclaimed on a slow timer rather than on the hot path.
     let gc = {
         let runner = runner.clone();
+        let active = active.clone();
         let idle_days = cfg.worktree_idle_days;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 ticker.tick().await;
-                match runner.gc(idle_days).await {
-                    Ok(n) if n > 0 => tracing::info!(reclaimed = n, "worktree caches reclaimed"),
+                let protect: HashSet<String> = active.lock().await.values().cloned().collect();
+                match runner.gc(idle_days, &protect).await {
+                    Ok(r) if r.reclaimed > 0 => {
+                        tracing::info!(
+                            reclaimed = r.reclaimed,
+                            skipped_active = r.skipped_active,
+                            "worktree caches reclaimed"
+                        )
+                    }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "worker gc failed"),
                 }
@@ -262,6 +277,9 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
             Err(status) => {
                 heartbeat.abort();
                 gc.abort();
+                for h in cleanup_handles.drain(..) {
+                    h.abort();
+                }
                 return Err(anyhow::Error::new(status));
             }
         };
@@ -283,10 +301,13 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
                 let tx = events_tx.clone();
                 let active = active.clone();
                 let cfg = cfg.clone();
+                let task_id = assignment.task_id.clone();
+                let worktree_id = assignment.worktree_id.clone();
+                // Protect the worktree before parking on the semaphore so a
+                // concurrent cleanup cannot delete its volume mid-queue.
+                active.lock().await.insert(task_id.clone(), worktree_id);
                 tokio::spawn(async move {
                     let _permit = permits.acquire().await;
-                    let task_id = assignment.task_id.clone();
-                    active.lock().await.insert(task_id.clone());
 
                     // Each task gets its own connection for blob transfer so a
                     // slow download cannot stall the command channel.
@@ -304,6 +325,32 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
             pb::server_cmd::Body::Drain(_) => {
                 tracing::info!("draining: no new tasks will be accepted");
                 draining.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            pb::server_cmd::Body::Cleanup(order) => {
+                // Flip drain before yielding so the next heartbeat reports
+                // draining and new Assigns are refused immediately.
+                let was_draining = draining.swap(true, std::sync::atomic::Ordering::Relaxed);
+                let runner = runner.clone();
+                let tx = events_tx.clone();
+                let active = active.clone();
+                let draining = draining.clone();
+                let cfg = cfg.clone();
+                let cleanup_lock = cleanup_lock.clone();
+                // Lock serialises actual work; keep every handle so session
+                // teardown can abort a pass still in flight.
+                cleanup_handles.push(tokio::spawn(async move {
+                    let done = run_cleanup(
+                        order,
+                        &runner,
+                        &active,
+                        &draining,
+                        was_draining,
+                        &cfg,
+                        &cleanup_lock,
+                    )
+                    .await;
+                    let _ = tx.send(client::cleanup_done_event(done)).await;
+                }));
             }
             pb::server_cmd::Body::BuildImage(order) => {
                 let runner = runner.clone();
@@ -332,7 +379,95 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
 
     heartbeat.abort();
     gc.abort();
+    for h in cleanup_handles.drain(..) {
+        h.abort();
+    }
     Ok(())
+}
+
+/// Admin-triggered reclaim: temporary drain, skip active worktrees, report back.
+async fn run_cleanup(
+    order: pb::CleanupOrder,
+    runner: &Runner,
+    active: &Mutex<HashMap<String, String>>,
+    draining: &std::sync::atomic::AtomicBool,
+    was_draining: bool,
+    cfg: &WorkerConfig,
+    cleanup_lock: &tokio::sync::Mutex<()>,
+) -> pb::CleanupDone {
+    let request_id = order.request_id.clone();
+    let disk_before = sysinfo::disk_free_gb(&cfg.data_dir);
+
+    let guard = match cleanup_lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Another pass owns the lock. Undo our drain if we set it.
+            if !was_draining {
+                draining.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            return pb::CleanupDone {
+                request_id,
+                ok: false,
+                message: "another cleanup is already running on this worker".into(),
+                disk_free_gb_before: disk_before,
+                disk_free_gb_after: disk_before,
+                ..Default::default()
+            };
+        }
+    };
+
+    let protect: HashSet<String> = active.lock().await.values().cloned().collect();
+    let policy = GcPolicy {
+        all_unused: order.all_unused,
+        idle_days: order.idle_days,
+    };
+
+    let result = runner.gc_with(policy, &protect).await;
+    drop(guard);
+
+    if !was_draining {
+        draining.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    let disk_after = sysinfo::disk_free_gb(&cfg.data_dir);
+
+    match result {
+        Ok(report) => {
+            tracing::info!(
+                request = %request_id,
+                reclaimed = report.reclaimed,
+                skipped_active = report.skipped_active,
+                skipped_fresh = report.skipped_fresh,
+                disk_before,
+                disk_after,
+                "manual cleanup finished"
+            );
+            pb::CleanupDone {
+                request_id,
+                ok: true,
+                message: format!(
+                    "reclaimed {} worktree cache(s); skipped {} active, {} still fresh",
+                    report.reclaimed, report.skipped_active, report.skipped_fresh
+                ),
+                reclaimed: report.reclaimed,
+                skipped_active: report.skipped_active,
+                skipped_fresh: report.skipped_fresh,
+                disk_free_gb_before: disk_before,
+                disk_free_gb_after: disk_after,
+                reclaimed_worktrees: report.reclaimed_worktrees,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(request = %request_id, error = %e, "manual cleanup failed");
+            pb::CleanupDone {
+                request_id,
+                ok: false,
+                message: e.to_string(),
+                disk_free_gb_before: disk_before,
+                disk_free_gb_after: disk_after,
+                ..Default::default()
+            }
+        }
+    }
 }
 
 async fn collect_stats(cfg: &WorkerConfig, runner: &Runner, running: u32) -> pb::WorkerStats {

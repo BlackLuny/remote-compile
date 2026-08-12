@@ -147,6 +147,23 @@ export interface Worker {
   stats?: WorkerStats;
 }
 
+export interface WorkerCleanupResult {
+  ok: boolean;
+  request_id: string;
+  reclaimed: number;
+  skipped_active: number;
+  skipped_fresh: number;
+  disk_free_gb_before: number;
+  disk_free_gb_after: number;
+  reclaimed_worktrees: string[];
+  message: string;
+}
+
+export interface WorkerCleanupReq {
+  all_unused?: boolean;
+  idle_days?: number;
+}
+
 export interface Alert {
   id: number;
   rule: string;

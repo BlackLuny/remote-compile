@@ -546,6 +546,7 @@ message WorkerEvent {
     TaskDone done = 3;
     ImageBuildDone image_done = 4;
     ImageMirrorDone mirror_done = 5;
+    CleanupDone cleanup_done = 6;
   }
 }
 
@@ -606,6 +607,32 @@ message ImageMirrorDone {
   string remote_ref = 5;
 }
 
+// Admin-driven disk cleanup on one worker (§9 manual path).
+// While running, the worker refuses new assignments (temporary drain).
+// Worktrees with an active task are never reclaimed.
+message CleanupOrder {
+  string request_id = 1;
+  // true: reclaim every worktree cache not currently in use.
+  // false: reclaim only caches idle for at least `idle_days`.
+  bool all_unused = 2;
+  // Used when all_unused=false. Units are whole days; 0 reclaims any cache
+  // whose last-used is not in the future (i.e. essentially all unused). Prefer
+  // all_unused=true for that intent so operators are not surprised.
+  int64 idle_days = 3;
+}
+
+message CleanupDone {
+  string request_id = 1;
+  bool ok = 2;
+  string message = 3;
+  uint64 reclaimed = 4;
+  uint64 skipped_active = 5;
+  uint64 skipped_fresh = 6;
+  uint64 disk_free_gb_before = 7;
+  uint64 disk_free_gb_after = 8;
+  repeated string reclaimed_worktrees = 9;
+}
+
 message ServerCmd {
   oneof body {
     TaskAssignment assign = 1;
@@ -614,6 +641,7 @@ message ServerCmd {
     ImageBuildOrder build_image = 4;
     Empty ping = 5;
     ImageMirrorOrder mirror_image = 6;
+    CleanupOrder cleanup = 7;
   }
 }
 

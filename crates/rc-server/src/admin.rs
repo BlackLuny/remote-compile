@@ -120,6 +120,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/workers/{id}", get(get_worker).delete(delete_worker))
         .route("/api/workers/{id}/drain", post(drain_worker))
         .route("/api/workers/{id}/resume", post(resume_worker))
+        .route("/api/workers/{id}/cleanup", post(cleanup_worker))
         .route("/api/enrollment-tokens", get(list_enrollment).post(create_enrollment))
         .route("/api/agent-tokens", get(list_agent_tokens).post(create_agent_token))
         .route("/api/agent-tokens/{hash}", delete(delete_agent_token))
@@ -408,6 +409,7 @@ async fn drain_worker(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Pin survives heartbeats until resume; worker also flips its local flag.
     app.workers.set_status(&id, "draining");
     app.store.set_worker_status(&id, "draining").map_err(ApiError::from)?;
     app.workers
@@ -422,11 +424,169 @@ async fn resume_worker(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Clears admin_drain pin so subsequent heartbeats can report online.
+    // Note: the worker process still has a local drain flag with no Resume
+    // wire command; reconnect/restart is needed for a fully drained worker.
     app.workers.set_status(&id, "online");
     app.store.set_worker_status(&id, "online").map_err(ApiError::from)?;
     app.store.audit(&u.username, "resume_worker", &id, "").ok();
     app.dispatch_signal.notify_one();
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CleanupReq {
+    /// When true, reclaim every worktree cache not currently running a task.
+    #[serde(default)]
+    all_unused: bool,
+    /// Used when `all_unused` is false. Default 14 matches worker idle GC.
+    #[serde(default = "default_cleanup_idle_days")]
+    idle_days: i64,
+}
+
+fn default_cleanup_idle_days() -> i64 {
+    14
+}
+
+/// How long the control plane waits for a worker to finish reclaiming volumes.
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Manual disk reclaim on one worker. Temporarily drains it so new work cannot
+/// race the delete, leaves in-flight tasks alone, and restores the prior status
+/// when the worker was online before the call.
+async fn cleanup_worker(
+    AdminUser(u): AdminUser,
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(body): Json<CleanupReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !body.all_unused && body.idle_days < 0 {
+        return Err(ApiError::bad("idle_days must be >= 0"));
+    }
+    if !app.workers.is_connected(&id) {
+        return Err(ApiError::bad(format!("worker {id} is not connected")));
+    }
+    if !app.try_begin_cleanup(&id) {
+        return Err(ApiError::bad(format!(
+            "worker {id} already has a cleanup in progress"
+        )));
+    }
+
+    let prior_status = app
+        .workers
+        .get(&id)
+        .map(|w| {
+            if w.admin_drain {
+                "draining".into()
+            } else {
+                w.status
+            }
+        })
+        .unwrap_or_else(|| "online".into());
+    let prior_was_draining = prior_status == "draining";
+    let request_id = ids::random_token();
+    let order = pb::CleanupOrder {
+        request_id: request_id.clone(),
+        all_unused: body.all_unused,
+        idle_days: body.idle_days.max(0),
+    };
+
+    // Keep the scheduler off this machine for the duration of the pass.
+    // admin_drain pin blocks "online" heartbeats until we clear it.
+    app.workers.set_status(&id, "draining");
+    app.store
+        .set_worker_status(&id, "draining")
+        .map_err(|e| {
+            app.end_cleanup(&id);
+            ApiError::from(e)
+        })?;
+
+    let rx = app.register_cleanup_wait(&request_id);
+    let sent = app
+        .workers
+        .send(
+            &id,
+            pb::ServerCmd {
+                body: Some(pb::server_cmd::Body::Cleanup(order)),
+            },
+        )
+        .await;
+    if !sent {
+        app.cancel_cleanup_wait(&request_id);
+        app.end_cleanup(&id);
+        restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+        return Err(ApiError::bad(format!("worker {id} is not connected")));
+    }
+
+    let done = match tokio::time::timeout(CLEANUP_TIMEOUT, rx).await {
+        Ok(Ok(done)) => done,
+        Ok(Err(_)) => {
+            app.cancel_cleanup_wait(&request_id);
+            app.end_cleanup(&id);
+            restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+            return Err(ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                "cleanup waiter dropped (worker disconnected?)".into(),
+            ));
+        }
+        Err(_) => {
+            app.cancel_cleanup_wait(&request_id);
+            app.end_cleanup(&id);
+            // Leave admin_drain pinned only if the machine was already drained;
+            // otherwise free the pin so a late heartbeat can report online once
+            // the worker finishes and clears its local flag.
+            restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+            return Err(ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                "cleanup timed out after 300s".into(),
+            ));
+        }
+    };
+
+    app.end_cleanup(&id);
+    restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+
+    app.store
+        .audit(
+            &u.username,
+            "cleanup_worker",
+            &id,
+            &format!(
+                "all_unused={} idle_days={} reclaimed={} ok={}",
+                body.all_unused, body.idle_days, done.reclaimed, done.ok
+            ),
+        )
+        .ok();
+
+    if !done.ok {
+        return Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            done.message,
+        ));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "request_id": done.request_id,
+        "reclaimed": done.reclaimed,
+        "skipped_active": done.skipped_active,
+        "skipped_fresh": done.skipped_fresh,
+        "disk_free_gb_before": done.disk_free_gb_before,
+        "disk_free_gb_after": done.disk_free_gb_after,
+        "reclaimed_worktrees": done.reclaimed_worktrees,
+        "message": done.message,
+    })))
+}
+
+fn restore_worker_status(app: &App, id: &str, status: &str, keep_admin_drain: bool) {
+    if keep_admin_drain || status == "draining" {
+        app.workers.set_status(id, "draining");
+        let _ = app.store.set_worker_status(id, "draining");
+    } else {
+        app.workers.set_status(id, "online");
+        let _ = app.store.set_worker_status(id, "online");
+        app.dispatch_signal.notify_one();
+    }
 }
 
 async fn delete_worker(

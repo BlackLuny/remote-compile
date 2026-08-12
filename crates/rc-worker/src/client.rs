@@ -174,6 +174,12 @@ pub fn mirror_done_event(done: ImageMirrorDone) -> WorkerEvent {
     }
 }
 
+pub fn cleanup_done_event(done: CleanupDone) -> WorkerEvent {
+    WorkerEvent {
+        body: Some(worker_event::Body::CleanupDone(done)),
+    }
+}
+
 /// A task that failed for infrastructure reasons. The control plane retries it
 /// elsewhere and the agent never sees it unless retries run out (§3.5/§6.2).
 pub fn infra_failure(task_id: &str, message: impl std::fmt::Display) -> TaskDone {

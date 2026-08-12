@@ -30,6 +30,10 @@ pub struct WorkerConn {
     /// Tasks the scheduler has handed to this worker but which have not yet
     /// reported a terminal state.
     pub assigned: HashSet<String>,
+    /// Control-plane pin: while set, heartbeats cannot clear `draining` back
+    /// to `online`. Used by drain and disk cleanup so a 2s heartbeat lag does
+    /// not reopen the scheduler.
+    pub admin_drain: bool,
 }
 
 impl WorkerConn {
@@ -77,6 +81,7 @@ impl WorkerRegistry {
                 capabilities: HashSet::new(),
                 tx,
                 assigned: HashSet::new(),
+                admin_drain: false,
             },
         );
     }
@@ -99,7 +104,13 @@ impl WorkerRegistry {
         let mut g = self.inner.lock();
         if let Some(w) = g.get_mut(id) {
             w.stats = stats;
-            w.status = status.to_string();
+            // Admin pin wins over a lagging "online" heartbeat. The worker
+            // may still be flipping its local drain flag after Drain/Cleanup.
+            if w.admin_drain && status == "online" {
+                w.status = "draining".into();
+            } else {
+                w.status = status.to_string();
+            }
             w.last_hb_ms = rc_core::now_ms();
             w.capabilities = capabilities.iter().cloned().collect();
             // Reconcile against what the worker says it is actually running:
@@ -142,6 +153,12 @@ impl WorkerRegistry {
     pub fn set_status(&self, id: &str, status: &str) {
         if let Some(w) = self.inner.lock().get_mut(id) {
             w.status = status.to_string();
+            if status == "online" {
+                w.admin_drain = false;
+            }
+            if status == "draining" {
+                w.admin_drain = true;
+            }
         }
     }
 
@@ -189,6 +206,21 @@ mod tests {
         );
         let got = rx.recv().await.unwrap().unwrap();
         assert!(matches!(got.body, Some(Body::CancelTaskId(t)) if t == "t1"));
+    }
+
+    #[test]
+    fn admin_drain_pin_survives_online_heartbeats() {
+        let (r, _rx) = registry_with("w1", 2);
+        r.set_status("w1", "draining");
+        assert!(r.get("w1").unwrap().admin_drain);
+        r.heartbeat("w1", WorkerStats::default(), "online", &[], &[]);
+        let w = r.get("w1").unwrap();
+        assert_eq!(w.status, "draining");
+        assert!(w.admin_drain);
+        r.set_status("w1", "online");
+        r.heartbeat("w1", WorkerStats::default(), "online", &[], &[]);
+        assert_eq!(r.get("w1").unwrap().status, "online");
+        assert!(!r.get("w1").unwrap().admin_drain);
     }
 
     #[tokio::test]
