@@ -224,11 +224,13 @@ note() {{
 }}
 while IFS= read -r pat; do
   [ -n "$pat" ] || continue
-  found=0
+  seen=0
+  dots=0
   for m in $pat; do
     case "$m" in *"$nl"*|*"	"*) note "skipped a name with control characters"; continue ;; esac
-    case "/$m/" in */../*|*/./*) note "skipped path with a dot segment: $m"; continue ;; esac
+    case "/$m/" in */../*|*/./*) dots=$((dots + 1)); continue ;; esac
     [ -e "$m" ] || continue
+    seen=1
     if [ -d "$m" ]; then note "skipped directory: $m"; continue; fi
     if [ ! -f "$m" ]; then note "skipped non-regular file: $m"; continue; fi
     case "$m" in
@@ -244,9 +246,11 @@ while IFS= read -r pat; do
     if [ -x "$m" ]; then chmod 755 "{out}/$d"; else chmod 644 "{out}/$d"; fi
     left=$((left - s))
     files=$((files + 1))
-    found=1
   done
-  [ "$found" = 1 ] || note "not found: $pat"
+  # One line per pattern, not per match: a stray `.*` would otherwise spend
+  # the whole note budget and hide the notes that matter.
+  if [ "$dots" -gt 0 ]; then note "skipped $dots match(es) with a . or .. segment: $pat"; fi
+  [ "$seen" = 1 ] || [ "$dots" -gt 0 ] || note "not found: $pat"
 done < {list}
 if [ "$notes" -gt {max_notes} ]; then echo "rc-artifact: ... and $((notes - {max_notes})) more"; fi
 "#,
