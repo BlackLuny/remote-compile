@@ -98,6 +98,11 @@ async fn maintenance_loop(app: Arc<App>) {
             tracing::error!(error = %e, "gc failed");
         }
 
+        // Env images distribute themselves once a registry is configured.
+        if let Err(e) = crate::images::publish_pending(&app).await {
+            tracing::warn!(error = %e, "env image publish failed");
+        }
+
         // Workers that stopped heartbeating.
         match app.store.stale_workers(policy.worker_offline_secs) {
             Ok(ids) => {

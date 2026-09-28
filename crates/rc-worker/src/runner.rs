@@ -571,6 +571,31 @@ impl Runner {
         Ok((artifacts, notes))
     }
 
+    /// The task's image, fetched from the fleet registry when it is a locally
+    /// built env image this host does not hold. The registry copy is only
+    /// trusted once its image id equals the digest the task is pinned to — a
+    /// registry credential leaks far more easily than an approval does.
+    async fn ensure_task_image(&self, image: &str, pull_ref: &str) -> Result<String> {
+        if let Some(local) = self.sandbox.resolve_local(image).await {
+            return Ok(local);
+        }
+        if pull_ref.is_empty() {
+            return self.sandbox.ensure_image(image).await;
+        }
+        let (repo, digest) = image
+            .split_once('@')
+            .ok_or_else(|| anyhow!("image `{image}` is not pinned by digest"))?;
+        tracing::info!(%image, %pull_ref, "env image not local; pulling the registry copy");
+        let pulled = self.sandbox.force_pull(pull_ref).await?;
+        let id = self.sandbox.image_id_of(&pulled).await?;
+        if !digests_equal(&id, digest) {
+            anyhow::bail!("registry copy {pull_ref} is {id}, not the approved {digest}; refusing to run it");
+        }
+        // The local name the fleet uses for it, so the next task and GC see it.
+        self.sandbox.tag_image(&id, repo, "latest").await?;
+        Ok(id)
+    }
+
     async fn run_build(
         &self,
         assignment: &TaskAssignment,
@@ -581,7 +606,9 @@ impl Runner {
         let adapter = rc_core::adapter::for_name(&profile.adapter);
         let cache = adapter.cache_config(profile);
 
-        let image = self.sandbox.ensure_image(&profile.image).await?;
+        let image = self
+            .ensure_task_image(&profile.image, &assignment.image_pull_ref)
+            .await?;
 
         let mut volumes = Vec::new();
         let labels = HashMap::from([

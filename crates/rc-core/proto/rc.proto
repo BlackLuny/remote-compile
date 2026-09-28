@@ -611,6 +611,10 @@ message TaskAssignment {
   string scope_hash = 12;
   // Authoritative path context for Receipt (must reach the worker result).
   PathContext path_context = 13;
+  // Where to pull `profile.image` from when this worker does not hold it:
+  // the fleet registry copy of a locally built env image. The worker must
+  // verify the pulled image id against the digest in `profile.image`.
+  string image_pull_ref = 14;
 }
 
 message ImageBuildOrder {

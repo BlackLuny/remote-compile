@@ -3,6 +3,7 @@
 
 use crate::config::{Config, Policy};
 use crate::events::{Event, EventBus};
+use crate::images;
 use crate::metrics::Metrics;
 use crate::scheduler::{self, Candidate, Demand};
 use crate::store::{Store, TaskRow};
@@ -720,7 +721,10 @@ impl App {
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id)?,
             required_capabilities: required_capabilities(manifest.as_ref(), profile.as_ref()),
-            require_local_image: scheduler::require_local_image(&candidates, &task.image),
+            // Published images can be fetched anywhere; only unpublished ones
+            // are tied to the workers that hold them.
+            require_local_image: scheduler::require_local_image(&candidates, &task.image)
+                && images::pull_ref_for_image(self, &task.image).is_none(),
         };
         let Some(choice) = scheduler::pick(&candidates, &demand, policy) else {
             return Ok(false);
@@ -781,6 +785,7 @@ impl App {
             command_is_default,
             scope_hash,
             path_context,
+            image_pull_ref: images::pull_ref_for_image(self, &task.image).unwrap_or_default(),
         };
 
         self.store.assign_to_worker(&task.id, &choice.worker_id)?;
@@ -879,7 +884,8 @@ impl App {
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id).unwrap_or_default(),
             required_capabilities,
-            require_local_image: scheduler::require_local_image(&candidates, &task.image),
+            require_local_image: scheduler::require_local_image(&candidates, &task.image)
+                && images::pull_ref_for_image(self, &task.image).is_none(),
         };
         scheduler::explain(&candidates, &demand, &policy)
             .into_iter()

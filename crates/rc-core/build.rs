@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(".rc.v1.TaskAssignment.command_is_default", "#[serde(default)]")
         .field_attribute(".rc.v1.TaskAssignment.scope_hash", "#[serde(default)]")
         .field_attribute(".rc.v1.TaskAssignment.path_context", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskAssignment.image_pull_ref", "#[serde(default)]")
         .field_attribute(".rc.v1.LogChunk.matched_lines", "#[serde(default)]")
         .field_attribute(".rc.v1.LogChunk.empty_reason", "#[serde(default)]")
         .field_attribute(".rc.v1.TaskStatus.queue_depth", "#[serde(default)]")

@@ -402,6 +402,90 @@ pub fn mirror_status(app: &App, env_id: &str) -> MirrorStatus {
         .unwrap_or_default()
 }
 
+/// A push that succeeded, kept apart from `MirrorStatus` (which the next pull
+/// overwrites): this is what lets any worker fetch the image on demand.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Published {
+    pub remote_ref: String,
+    pub digest: String,
+    pub at: i64,
+}
+
+fn published_key(env_id: &str) -> String {
+    format!("image_published:{env_id}")
+}
+
+/// Registry ref for an env image, if a push of *this* digest succeeded.
+pub fn published_ref(app: &App, row: &crate::store::ImageRow) -> Option<String> {
+    let p: Published = app
+        .store
+        .get_setting(&published_key(&row.id))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    (!row.digest.is_empty() && p.digest == row.digest && !p.remote_ref.is_empty())
+        .then_some(p.remote_ref)
+}
+
+/// Where a worker without `image` can get it: only for a fleet-built env
+/// image that is approved and published. Anything else is either pullable by
+/// name already, or not something a worker should fetch on its own.
+pub fn pull_ref_for_image(app: &App, image: &str) -> Option<String> {
+    if !crate::scheduler::is_fleet_built(image) {
+        return None;
+    }
+    let digest = image.split_once('@').map(|(_, d)| d)?;
+    let row = app.store.image_by_digest(digest).ok().flatten()?;
+    if row.approved_by.is_empty() || row.status == "rejected" {
+        return None;
+    }
+    published_ref(app, &row)
+}
+
+/// How long a push may run before another is allowed to start.
+const PUSH_LEASE_MS: i64 = 30 * 60 * 1000;
+
+/// Publish approved env images that are not in the registry yet, one at a
+/// time, from a worker that actually holds the bytes. Called from the
+/// maintenance loop, so new builds and pre-existing images both converge.
+pub async fn publish_pending(app: &Arc<App>) -> Result<usize> {
+    let policy = app.policy();
+    let images = app.store.list_images(None)?;
+    let now = now_ms();
+    // One multi-GB upload at a time is plenty for a shared host.
+    if images.iter().any(|r| {
+        let st = mirror_status(app, &r.id);
+        st.status == "pushing" && now - st.at < PUSH_LEASE_MS
+    }) {
+        return Ok(0);
+    }
+    for row in images {
+        if row.digest.is_empty()
+            || row.approved_by.is_empty()
+            || row.status == "rejected"
+            || policy.image_remote_ref(&row.id).is_none()
+            || published_ref(app, &row).is_some()
+        {
+            continue;
+        }
+        // A failed push is retried, but not on every tick.
+        let st = mirror_status(app, &row.id);
+        if st.op == "push" && st.status == "error" && now - st.at < PUSH_LEASE_MS {
+            continue;
+        }
+        let holder = app
+            .workers
+            .snapshot()
+            .into_iter()
+            .find(|w| w.status == "online" && w.stats.local_images.contains(&row.digest));
+        let Some(holder) = holder else { continue };
+        tracing::info!(env = %row.id, worker = %holder.id, "publishing env image to the registry");
+        dispatch_push(app, &row.id, Some(&holder.id)).await?;
+        return Ok(1);
+    }
+    Ok(0)
+}
+
 fn save_mirror_status(app: &App, env_id: &str, st: &MirrorStatus) -> Result<()> {
     app.store
         .set_setting(&mirror_setting_key(env_id), &serde_json::to_string(st)?)?;
@@ -558,6 +642,17 @@ pub fn on_mirror_done(app: &App, worker_id: &str, done: &pb::ImageMirrorDone) ->
         at: now_ms(),
     };
     save_mirror_status(app, &done.env_id, &st)?;
+    if done.ok && done.op == "push" {
+        if let Some(row) = app.store.get_image(&done.env_id)? {
+            let p = Published {
+                remote_ref: done.remote_ref.clone(),
+                digest: row.digest.clone(),
+                at: now_ms(),
+            };
+            app.store
+                .set_setting(&published_key(&done.env_id), &serde_json::to_string(&p)?)?;
+        }
+    }
     if !done.ok {
         app.store.raise_alert(
             &format!("image_mirror:{}:{}", done.op, done.env_id),
@@ -835,5 +930,97 @@ mod tests {
         .unwrap();
         assert_eq!(a.store.get_image("e1").unwrap().unwrap().status, "failing");
         assert_eq!(a.store.list_alerts(false).unwrap().len(), 1);
+    }
+
+    fn approved_env(a: &App) -> ImageRow {
+        let row = ImageRow {
+            id: "e-0f5446c328b93fb7".into(),
+            image_ref: "rc-registry/env/0f5446c3:latest".into(),
+            digest: "sha256:d5b6".into(),
+            status: "healthy".into(),
+            approved_by: "admin".into(),
+            ..Default::default()
+        };
+        a.store.upsert_image(&row).unwrap();
+        a.store.approve_image(&row.id, "admin").unwrap();
+        a.store.get_image(&row.id).unwrap().unwrap()
+    }
+
+    fn enable_registry(a: &App) {
+        let mut p = a.policy();
+        p.image_registry_enabled = true;
+        p.image_registry = "build.example.com".into();
+        a.set_policy(p).unwrap();
+    }
+
+    const PINNED: &str = "rc-registry/env/0f5446c3@sha256:d5b6";
+
+    #[test]
+    fn only_a_successful_push_of_this_digest_makes_an_image_pullable() {
+        let a = app();
+        let row = approved_env(&a);
+        assert_eq!(pull_ref_for_image(&a, PINNED), None, "nothing pushed yet");
+
+        let done = |ok: bool| pb::ImageMirrorDone {
+            env_id: row.id.clone(),
+            op: "push".into(),
+            ok,
+            message: String::new(),
+            remote_ref: "build.example.com/rc-env:0f5446c3".into(),
+        };
+        on_mirror_done(&a, "w1", &done(false)).unwrap();
+        assert_eq!(pull_ref_for_image(&a, PINNED), None, "a failed push publishes nothing");
+        on_mirror_done(&a, "w1", &done(true)).unwrap();
+        assert_eq!(
+            pull_ref_for_image(&a, PINNED).as_deref(),
+            Some("build.example.com/rc-env:0f5446c3")
+        );
+
+        // A later pull overwrites the mirror status but not the publication.
+        on_mirror_done(
+            &a,
+            "w2",
+            &pb::ImageMirrorDone { op: "pull".into(), ..done(true) },
+        )
+        .unwrap();
+        assert!(pull_ref_for_image(&a, PINNED).is_some());
+
+        // Rebuilt under a new digest: the old registry copy no longer counts.
+        let mut rebuilt = row.clone();
+        rebuilt.digest = "sha256:beef".into();
+        a.store.upsert_image(&rebuilt).unwrap();
+        assert_eq!(pull_ref_for_image(&a, "rc-registry/env/0f5446c3@sha256:beef"), None);
+
+        // Public images never get a fleet pull ref.
+        assert_eq!(pull_ref_for_image(&a, "rust:1"), None);
+    }
+
+    #[tokio::test]
+    async fn publishing_waits_for_a_registry_and_a_holder() {
+        let a = app();
+        approved_env(&a);
+        assert_eq!(publish_pending(&a).await.unwrap(), 0, "no registry configured");
+        enable_registry(&a);
+        assert_eq!(publish_pending(&a).await.unwrap(), 0, "no worker holds the image");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        a.workers.connect("w1", "x86_64", "0.1.2", 2, tx);
+        a.workers.heartbeat(
+            "w1",
+            pb::WorkerStats { local_images: vec!["sha256:d5b6".into()], ..Default::default() },
+            "online",
+            &[],
+            &[],
+        );
+        assert_eq!(publish_pending(&a).await.unwrap(), 1);
+        let cmd = rx.recv().await.unwrap().unwrap();
+        match cmd.body {
+            Some(pb::server_cmd::Body::MirrorImage(o)) => {
+                assert_eq!(o.op, "push");
+                assert_eq!(o.expected_digest, "sha256:d5b6");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(publish_pending(&a).await.unwrap(), 0, "one push at a time");
     }
 }
