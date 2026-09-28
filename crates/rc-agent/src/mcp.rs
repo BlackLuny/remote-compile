@@ -104,8 +104,10 @@ impl McpServer {
                 "name": SERVER_NAME,
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "远程编译检查。改完代码用 check(path) 拿结论；子 crate 路径自动 -p。\
-                             结果：结论 → 结构化诊断 → get_diagnostics 分页 → get_log 逃逸舱。不要本地 cargo check。"
+            "instructions": "远程编译：编译优先用这里，不要本地 cargo check/build/test——本地磁盘剩余 < 10G 时尤其禁止本地编译。\
+                             改完代码用 check(path) 拿结论；子 crate 路径自动 -p；task=test/clippy/build 同理。\
+                             需要二进制时 check(path, task=\"build\", artifacts=[\"auto\"])，再 fetch_artifacts(task_id) 拉回本地\
+                             （Linux glibc 产物）。结果：结论 → 结构化诊断 → get_diagnostics 分页 → get_log 逃逸舱。"
         })
     }
 
@@ -525,9 +527,10 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "check",
-            "description": "远程编译检查。path 落在 monorepo 子 crate 时默认 cargo check -p 该包；\
-                            仓库根则全 workspace。返回结论 + 结构化诊断，不返回原始日志。\
-                            冷 monorepo 建议 wait_secs=60~120。不要本地跑 cargo check。",
+            "description": "远程编译（优先于本地编译；本地磁盘紧张时必须用它）。path 落在 monorepo 子 crate 时\
+                            默认 cargo check -p 该包；仓库根则全 workspace。返回结论 + 结构化诊断，不返回原始日志。\
+                            要二进制用 task=build + artifacts=[\"auto\"]，产物用 fetch_artifacts 下载。\
+                            冷 monorepo 建议 wait_secs=60~120。不要本地跑 cargo check/build。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
