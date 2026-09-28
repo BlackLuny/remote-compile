@@ -4,11 +4,11 @@
 #
 # First install:
 #   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/server-install.sh \
-#     | sudo sh
+#     | sudo bash
 #
 # Upgrade to latest GitHub Release (keeps /var/lib/rc-server data):
 #   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/server-install.sh \
-#     | sudo sh
+#     | sudo bash
 #
 # Pin a version / arch / fork:
 #   sudo RC_RELEASE=v0.1.1 RC_GITHUB_REPO=BlackLuny/remote-compile ./deploy/server-install.sh

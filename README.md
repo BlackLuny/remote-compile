@@ -52,7 +52,7 @@ Binaries are published for **linux/darwin × x86_64/aarch64** on every `v*` tag
 ```bash
 # 1. control plane (Linux)
 curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/server-install.sh \
-  | sudo sh
+  | sudo bash
 sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server \
   admin --username admin --password '<password>'
 # console → http://127.0.0.1:7700     agents/workers → :7701
@@ -60,10 +60,10 @@ sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server \
 # 2. compile machine (Linux + Docker; x86_64 or aarch64 — arch is auto-detected)
 TOKEN=$(sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server enroll-token)
 curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
-  | sudo RC_SERVER=http://<control-plane>:7701 RC_ENROLLMENT_TOKEN="$TOKEN" sh
+  | sudo RC_SERVER=http://<control-plane>:7701 RC_ENROLLMENT_TOKEN="$TOKEN" bash
 
 # 3. dev machine (Linux or macOS → ~/.local/bin/rc-agent)
-curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | sh
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | bash
 # on the control plane:
 sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server agent-token
 rc-agent configure --server http://<control-plane>:7701 --token <agent-token>
@@ -77,14 +77,14 @@ worker enrollments are kept**. Order: control plane → workers → agents.
 ```bash
 # control plane
 curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/server-install.sh \
-  | sudo sh
+  | sudo bash
 
 # each worker (no enrollment token needed if already enrolled)
 curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
-  | sudo sh
+  | sudo bash
 
 # each dev machine
-curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | sh
+curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | bash
 ```
 
 Pin a version: `RC_RELEASE=v0.1.1`. Private mirror / fork: `RC_GITHUB_REPO=org/repo`.

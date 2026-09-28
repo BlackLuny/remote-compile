@@ -4,11 +4,11 @@
 #
 # First install (needs a single-use enrollment token from the console):
 #   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
-#     | sudo RC_SERVER=http://ctrl:7701 RC_ENROLLMENT_TOKEN=<token> sh
+#     | sudo RC_SERVER=http://ctrl:7701 RC_ENROLLMENT_TOKEN=<token> bash
 #
 # Upgrade to latest GitHub Release (already enrolled — no token needed):
 #   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/worker-install.sh \
-#     | sudo sh
+#     | sudo bash
 #
 # Pin version / fork / direct URL:
 #   sudo RC_RELEASE=v0.1.1 ./deploy/worker-install.sh

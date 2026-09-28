@@ -2,7 +2,7 @@
 #
 # Install or upgrade rc-agent on the current machine (no root required).
 #
-#   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | sh
+#   curl -fsSL https://github.com/BlackLuny/remote-compile/releases/latest/download/agent-install.sh | bash
 #
 # Pin version / arch / install dir:
 #   RC_RELEASE=v0.1.1 RC_INSTALL_DIR=~/.local/bin ./deploy/agent-install.sh
