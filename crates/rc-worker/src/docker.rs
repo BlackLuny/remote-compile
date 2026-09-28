@@ -14,7 +14,7 @@ use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest, Vol
 use bollard::auth::DockerCredentials;
 use bollard::query_parameters::{
     BuildImageOptions, CreateContainerOptions, CreateImageOptions, InspectNetworkOptions,
-    KillContainerOptions, ListContainersOptions, ListVolumesOptions, LogsOptions,
+    KillContainerOptions, ListContainersOptions, ListImagesOptions, ListVolumesOptions, LogsOptions,
     PushImageOptions, RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions,
     TagImageOptions, WaitContainerOptions,
 };
@@ -161,6 +161,31 @@ impl Sandbox {
             item.with_context(|| format!("pull {image}"))?;
         }
         Ok(image.to_string())
+    }
+
+    /// Every form a task's image ref could take for an image held here: the id,
+    /// each `repo:tag`, and `repo@<id>` — the last is how a locally built env
+    /// image is pinned (§5.1), since it has no registry digest.
+    pub async fn local_image_refs(&self) -> Result<Vec<String>> {
+        let images = self
+            .docker
+            .list_images(Some(ListImagesOptions { all: false, ..Default::default() }))
+            .await
+            .context("list images")?;
+        let mut out = Vec::new();
+        for img in images {
+            out.push(img.id.clone());
+            for tag in &img.repo_tags {
+                if tag.starts_with("<none>") {
+                    continue;
+                }
+                out.push(tag.clone());
+                out.push(format!("{}@{}", repo_of(tag), img.id));
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// Resolve `image` only if it is already on this host — never reaches the network.
@@ -742,6 +767,15 @@ fn write_octal(field: &mut [u8], value: u64, digits: usize) {
 }
 
 /// Container name for a task, stable and collision-free.
+/// `repo` of a `repo:tag` reference; a `:` inside a registry host (`host:5000/x`)
+/// is not a tag separator.
+pub fn repo_of(reference: &str) -> &str {
+    match reference.rfind(':') {
+        Some(i) if !reference[i..].contains('/') => &reference[..i],
+        _ => reference,
+    }
+}
+
 pub fn container_name(task_id: &str) -> String {
     format!("rc-task-{}", task_id.replace(|c: char| !c.is_alphanumeric(), "-"))
 }
@@ -925,6 +959,13 @@ mod tests {
         assert_eq!(container_name("t-01J8XYZ"), "rc-task-t-01J8XYZ");
         assert_eq!(target_volume("w-abc"), "rc-target-w-abc");
         assert_eq!(registry_volume("p-abc"), "rc-cargo-p-abc");
+    }
+
+    #[test]
+    fn a_tag_is_split_off_but_a_registry_port_is_not() {
+        assert_eq!(repo_of("rc-registry/env/0f5446c3:latest"), "rc-registry/env/0f5446c3");
+        assert_eq!(repo_of("host:5000/env/x:1"), "host:5000/env/x");
+        assert_eq!(repo_of("host:5000/env/x"), "host:5000/env/x");
     }
 
     #[test]

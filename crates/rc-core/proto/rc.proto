@@ -539,6 +539,11 @@ message WorkerStats {
   double sccache_hit_rate = 7;
   uint32 gc_runs = 8;
   uint64 gc_reclaimed_mb = 9;
+  // Images this host holds: ids (`sha256:…`), `repo:tag` names and the
+  // `repo@<id>` refs tasks are pinned by. `cached_images` above has always
+  // carried volume names and the console labels it so; this is the field
+  // the scheduler matches a task's image against.
+  repeated string local_images = 10;
 }
 
 message Heartbeat {

@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(".rc.v1.TaskResult.artifact_target", "#[serde(default)]")
         .field_attribute(".rc.v1.TaskResult.artifacts_incomplete", "#[serde(default)]")
         .field_attribute(".rc.v1.ResolvedProfile.artifacts", "#[serde(default)]")
+        .field_attribute(".rc.v1.WorkerStats.local_images", "#[serde(default)]")
         .compile_protos(&["proto/rc.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/rc.proto");
     Ok(())

@@ -18,7 +18,8 @@ pub struct Candidate {
     /// Worktrees whose target volume lives on this worker.
     pub cached_worktrees: Vec<String>,
     pub cached_projects: Vec<String>,
-    pub cached_images: Vec<String>,
+    /// Image refs held locally (ids, names, `repo@<id>`), from the heartbeat.
+    pub local_images: Vec<String>,
     /// Worktrees currently executing here — a second task for the same
     /// worktree would just block on cargo's file lock (§6.2).
     pub busy_worktrees: Vec<String>,
@@ -40,6 +41,10 @@ pub struct Demand {
     pub excluded: Vec<String>,
     /// Capabilities without which this task cannot run correctly.
     pub required_capabilities: Vec<String>,
+    /// The image exists only where it was built: a worker without it cannot
+    /// pull it, and would fail the task as an infra error only to have it
+    /// retried where it should have gone in the first place.
+    pub require_local_image: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +61,7 @@ pub enum Reject {
     ArchMismatch,
     NoFreeSlot,
     InsufficientDisk,
+    ImageNotLocal,
     AlreadyTried,
     WorktreeBusy,
     /// The worker predates something this task needs. Silently running it
@@ -85,6 +91,9 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
     {
         return Err(Reject::MissingCapability(missing.clone()));
     }
+    if d.require_local_image && !has_image(c, &d.image) {
+        return Err(Reject::ImageNotLocal);
+    }
     if c.free_slots == 0 {
         return Err(Reject::NoFreeSlot);
     }
@@ -108,7 +117,7 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
     } else {
         0.0
     };
-    let image_affinity = if !d.image.is_empty() && c.cached_images.iter().any(|i| i == &d.image) {
+    let image_affinity = if has_image(c, &d.image) {
         1.0
     } else {
         0.0
@@ -118,6 +127,23 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
         + p.w_cpu * cpu_fit
         + p.w_cache_affinity * cache_affinity
         + p.w_image_affinity * image_affinity)
+}
+
+pub fn has_image(c: &Candidate, image: &str) -> bool {
+    !image.is_empty() && c.local_images.iter().any(|i| i == image)
+}
+
+/// Env images the fleet builds itself are named `rc-registry/env/…` and pinned
+/// by image id; nothing serves them, so only a worker holding one can run it.
+pub fn is_fleet_built(image: &str) -> bool {
+    image.starts_with("rc-registry/")
+}
+
+/// Whether a task must wait for a worker that already holds its image. Only
+/// when somebody online does: with no holder at all, letting the pull fail
+/// names the problem, whereas waiting would look like an idle queue.
+pub fn require_local_image(candidates: &[Candidate], image: &str) -> bool {
+    is_fleet_built(image) && candidates.iter().any(|c| c.status == "online" && has_image(c, image))
 }
 
 /// Best worker for a task, or `None` when nothing qualifies.
@@ -177,6 +203,7 @@ mod tests {
             est_disk_gb: 20,
             excluded: vec![],
             required_capabilities: vec![],
+            require_local_image: false,
         }
     }
 
@@ -316,8 +343,35 @@ mod tests {
         let p = Policy::default();
         let plain = worker("b");
         let mut has_image = worker("c");
-        has_image.cached_images = vec!["img@sha256:a".into()];
+        has_image.local_images = vec!["img@sha256:a".into()];
         assert_eq!(pick(&[plain, has_image], &demand(), &p).unwrap().worker_id, "c");
+    }
+
+    #[test]
+    fn a_fleet_built_image_only_goes_where_it_already_is() {
+        let p = Policy::default();
+        let image = "rc-registry/env/0f5446c3@sha256:d5b6";
+        let mut d = demand();
+        d.image = image.into();
+        // Roomier and idle, but it cannot pull a locally built image.
+        let mut empty = worker("a");
+        empty.cpu_load = 0.0;
+        empty.disk_free_gb = 5000;
+        let mut holder = worker("b");
+        holder.cpu_load = 0.9;
+        holder.local_images = vec![image.into()];
+        let fleet = [empty.clone(), holder.clone()];
+        d.require_local_image = require_local_image(&fleet, image);
+        assert!(d.require_local_image);
+        assert_eq!(evaluate(&empty, &d, &p), Err(Reject::ImageNotLocal));
+        assert_eq!(pick(&fleet, &d, &p).unwrap().worker_id, "b");
+
+        // Nobody holds it: do not strand the task in the queue.
+        assert!(!require_local_image(&[empty.clone()], image));
+        // Pullable images are never restricted.
+        let mut pub_holder = holder.clone();
+        pub_holder.local_images = vec!["rust:1".into()];
+        assert!(!require_local_image(&[empty, pub_holder], "rust:1"));
     }
 
     #[test]

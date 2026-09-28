@@ -720,6 +720,7 @@ impl App {
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id)?,
             required_capabilities: required_capabilities(manifest.as_ref(), profile.as_ref()),
+            require_local_image: scheduler::require_local_image(&candidates, &task.image),
         };
         let Some(choice) = scheduler::pick(&candidates, &demand, policy) else {
             return Ok(false);
@@ -826,7 +827,7 @@ impl App {
                 free_slots: w.free_slots(),
                 cached_worktrees: w.stats.cached_worktrees.clone(),
                 cached_projects: w.stats.cached_projects.clone(),
-                cached_images: w.stats.cached_images.clone(),
+                local_images: w.stats.local_images.clone(),
                 busy_worktrees: self.store.busy_worktrees_on_worker(&w.id)?,
                 capabilities: w.capabilities.iter().cloned().collect(),
             });
@@ -878,6 +879,7 @@ impl App {
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id).unwrap_or_default(),
             required_capabilities,
+            require_local_image: scheduler::require_local_image(&candidates, &task.image),
         };
         scheduler::explain(&candidates, &demand, &policy)
             .into_iter()

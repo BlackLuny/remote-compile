@@ -483,6 +483,7 @@ async fn collect_stats(cfg: &WorkerConfig, runner: &Runner, running: u32) -> pb:
         .await
         .map(|v| v.into_iter().map(|(n, _)| n).collect())
         .unwrap_or_default();
+    let local_images = runner.sandbox.local_image_refs().await.unwrap_or_default();
     pb::WorkerStats {
         cpu_load: sysinfo::cpu_load(),
         disk_free_gb: sysinfo::disk_free_gb(&cfg.data_dir),
@@ -490,6 +491,7 @@ async fn collect_stats(cfg: &WorkerConfig, runner: &Runner, running: u32) -> pb:
         cached_worktrees,
         cached_projects,
         cached_images,
+        local_images,
         sccache_hit_rate: 0.0,
         gc_runs: 0,
         gc_reclaimed_mb: 0,
