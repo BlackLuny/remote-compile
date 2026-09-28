@@ -116,6 +116,22 @@ clippy = "cargo clippy -- -D warnings"
 
 profile 附带健康元数据：最近成功时间、成功率趋势、创建者（agent/admin/auto）、关联镜像。
 
+**命名变体（variants）**：同一份代码按用途用不同环境——日常 check 用 glibc 镜像、发版用带
+zig/musl 的镜像、桌面端用带图形栈的镜像。仓库文件里声明 `[variants.<名字>]`，调用时
+`check(path, variant="<名字>")`（CLI `--variant`）选用；变体位于"调用方显式传参"与仓库默认之间，
+只替换它写了的字段，其余继承：
+
+```toml
+[variants.musl]
+image = "rc-registry/env/zig@sha256:…"
+tasks = { build = "cargo zigbuild -p zf-worker --target x86_64-unknown-linux-musl --message-format=json" }
+```
+
+变体可改 `image/target/toolchain/timeout_secs/features/pre_commands/env/tasks/artifacts`，**不能**改
+`extra_roots/include/exclude/egress`——那几项决定什么离开开发机、沙箱能连哪里，不能被一次调用放宽。
+镜像与命令进入 canonical profile，所以每个变体自然有独立的指纹与缓存；变体构建不参与 fleet 学习
+（不会把 musl 镜像教成项目默认）。只有仓库文件能定义变体，服务端无需感知。
+
 **写入策略**：agent 新建/修改 profile 若指向**未信任镜像**，镜像需管理员审批通过后才生效（见 §8.3）；已信任镜像之间的切换直接生效。
 
 ### 3.3 EnvImage（环境镜像）
@@ -139,6 +155,15 @@ builder_worker: worker-3
 ```
 
 健康度信息通过 MCP 暴露给 agent，用于"是否已有可用环境"的判断。
+
+**分发**：`rc-registry/env/…` 是某台 worker 本地构建的镜像，别处拉不到。配置了镜像仓库
+（`image_registry`，当前为 rc 机器上 registry:2 经 Caddy `https://build.coderluny.com/v2/` +
+basic auth 暴露）后：控制面维护循环把已审批、未发布的镜像从**实际持有它的 worker**（心跳上报的
+`local_images`）逐个推上去，推成功单独记为"已发布"；派任务时附带该镜像的仓库地址，缺镜像的
+worker 拉取后**校验镜像 id 等于任务钉住的 digest** 才运行并打回本地名——仓库凭据泄露也换不了
+镜像内容。未发布的镜像只调度到已持有它的 worker。worker 的仓库凭据放在
+`/var/lib/rc-worker/.docker/config.json`（新装 worker 需要同样一份，源在 rc 机器
+`/root/.rc-registry-credentials`）。
 
 ### 3.4 Worker
 

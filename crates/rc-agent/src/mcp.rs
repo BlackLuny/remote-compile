@@ -172,6 +172,11 @@ impl McpServer {
                 .unwrap_or("auto")
                 .to_string(),
             artifacts: string_list(args, "artifacts"),
+            variant: args
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(String::from),
         };
         self.engine
             .check(req)
@@ -542,6 +547,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "env": { "type": "object", "description": "请求级环境变量（分层叠加；有 denylist）", "additionalProperties": { "type": "string" } },
                     "no_remediate": { "type": "boolean", "description": "关闭 OOM 自动降配重试，默认 false" },
                     "baseline": { "type": "string", "description": "诊断增量基线：auto|none|last_success|<task_id>，默认 auto" },
+                    "variant": { "type": "string", "description": "用 .remote-compile.toml 里 [variants.<名字>] 的镜像/命令/env 构建（如 musl 发版工具链）" },
                     "artifacts": { "type": "array", "items": { "type": "string" },
                                    "description": "仅 task=build：回传的产物路径（相对子项目，target/ 指构建目录，支持 glob）；\"auto\" = 所有 workspace 可执行文件。覆盖 .remote-compile.toml 的 [artifacts]" }
                 },

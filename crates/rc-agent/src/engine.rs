@@ -89,6 +89,8 @@ pub struct CheckRequest {
     /// Per-call artifact paths (build-artifacts §3); `"auto"` selects the
     /// workspace executables. Overrides the repository's `[artifacts]`.
     pub artifacts: Vec<String>,
+    /// `[variants.<name>]` from the repository config to build with.
+    pub variant: Option<String>,
 }
 
 /// What the agent is told. Deliberately three tiers: a verdict, a short
@@ -463,7 +465,9 @@ impl Engine {
                 // get a green build teaches every other agent how. A green
                 // build is worth teaching whether or not something is still
                 // queued for approval — it evidently did not need it.
-                if result.kind == "success" && !client_profile.found {
+                // A variant is a per-call choice, not how the project builds:
+                // teaching it would hand every agent the musl image.
+                if result.kind == "success" && !client_profile.found && req.variant.is_none() {
                     self.publish_profile(&mut client, &project_id, &resolution).await;
                 }
 
@@ -1181,9 +1185,21 @@ impl Engine {
 
         // Repo config: versioned, reviewable, travels with the branch (§3.2).
         let repo_path = root.join(rc_core::profile::REPO_CONFIG_FILE);
+        let mut variant_found = req.variant.is_none();
         if let Ok(text) = std::fs::read_to_string(&repo_path) {
             match rc_core::profile::parse_toml(&text) {
-                Ok(parsed) => layers.push((ProfileSource::Repo, parsed.profile)),
+                Ok(parsed) => {
+                    // A variant sits between the call and the repository's
+                    // defaults: it replaces what it names, inherits the rest.
+                    if let Some(name) = &req.variant {
+                        match parsed.profile.variant_layer(name) {
+                            Ok(layer) => layers.push((ProfileSource::Repo, layer)),
+                            Err(e) => return Ok(Err(format!("✗ {e}"))),
+                        }
+                        variant_found = true;
+                    }
+                    layers.push((ProfileSource::Repo, parsed.profile))
+                }
                 Err(e) => {
                     return Ok(Err(format!(
                         "✗ {} 解析失败: {e}\n修好它再试；控制面不会猜测其内容。",
@@ -1191,6 +1207,13 @@ impl Engine {
                     )))
                 }
             }
+        }
+        if !variant_found {
+            return Ok(Err(format!(
+                "✗ variant `{}` 不存在：没有找到 {}",
+                req.variant.as_deref().unwrap_or_default(),
+                rc_core::profile::REPO_CONFIG_FILE
+            )));
         }
 
         // What the fleet already knows.
@@ -2393,5 +2416,56 @@ mod tests {
 
         let plain = format_result("t-2", &pb::TaskResult { kind: "success".into(), ..Default::default() }, 10, false, 0);
         assert!(!plain.contains("产物"), "{plain}");
+    }
+
+    fn check_req(variant: Option<&str>) -> CheckRequest {
+        CheckRequest {
+            path: String::new(),
+            task: TaskType::Build,
+            command: None,
+            wait_secs: None,
+            no_cache: false,
+            env: Default::default(),
+            no_remediate: false,
+            baseline: "auto".into(),
+            artifacts: vec![],
+            variant: variant.map(String::from),
+        }
+    }
+
+    #[test]
+    fn a_variant_switches_image_and_command_but_nothing_else() {
+        let root = std::env::temp_dir().join(format!("rc-variant-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(rc_core::profile::REPO_CONFIG_FILE),
+            r#"image = "rc-registry/env/base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+timeout_secs = 900
+
+[variants.musl]
+image = "rc-registry/env/zig@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+tasks = { build = "cargo zigbuild -p x --target x86_64-unknown-linux-musl --message-format=json" }
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(AgentConfig::default());
+        let server = pb::ProfileResp::default();
+
+        let base = engine.resolve_profile(&root, &check_req(None), &server, "rust").unwrap().unwrap();
+        let musl = engine
+            .resolve_profile(&root, &check_req(Some("musl")), &server, "rust")
+            .unwrap()
+            .unwrap();
+        assert_eq!(base.image_digest, "rc-registry/env/base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(musl.image_digest, "rc-registry/env/zig@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(musl.command.contains("zigbuild"), "{}", musl.command);
+        assert_eq!(musl.profile.timeout_secs, Some(900), "inherits what it does not name");
+        assert_ne!(base.canonical(), musl.canonical(), "separate cache entries");
+
+        let err = engine
+            .resolve_profile(&root, &check_req(Some("nope")), &server, "rust")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("musl"), "{err}");
     }
 }

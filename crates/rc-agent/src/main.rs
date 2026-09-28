@@ -62,6 +62,9 @@ enum Command {
         /// Download the artifacts into this directory once the build is done.
         #[arg(long)]
         out: Option<String>,
+        /// Build with `[variants.<name>]` from .remote-compile.toml.
+        #[arg(long)]
+        variant: Option<String>,
     },
 }
 
@@ -126,6 +129,7 @@ fn main() -> Result<()> {
             command,
             artifacts,
             out,
+            variant,
         } => {
             let cfg = AgentConfig::load_or_create()?;
             let engine = Engine::new(cfg);
@@ -140,6 +144,7 @@ fn main() -> Result<()> {
                 no_remediate: false,
                 baseline: "auto".into(),
                 artifacts,
+                variant,
             }))?;
             // The server answers a long-poll after at most 120s (sized for MCP
             // calls); from a terminal `--wait-secs` means the whole wait, so

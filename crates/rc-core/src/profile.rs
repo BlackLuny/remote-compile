@@ -63,6 +63,63 @@ pub struct BuildProfile {
     /// Build outputs to ship back to the agent
     /// (docs/proposals/build-artifacts.md).
     pub artifacts: Option<crate::artifacts::ArtifactsConfig>,
+    /// Named alternatives selected per call (`check(..., variant = "musl")`):
+    /// a different image, commands or env for the same code — a musl release
+    /// toolchain next to the everyday check image, say. Only the repository's
+    /// own file may define them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, Variant>,
+}
+
+/// What a variant may change. Deliberately not `extra_roots`, `include`,
+/// `exclude` or `egress`: those decide what leaves the machine and what the
+/// sandbox can reach, and a per-call switch must not widen either.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Variant {
+    pub image: Option<String>,
+    pub target: Option<String>,
+    pub toolchain: Option<String>,
+    pub timeout_secs: Option<u32>,
+    pub features: Option<Vec<String>>,
+    pub pre_commands: Option<Vec<String>>,
+    pub env: BTreeMap<String, String>,
+    pub tasks: BTreeMap<String, String>,
+    pub artifacts: Option<crate::artifacts::ArtifactsConfig>,
+}
+
+impl Variant {
+    /// As a profile layer to sit above the repository's own settings.
+    pub fn as_layer(&self) -> BuildProfile {
+        BuildProfile {
+            image: self.image.clone(),
+            target: self.target.clone(),
+            toolchain: self.toolchain.clone(),
+            timeout_secs: self.timeout_secs,
+            features: self.features.clone(),
+            pre_commands: self.pre_commands.clone(),
+            env: self.env.clone(),
+            tasks: self.tasks.clone(),
+            artifacts: self.artifacts.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl BuildProfile {
+    /// The named variant as a layer, or an error naming the ones that exist.
+    pub fn variant_layer(&self, name: &str) -> Result<BuildProfile, String> {
+        match self.variants.get(name) {
+            Some(v) => Ok(v.as_layer()),
+            None if self.variants.is_empty() => Err(format!(
+                "variant `{name}` 不存在：{REPO_CONFIG_FILE} 里没有定义任何 [variants.*]"
+            )),
+            None => Err(format!(
+                "variant `{name}` 不存在；可用: {}",
+                self.variants.keys().cloned().collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
 }
 
 /// What the repository permits beyond its own root.
@@ -141,6 +198,7 @@ const KNOWN_KEYS: &[&str] = &[
     "include",
     "egress",
     "artifacts",
+    "variants",
 ];
 
 pub fn parse_toml(text: &str) -> Result<ParsedProfile, String> {
@@ -301,6 +359,46 @@ mod tests {
 
     fn p(toml: &str) -> BuildProfile {
         parse_toml(toml).unwrap().profile
+    }
+
+    #[test]
+    fn a_variant_overrides_the_repo_but_not_the_call() {
+        let repo = p(r#"
+image = "rc-registry/env/base@sha256:aa"
+timeout_secs = 600
+env = { A = "repo", B = "repo" }
+exclude = ["*.pem"]
+
+[variants.musl]
+image = "rc-registry/env/zig@sha256:bb"
+env = { B = "musl" }
+tasks = { build = "cargo zigbuild -p x --target x86_64-unknown-linux-musl --message-format=json" }
+"#);
+        let variant = repo.variant_layer("musl").unwrap();
+        let mut explicit = BuildProfile::default();
+        explicit.timeout_secs = Some(99);
+        let (merged, _) = resolve(vec![
+            (ProfileSource::Explicit, explicit),
+            (ProfileSource::Repo, variant),
+            (ProfileSource::Repo, repo.clone()),
+        ]);
+        assert_eq!(merged.image.as_deref(), Some("rc-registry/env/zig@sha256:bb"));
+        assert_eq!(merged.timeout_secs, Some(99), "the call still wins");
+        assert_eq!(merged.env["A"], "repo", "untouched keys come from the repo");
+        assert_eq!(merged.env["B"], "musl");
+        assert!(merged.tasks["build"].contains("zigbuild"));
+
+        let err = repo.variant_layer("nope").unwrap_err();
+        assert!(err.contains("musl"), "{err}");
+        assert!(BuildProfile::default().variant_layer("x").is_err());
+    }
+
+    #[test]
+    fn a_variant_cannot_widen_what_leaves_the_machine() {
+        for key in ["exclude", "include", "egress", "extra_roots"] {
+            let text = format!("[variants.x]\n{key} = []\n");
+            assert!(parse_toml(&text).is_err(), "{key} must be refused inside a variant");
+        }
     }
 
     #[test]
