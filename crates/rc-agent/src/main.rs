@@ -129,7 +129,8 @@ fn main() -> Result<()> {
         } => {
             let cfg = AgentConfig::load_or_create()?;
             let engine = Engine::new(cfg);
-            let outcome = rt.block_on(engine.check(CheckRequest {
+            let started = std::time::Instant::now();
+            let mut outcome = rt.block_on(engine.check(CheckRequest {
                 path,
                 task: TaskType::parse_or_default(&task),
                 command,
@@ -140,6 +141,18 @@ fn main() -> Result<()> {
                 baseline: "auto".into(),
                 artifacts,
             }))?;
+            // The server answers a long-poll after at most 120s (sized for MCP
+            // calls); from a terminal `--wait-secs` means the whole wait, so
+            // keep polling until the task ends or the budget is spent.
+            let budget = std::time::Duration::from_secs(wait_secs.unwrap_or(0) as u64);
+            while !outcome.task_id.is_empty()
+                && !rc_core::TaskState::parse_or_default(&outcome.status).is_terminal()
+                && started.elapsed() < budget
+            {
+                let left = (budget - started.elapsed()).as_secs().clamp(1, 120) as u32;
+                eprintln!("{}", outcome.text.lines().next().unwrap_or_default());
+                outcome = rt.block_on(engine.get_result(&outcome.task_id, left))?;
+            }
             println!("{}", outcome.text);
             if let Some(dir) = out.filter(|_| outcome.kind == Some(rc_core::ResultKind::Success)) {
                 match rt.block_on(engine.fetch_artifacts(&outcome.task_id, &[], Some(&dir))) {
