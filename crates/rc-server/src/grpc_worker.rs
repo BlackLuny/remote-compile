@@ -20,7 +20,44 @@ pub struct WorkerService {
 }
 
 type CmdStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ServerCmd, Status>> + Send>>;
-type BlobStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<BlobChunk, Status>> + Send>>;
+pub(crate) type BlobStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<BlobChunk, Status>> + Send>>;
+
+/// Stream a CAS blob from disk without reading it whole: artifacts can be
+/// hundreds of megabytes (build-artifacts §5).
+pub(crate) async fn stream_cas_blob(cas: &cas::FsCas, hash: String) -> Result<BlobStream, Status> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(cas.path_of(&hash))
+        .await
+        .map_err(|_| Status::not_found(format!("blob {hash} is not in the CAS")))?;
+    let total = file
+        .metadata()
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .len();
+    let stream = async_stream::stream! {
+        let mut sent = 0u64;
+        let mut buf = vec![0u8; cas::CHUNK_SIZE];
+        loop {
+            let n = match file.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    yield Err(Status::internal(e.to_string()));
+                    break;
+                }
+            };
+            sent += n as u64;
+            let last = n == 0 || sent >= total;
+            if n > 0 || sent == 0 {
+                yield Ok(BlobChunk { hash: hash.clone(), data: buf[..n].to_vec(), last, total_size: total });
+            }
+            if last {
+                break;
+            }
+        }
+    };
+    Ok(Box::pin(stream))
+}
 
 impl WorkerService {
     pub fn new(app: Arc<App>) -> WorkerApiServer<Self> {
@@ -204,24 +241,35 @@ impl WorkerApi for WorkerService {
         Ok(Response::new(Box::pin(stream) as BlobStream))
     }
 
-    /// Workers upload build logs (and image build logs) as CAS blobs.
+    /// Workers upload build logs (and image build logs, and artifacts) as CAS
+    /// blobs. Streamed to disk: an artifact may not fit in memory.
     async fn put_blob(&self, req: Request<Streaming<BlobChunk>>) -> Result<Response<PutBlobResp>, Status> {
         self.authenticate(&req)?;
         let mut stream = req.into_inner();
-        let mut buf = Vec::new();
+        let internal = |e: std::io::Error| Status::internal(e.to_string());
+        let joined = |e: tokio::task::JoinError| Status::internal(e.to_string());
+        // Disk writes (and the final fsync of a blob that may be gigabytes)
+        // stay off the async workers that serve every other RPC.
+        let mut writer = self.app.cas.writer().map_err(internal)?;
+        let mut declared = String::new();
         while let Some(chunk) = stream.next().await {
-            buf.extend_from_slice(&chunk?.data);
+            let chunk = chunk?;
+            if declared.is_empty() {
+                declared = chunk.hash;
+            }
+            writer = tokio::task::spawn_blocking(move || writer.write(&chunk.data).map(|_| writer))
+                .await
+                .map_err(joined)?
+                .map_err(internal)?;
         }
-        let hash = self
-            .app
-            .cas
-            .put(&buf)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        self.app.store.touch_blobs(&[(hash.clone(), buf.len() as i64)]).ok();
-        Ok(Response::new(PutBlobResp {
-            hash,
-            size: buf.len() as u64,
-        }))
+        // The worker names the hash on every chunk; content that disagrees is
+        // refused rather than stored under a key it does not have.
+        let (hash, size) = tokio::task::spawn_blocking(move || writer.finish(Some(&declared)))
+            .await
+            .map_err(joined)?
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.app.store.touch_blobs(&[(hash.clone(), size as i64)]).ok();
+        Ok(Response::new(PutBlobResp { hash, size }))
     }
 }
 

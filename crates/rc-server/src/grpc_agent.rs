@@ -595,6 +595,31 @@ impl AgentApi for AgentService {
     /// Ownership: `project_id` on the request must match the task row. The
     /// bearer token is fleet-wide — this check prevents mis-cancel, not a
     /// malicious agent holding a valid fleet token (R6).
+    /// One artifact of one task, by path (build-artifacts §5). There is no
+    /// fetch-by-hash on this API: that would let any agent read any blob.
+    type FetchArtifactStream = crate::grpc_worker::BlobStream;
+
+    async fn fetch_artifact(
+        &self,
+        req: Request<ArtifactQuery>,
+    ) -> Result<Response<Self::FetchArtifactStream>, Status> {
+        self.authenticate(&req)?;
+        let req = req.into_inner();
+        let hash = self
+            .app
+            .artifact_blob(&req.task_id, &req.path)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "no artifact `{}` for task {} (never produced, or expired)",
+                    req.path, req.task_id
+                ))
+            })?;
+        self.app.metrics.incr("artifacts_fetched_total", 1.0);
+        let stream = crate::grpc_worker::stream_cas_blob(&self.app.cas, hash).await?;
+        Ok(Response::new(stream))
+    }
+
     async fn cancel_task(
         &self,
         req: Request<CancelTaskReq>,

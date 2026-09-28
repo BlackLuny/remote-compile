@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod ansi;
 pub mod arch;
+pub mod artifacts;
 pub mod budget;
 pub mod cas;
 pub mod contract;
@@ -48,8 +49,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// such a worker is excluded from multi-root tasks instead.
 pub const CAP_MULTI_ROOT: &str = "multi-root";
 
+/// Worker capability: runs the artifact collect step and uploads what it
+/// finds (docs/proposals/build-artifacts.md). A worker without it would
+/// silently return none, so such tasks are never placed on one.
+pub const CAP_ARTIFACTS: &str = "artifacts";
+
 /// Capabilities this build advertises.
-pub const CAPABILITIES: &[&str] = &[CAP_MULTI_ROOT];
+pub const CAPABILITIES: &[&str] = &[CAP_MULTI_ROOT, CAP_ARTIFACTS];
 
 /// Directories never synced, regardless of adapter.
 pub const ALWAYS_EXCLUDE: &[&str] = &[".git", "node_modules", ".direnv", ".venv"];

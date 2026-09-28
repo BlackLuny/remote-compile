@@ -43,9 +43,20 @@ pub struct GcReport {
 /// §9. Anything pinned by a live task or still inside its lease window is left
 /// alone — the whole point of the lease is that reconciliation promised the
 /// agent those blobs would still be there (§4.7).
+/// How long a freshly uploaded blob is safe from artifact expiry: longer than
+/// any gap between a worker's upload and its TaskDone.
+pub const ARTIFACT_UPLOAD_GRACE_SECS: i64 = 3600;
+
 pub fn collect_garbage(app: &App) -> Result<GcReport> {
     let policy = app.policy();
     let mut report = GcReport::default();
+    for (hash, size) in app.store.expire_task_artifacts(ARTIFACT_UPLOAD_GRACE_SECS)? {
+        if app.cas.remove(&hash).is_ok() {
+            app.store.forget_blob(&hash)?;
+            report.deleted += 1;
+            report.bytes += size.max(0) as u64;
+        }
+    }
     for blob in app.store.collectable_blobs(policy.blob_gc_ttl_secs, 5000)? {
         let size = app
             .cas

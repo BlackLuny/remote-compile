@@ -78,13 +78,23 @@ pub struct TerminalExtras {
 /// root, and a worker that does not know that would extract the git baseline
 /// one directory too high — producing a tree that fails in a way which looks
 /// like CAS corruption. Better to leave the task queued and say why.
-fn required_capabilities(manifest: Option<&pb::Manifest>) -> Vec<String> {
-    match manifest {
-        Some(m) if !m.anchor_mount.is_empty() || !m.roots.is_empty() => {
-            vec![rc_core::CAP_MULTI_ROOT.to_string()]
+///
+/// A task that declares artifacts on a worker without the collect step would
+/// come back successful and empty, which reads as "your glob matched nothing".
+fn required_capabilities(
+    manifest: Option<&pb::Manifest>,
+    profile: Option<&pb::ResolvedProfile>,
+) -> Vec<String> {
+    let mut caps = Vec::new();
+    if let Some(m) = manifest {
+        if !m.anchor_mount.is_empty() || !m.roots.is_empty() {
+            caps.push(rc_core::CAP_MULTI_ROOT.to_string());
         }
-        _ => Vec::new(),
     }
+    if rc_core::artifacts::is_declared(profile.and_then(|p| p.artifacts.as_ref())) {
+        caps.push(rc_core::CAP_ARTIFACTS.to_string());
+    }
+    caps
 }
 
 /// How long a dispatched image build is assumed to still be running. Past this
@@ -233,8 +243,12 @@ impl App {
     /// Queueing it instead would look identical to ordinary congestion: the
     /// agent gets a task id, waits, and is never told that the reason is a
     /// fleet that has not been upgraded.
-    fn check_capabilities_available(&self, manifest: &pb::Manifest) -> Result<()> {
-        let needed = required_capabilities(Some(manifest));
+    fn check_capabilities_available(
+        &self,
+        manifest: &pb::Manifest,
+        profile: &pb::ResolvedProfile,
+    ) -> Result<()> {
+        let needed = required_capabilities(Some(manifest), Some(profile));
         if needed.is_empty() {
             return Ok(());
         }
@@ -253,10 +267,14 @@ impl App {
         for cap in &needed {
             let anyone = online.iter().any(|w| w.capabilities.contains(cap));
             if !anyone {
+                let workaround = if cap == rc_core::CAP_ARTIFACTS {
+                    "or drop the artifacts declaration to build without shipping outputs back"
+                } else {
+                    "or set extra_roots = [] to build without the directories outside the repository"
+                };
                 return Err(anyhow!(
                     "no online worker supports `{cap}`, which this task needs; \
-                     upgrade the compile machines, or set extra_roots = [] to build \
-                     without the directories outside the repository"
+                     upgrade the compile machines, {workaround}"
                 ));
             }
         }
@@ -297,6 +315,16 @@ impl App {
             .ok_or_else(|| anyhow!("submit without a resolved profile"))?;
 
         manifest::validate(manifest).map_err(|e| anyhow!("{e}"))?;
+        // Artifacts are part of what the build is (build-artifacts §3): kept
+        // only for task types that collect, normalised, and refused outright
+        // when malformed rather than dropped.
+        let mut wire_profile = profile.clone();
+        wire_profile.artifacts = rc_core::artifacts::effective_spec(
+            profile.artifacts.as_ref(),
+            TaskType::parse_or_default(&req.task_type),
+        )
+        .map_err(|e| anyhow!("invalid artifacts declaration: {e}"))?;
+        let profile = &wire_profile;
         // Both of these end up as path components on the worker (`<mirrors>/
         // <project_id>.git`, `<work>/<worktree_id>`), so their shape is checked
         // here rather than trusted from the wire.
@@ -307,7 +335,7 @@ impl App {
             return Err(anyhow!("malformed worktree_id: {}", req.worktree_id));
         }
         self.check_image_admissible(&profile.image, &policy)?;
-        self.check_capabilities_available(manifest)?;
+        self.check_capabilities_available(manifest, profile)?;
 
         let task_type = TaskType::parse_or_default(&req.task_type);
         // Authoritative command resolution (intent-and-query-surface §3.4):
@@ -417,7 +445,13 @@ impl App {
 
         // §5.1 task cache.
         if !req.no_cache {
-            if let Some(prev) = self.store.find_cached_result(&fingerprint, &egress_key, policy.task_cache_ttl_secs)? {
+            let cached = self
+                .store
+                .find_cached_result(&fingerprint, &egress_key, policy.task_cache_ttl_secs)?
+                // A verdict whose artifacts have expired is only half an
+                // answer; rebuilding is the only way to get the rest.
+                .filter(|prev| self.artifacts_still_held(prev));
+            if let Some(prev) = cached {
                 let id = ids::task_id();
                 let row = self.new_row(
                     &id,
@@ -430,6 +464,8 @@ impl App {
                 );
                 self.persist_new(&row, req, &profile)?;
                 self.store.record_cache_hit(&id, &prev)?;
+                self.store
+                    .copy_task_artifacts(&prev.id, &id, policy.artifact_ttl_secs)?;
                 self.metrics.incr("tasks_cache_hit_total", 1.0);
                 self.store.add_timeline(&id, "cache_hit", "", &prev.id)?;
                 self.publish_task(&id);
@@ -683,7 +719,7 @@ impl App {
             arch: self.demand_arch_for(task, profile.as_ref()),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
             excluded: self.store.attempted_workers(&task.id)?,
-            required_capabilities: required_capabilities(manifest.as_ref()),
+            required_capabilities: required_capabilities(manifest.as_ref(), profile.as_ref()),
         };
         let Some(choice) = scheduler::pick(&candidates, &demand, policy) else {
             return Ok(false);
@@ -832,7 +868,7 @@ impl App {
         let required_capabilities = inputs
             .as_ref()
             .and_then(|(manifest_json, _, _)| serde_json::from_str(manifest_json).ok())
-            .map(|m: Option<pb::Manifest>| required_capabilities(m.as_ref()))
+            .map(|m: Option<pb::Manifest>| required_capabilities(m.as_ref(), profile.as_ref()))
             .unwrap_or_default();
         let demand = Demand {
             worktree_id: task.worktree_id.clone(),
@@ -910,6 +946,15 @@ impl App {
     }
 
     async fn finish(&self, task: &TaskRow, result: &pb::TaskResult, log_ref: &str) -> Result<()> {
+        // What is stored must list only artifacts that can actually be
+        // fetched, or the agent is offered files that answer not_found.
+        let checked;
+        let result = if result.artifacts.is_empty() {
+            result
+        } else {
+            checked = self.checked_artifacts(&task.id, result);
+            &checked
+        };
         let kind = ResultKind::parse_or_default(&result.kind);
         let status = if matches!(kind, ResultKind::InfraError) {
             TaskState::Failed
@@ -932,6 +977,9 @@ impl App {
             .lock()
             .retain(|k, _| !k.starts_with(&format!("{}\0", task.id)));
         self.store.unpin_task_blobs(&task.id)?;
+        if !result.artifacts.is_empty() {
+            self.record_artifacts(&task.id, result)?;
+        }
         self.store.add_timeline(&task.id, "finished", &task.worker_id, &result.kind)?;
 
         let digest = task.image.split_once('@').map(|(_, d)| d).unwrap_or_default();
@@ -966,6 +1014,72 @@ impl App {
         self.publish_task(&task.id);
         self.dispatch_signal.notify_one();
         Ok(())
+    }
+
+    /// The worker is trusted to have checked these; the agent will turn the
+    /// paths into files on a developer's disk, so check again. A blob that is
+    /// gone makes the result incomplete rather than silently shorter.
+    fn checked_artifacts(&self, task_id: &str, result: &pb::TaskResult) -> pb::TaskResult {
+        let mut out = result.clone();
+        out.artifacts.clear();
+        let mut dropped = Vec::new();
+        for a in &result.artifacts {
+            if !rc_core::artifacts::is_safe_relative(&a.path) {
+                dropped.push("an artifact with an unsafe path".to_string());
+            } else if !self.cas.exists(&a.blob) {
+                dropped.push(format!("{} (upload lost)", a.path));
+                out.artifacts_incomplete = true;
+            } else {
+                out.artifacts.push(a.clone());
+            }
+        }
+        if !dropped.is_empty() {
+            tracing::warn!(task = %task_id, ?dropped, "dropping artifacts that are malformed or absent");
+            let mut notes: Vec<String> = out.artifacts_note.lines().map(String::from).collect();
+            notes.push(format!("dropped: {}", dropped.join(", ")));
+            out.artifacts_note = rc_core::artifacts::cap_notes(notes).join("\n");
+        }
+        out
+    }
+
+    /// Artifacts become fetchable only through `task_artifacts`, never by bare
+    /// hash, and only for as long as the artifact TTL (build-artifacts §6).
+    fn record_artifacts(&self, task_id: &str, result: &pb::TaskResult) -> Result<()> {
+        let ttl = self.policy().artifact_ttl_secs;
+        let rows: Vec<_> = result
+            .artifacts
+            .iter()
+            .map(|a| (a.path.clone(), a.blob.clone(), a.compressed_size as i64))
+            .collect();
+        self.store.insert_task_artifacts(task_id, &rows, ttl)?;
+        self.metrics.incr("artifacts_stored_total", rows.len() as f64);
+        Ok(())
+    }
+
+    /// Every artifact the cached result lists is still stored.
+    fn artifacts_still_held(&self, prev: &TaskRow) -> bool {
+        let Some(result) = prev.result() else { return true };
+        if result.artifacts_incomplete {
+            return false;
+        }
+        if result.artifacts.is_empty() {
+            return true;
+        }
+        let held = self.store.live_task_artifacts(&prev.id).unwrap_or_default();
+        result.artifacts.iter().all(|a| {
+            held.iter().any(|(p, h)| *p == a.path && *h == a.blob) && self.cas.exists(&a.blob)
+        })
+    }
+
+    /// The CAS blob behind one artifact of one task, if it is still held.
+    pub fn artifact_blob(&self, task_id: &str, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .live_task_artifacts(task_id)?
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, h)| h)
+            .filter(|h| self.cas.exists(h)))
     }
 
     pub fn fail_task(&self, task_id: &str, kind: ResultKind, message: &str) -> Result<()> {
@@ -1379,14 +1493,31 @@ mod tests {
     #[test]
     fn multi_root_is_only_required_when_the_layout_is_actually_multi_root() {
         // Every ordinary project must stay runnable on every worker.
-        assert!(required_capabilities(None).is_empty());
-        assert!(required_capabilities(Some(&pb::Manifest::default())).is_empty());
+        assert!(required_capabilities(None, None).is_empty());
+        assert!(required_capabilities(Some(&pb::Manifest::default()), None).is_empty());
 
         let nested = pb::Manifest {
             anchor_mount: "app".into(),
             ..Default::default()
         };
-        assert_eq!(required_capabilities(Some(&nested)), vec!["multi-root"]);
+        assert_eq!(required_capabilities(Some(&nested), None), vec!["multi-root"]);
+    }
+
+    #[test]
+    fn declared_artifacts_require_a_collecting_worker() {
+        let undeclared = pb::ResolvedProfile {
+            artifacts: Some(pb::ArtifactSpec::default()),
+            ..Default::default()
+        };
+        assert!(required_capabilities(None, Some(&undeclared)).is_empty());
+        let declared = pb::ResolvedProfile {
+            artifacts: Some(pb::ArtifactSpec {
+                paths: vec!["target/release/app".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(required_capabilities(None, Some(&declared)), vec!["artifacts"]);
     }
 
     #[test]
@@ -1400,16 +1531,16 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            app.check_capabilities_available(&multi).is_ok(),
+            app.check_capabilities_available(&multi, &pb::ResolvedProfile::default()).is_ok(),
             "an empty fleet must not turn into a hard failure"
         );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         app.workers.connect("w-old", "x86_64", "0.1.0", 4, tx);
-        let err = app.check_capabilities_available(&multi).unwrap_err();
+        let err = app.check_capabilities_available(&multi, &pb::ResolvedProfile::default()).unwrap_err();
         assert!(err.to_string().contains("multi-root"), "{err}");
         // A plain task is unaffected.
-        assert!(app.check_capabilities_available(&pb::Manifest::default()).is_ok());
+        assert!(app.check_capabilities_available(&pb::Manifest::default(), &pb::ResolvedProfile::default()).is_ok());
     }
 
     #[test]
@@ -1755,6 +1886,175 @@ mod tests {
         assert_eq!(app.store.get_task(&id).unwrap().unwrap().status, "done");
         assert_eq!(app.store.collectable_blobs(-1, 10).unwrap().len(), 1);
         assert_eq!(app.store.get_image("e1").unwrap().unwrap().success_count, 1);
+    }
+
+    fn build_with_artifacts(app: &App, content: &[u8]) -> pb::SubmitTaskReq {
+        let mut req = request(app, "s1", "build", content);
+        req.profile.as_mut().unwrap().artifacts = Some(pb::ArtifactSpec {
+            paths: vec!["./target/release/app".into()],
+            ..Default::default()
+        });
+        req
+    }
+
+    async fn finish_with_artifact(app: &App, id: &str, path: &str) -> String {
+        let blob = app.cas.put(b"zstd-bytes").unwrap();
+        app.store.assign_to_worker(id, "w-a").unwrap();
+        app.on_task_done(
+            "w-a",
+            pb::TaskDone {
+                task_id: id.to_string(),
+                result: Some(pb::TaskResult {
+                    kind: "success".into(),
+                    artifacts: vec![pb::Artifact {
+                        path: path.into(),
+                        blob: blob.clone(),
+                        size: 100,
+                        compressed_size: 10,
+                        mode: 0o755,
+                        content_hash: "c".repeat(64),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        blob
+    }
+
+    #[test]
+    fn artifacts_are_only_kept_for_task_types_that_collect() {
+        let app = test_app();
+        let mut check = build_with_artifacts(&app, b"a");
+        check.task_type = "check".into();
+        check.profile.as_mut().unwrap().canonical = "task_type=check\n".into();
+        let id = queued_id(app.submit(&check).unwrap());
+        let (_, profile_json, _) = app.store.get_task_inputs(&id).unwrap().unwrap();
+        let stored: pb::ResolvedProfile = serde_json::from_str(&profile_json).unwrap();
+        assert!(stored.artifacts.is_none(), "a check ignores the declaration");
+
+        let id = queued_id(app.submit(&build_with_artifacts(&app, b"b")).unwrap());
+        let (_, profile_json, _) = app.store.get_task_inputs(&id).unwrap().unwrap();
+        let stored: pb::ResolvedProfile = serde_json::from_str(&profile_json).unwrap();
+        assert_eq!(stored.artifacts.unwrap().paths, vec!["target/release/app"]);
+        assert!(stored.canonical.contains("artifacts.paths=target/release/app"));
+    }
+
+    #[test]
+    fn a_malformed_declaration_is_refused_not_dropped() {
+        let app = test_app();
+        let mut req = build_with_artifacts(&app, b"a");
+        req.profile.as_mut().unwrap().artifacts.as_mut().unwrap().paths = vec!["../../etc".into()];
+        let err = app.submit(&req).unwrap_err().to_string();
+        assert!(err.contains("invalid artifacts declaration"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn artifacts_are_fetchable_by_task_and_path_only() {
+        let app = test_app();
+        let id = queued_id(app.submit(&build_with_artifacts(&app, b"a")).unwrap());
+        let blob = finish_with_artifact(&app, &id, "target/release/app").await;
+        assert_eq!(app.artifact_blob(&id, "target/release/app").unwrap(), Some(blob));
+        assert_eq!(app.artifact_blob(&id, "target/release/other").unwrap(), None);
+        assert_eq!(app.artifact_blob("t-unknown", "target/release/app").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_path_that_could_escape_the_destination_is_never_recorded() {
+        let app = test_app();
+        let id = queued_id(app.submit(&build_with_artifacts(&app, b"a")).unwrap());
+        finish_with_artifact(&app, &id, "../evil").await;
+        assert!(app.store.live_task_artifacts(&id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_carries_the_artifacts_until_they_expire() {
+        let app = test_app();
+        let first = queued_id(app.submit(&build_with_artifacts(&app, b"a")).unwrap());
+        let blob = finish_with_artifact(&app, &first, "target/release/app").await;
+
+        let hit = match app.submit(&build_with_artifacts(&app, b"a")).unwrap() {
+            Admission::CacheHit { task_id, result } => {
+                assert_eq!(result.artifacts.len(), 1);
+                task_id
+            }
+            _ => panic!("expected CacheHit"),
+        };
+        assert_eq!(app.artifact_blob(&hit, "target/release/app").unwrap(), Some(blob.clone()));
+
+        // Expire everything: the next identical build must run, not replay a
+        // result whose artifacts are gone.
+        app.store
+            .insert_task_artifacts(&first, &[("target/release/app".into(), blob.clone(), 10)], -1)
+            .unwrap();
+        app.store
+            .insert_task_artifacts(&hit, &[("target/release/app".into(), blob.clone(), 10)], -1)
+            .unwrap();
+        assert!(matches!(
+            app.submit(&build_with_artifacts(&app, b"a")).unwrap(),
+            Admission::Queued { .. } | Admission::Subscribed { .. }
+        ));
+
+        // And GC reclaims the blob right away, not after the cold-blob TTL.
+        let report = crate::bg::collect_garbage(&app).unwrap();
+        assert!(report.deleted >= 1);
+        assert!(!app.cas.exists(&blob));
+    }
+
+    #[tokio::test]
+    async fn a_lost_upload_is_reported_and_never_cached() {
+        let app = test_app();
+        let id = queued_id(app.submit(&build_with_artifacts(&app, b"a")).unwrap());
+        finish_with_artifact(&app, &id, "target/release/app").await;
+        // Same build again, but this time the blob vanished before TaskDone.
+        let id2 = queued_id(app.submit(&{
+            let mut r = build_with_artifacts(&app, b"b");
+            r.no_cache = true;
+            r
+        }).unwrap());
+        app.store.assign_to_worker(&id2, "w-a").unwrap();
+        app.on_task_done(
+            "w-a",
+            pb::TaskDone {
+                task_id: id2.clone(),
+                result: Some(pb::TaskResult {
+                    kind: "success".into(),
+                    artifacts: vec![pb::Artifact {
+                        path: "target/release/app".into(),
+                        blob: "f".repeat(64),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let stored = app.store.get_task(&id2).unwrap().unwrap().result().unwrap();
+        assert!(stored.artifacts.is_empty(), "never offer what cannot be fetched");
+        assert!(stored.artifacts_incomplete);
+        assert!(stored.artifacts_note.contains("upload lost"), "{}", stored.artifacts_note);
+        assert!(matches!(
+            app.submit(&build_with_artifacts(&app, b"b")).unwrap(),
+            Admission::Queued { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_freshly_uploaded_blob_survives_the_expiry_of_an_old_row() {
+        let app = test_app();
+        let id = queued_id(app.submit(&build_with_artifacts(&app, b"a")).unwrap());
+        let blob = finish_with_artifact(&app, &id, "target/release/app").await;
+        app.store
+            .insert_task_artifacts(&id, &[("target/release/app".into(), blob.clone(), 10)], -1)
+            .unwrap();
+        // A running task just uploaded the same bytes.
+        app.store.touch_blobs(&[(blob.clone(), 10)]).unwrap();
+        crate::bg::collect_garbage(&app).unwrap();
+        assert!(app.cas.exists(&blob));
     }
 
     #[test]

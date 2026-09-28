@@ -36,6 +36,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(".rc.v1.TaskStatus.capacity", "#[serde(default)]")
         .field_attribute(".rc.v1.TaskStatus.suggest_wait_secs", "#[serde(default)]")
         .field_attribute(".rc.v1.ProfileResp.pending_pre_commands", "#[serde(default)]")
+        // Build artifacts: results and profiles stored before the feature
+        // declared none, which is exactly what the default says.
+        .field_attribute(".rc.v1.TaskResult.artifacts", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskResult.artifacts_note", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskResult.artifact_target", "#[serde(default)]")
+        .field_attribute(".rc.v1.TaskResult.artifacts_incomplete", "#[serde(default)]")
+        .field_attribute(".rc.v1.ResolvedProfile.artifacts", "#[serde(default)]")
         .compile_protos(&["proto/rc.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/rc.proto");
     Ok(())

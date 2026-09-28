@@ -128,6 +128,40 @@ impl ServerClient {
             .into_inner();
         Ok(resp.hash)
     }
+
+    /// Upload a file too large to hold in memory, read chunk by chunk. The
+    /// server refuses it unless the content hashes to `hash`.
+    pub async fn put_blob_file(&mut self, path: &std::path::Path, hash: &str) -> Result<String> {
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("open {}", path.display()))?;
+        let total = file.metadata().await?.len();
+        let hash = hash.to_string();
+        let stream = async_stream::stream! {
+            let mut sent = 0u64;
+            let mut buf = vec![0u8; cas::CHUNK_SIZE];
+            // A read error ends the stream early, which makes the server's
+            // hash check fail — that is the error the caller then sees.
+            while let Ok(n) = file.read(&mut buf).await {
+                sent += n as u64;
+                let last = n == 0 || sent >= total;
+                if n > 0 || sent == 0 {
+                    yield BlobChunk { hash: hash.clone(), data: buf[..n].to_vec(), last, total_size: total };
+                }
+                if last {
+                    break;
+                }
+            }
+        };
+        let resp = self
+            .inner
+            .put_blob(self.authed(stream))
+            .await
+            .context("upload blob")?
+            .into_inner();
+        Ok(resp.hash)
+    }
 }
 
 /// Convenience wrappers so call sites read as intent, not protobuf shape.

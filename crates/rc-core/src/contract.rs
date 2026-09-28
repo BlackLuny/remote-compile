@@ -181,6 +181,7 @@ pub fn canonicalize_resolved(
     for (k, v) in env {
         push(&format!("env[{k}]"), v);
     }
+    s.push_str(&crate::artifacts::canonical_lines(profile.artifacts.as_ref()));
     s
 }
 

@@ -60,6 +60,9 @@ pub struct BuildProfile {
     /// hole in the sandbox that §16 shows cannot be closed again from inside.
     /// Like `exclude` and `include`, only the repository's own file may ask.
     pub egress: Option<Vec<String>>,
+    /// Build outputs to ship back to the agent
+    /// (docs/proposals/build-artifacts.md).
+    pub artifacts: Option<crate::artifacts::ArtifactsConfig>,
 }
 
 /// What the repository permits beyond its own root.
@@ -137,6 +140,7 @@ const KNOWN_KEYS: &[&str] = &[
     "exclude",
     "include",
     "egress",
+    "artifacts",
 ];
 
 pub fn parse_toml(text: &str) -> Result<ParsedProfile, String> {
@@ -169,7 +173,7 @@ impl BuildProfile {
         // the sandbox may reach — and only the repository's own file may answer
         // that. Inheriting one from a fleet-learned profile would let one
         // project's stored config change another's disclosure.
-        fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands);
+        fill!(adapter, image, path, target, toolchain, timeout_secs, features, pre_commands, artifacts);
         for (k, v) in &lower.env {
             self.env.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -254,7 +258,18 @@ impl Resolution {
         for (k, v) in &p.env {
             push(&format!("env[{k}]"), v);
         }
+        s.push_str(&crate::artifacts::canonical_lines(self.artifact_spec().as_ref()));
         s
+    }
+
+    /// The declared artifacts, normalised; `None` when nothing is declared.
+    pub fn artifact_spec(&self) -> Option<crate::pb::ArtifactSpec> {
+        let spec = self.profile.artifacts.as_ref()?.to_spec();
+        // An invalid declaration still travels: the control plane refuses it
+        // with the reason, which beats silently collecting nothing.
+        crate::artifacts::effective_spec(Some(&spec), self.task_type)
+            .unwrap_or(Some(spec))
+            .filter(|_| crate::artifacts::applies_to(self.task_type))
     }
 
     pub fn to_pb(&self) -> ResolvedProfile {
@@ -272,6 +287,7 @@ impl Resolution {
             toolchain: self.toolchain.clone(),
             canonical: self.canonical(),
             source: self.source.as_str().to_string(),
+            artifacts: self.artifact_spec(),
         }
     }
 }

@@ -202,6 +202,19 @@ CREATE TABLE IF NOT EXISTS task_blob_refs (
 );
 CREATE INDEX IF NOT EXISTS idx_blob_refs_hash ON task_blob_refs(hash);
 
+-- Build artifacts (docs/proposals/build-artifacts.md §6): held by expiry, not
+-- by the task row, so GC can reclaim them long before the task is forgotten.
+CREATE TABLE IF NOT EXISTS task_artifacts (
+  task_id    TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  hash       TEXT NOT NULL,
+  size       INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_hash ON task_artifacts(hash);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_expiry ON task_artifacts(expires_at);
+
 -- Commits the fleet can already materialize, and the bundles that got them
 -- there (§4.1).
 CREATE TABLE IF NOT EXISTS project_commits (

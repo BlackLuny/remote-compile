@@ -126,6 +126,22 @@ impl FsCas {
         }
     }
 
+    /// Start a streamed write for a blob too large to hold in memory. The key
+    /// is known only once every byte has been seen.
+    pub fn writer(&self) -> io::Result<CasWriter> {
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("stream.{}.{}", std::process::id(), ulid::Ulid::generate()));
+        Ok(CasWriter {
+            cas: self.clone(),
+            file: Some(fs::File::create(&tmp)?),
+            tmp,
+            hasher: blake3::Hasher::new(),
+            size: 0,
+        })
+    }
+
     /// Convenience: hash and store in one step, returning the key.
     pub fn put(&self, data: &[u8]) -> io::Result<String> {
         let hash = hash_bytes(data);
@@ -165,6 +181,151 @@ impl FsCas {
 
 /// Build logs are stored compressed (§9): they are large, highly compressible
 /// and read rarely.
+/// A blob being written in pieces. Dropped without `finish`, it leaves nothing
+/// behind.
+pub struct CasWriter {
+    cas: FsCas,
+    file: Option<fs::File>,
+    tmp: PathBuf,
+    hasher: blake3::Hasher,
+    size: u64,
+}
+
+impl CasWriter {
+    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        self.hasher.update(data);
+        self.size += data.len() as u64;
+        self.file
+            .as_mut()
+            .expect("write after finish")
+            .write_all(data)
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Seal the blob. With `expected`, content that hashes to anything else is
+    /// refused rather than stored under the wrong key.
+    pub fn finish(mut self, expected: Option<&str>) -> io::Result<(String, u64)> {
+        let hash = self.hasher.finalize().to_hex().to_string();
+        if let Some(e) = expected.filter(|e| !e.is_empty()) {
+            if e != hash {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("blob hash mismatch: declared {e}, actual {hash}"),
+                ));
+            }
+        }
+        let file = self.file.take().expect("finish twice");
+        file.sync_all()?;
+        drop(file);
+        let dest = self.cas.path_of(&hash);
+        if !dest.is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Err(e) = fs::rename(&self.tmp, &dest) {
+                if !dest.is_file() {
+                    return Err(e);
+                }
+            }
+        }
+        Ok((hash, self.size))
+    }
+}
+
+impl Drop for CasWriter {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
+}
+
+/// Hashes a file while zstd-compressing it into `dst`, without holding either
+/// in memory. Returns `(blake3 of the original, original size)` — what the
+/// receiving end checks after decompressing.
+pub fn compress_file(src: &Path, dst: &Path) -> io::Result<(String, u64)> {
+    struct Hashing<R> {
+        inner: R,
+        hasher: blake3::Hasher,
+        size: u64,
+    }
+    impl<R: Read> Read for Hashing<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.hasher.update(&buf[..n]);
+            self.size += n as u64;
+            Ok(n)
+        }
+    }
+    let mut reader = Hashing {
+        inner: io::BufReader::new(fs::File::open(src)?),
+        hasher: blake3::Hasher::new(),
+        size: 0,
+    };
+    let out = io::BufWriter::new(fs::File::create(dst)?);
+    zstd::stream::copy_encode(&mut reader, out, 3)?;
+    Ok((reader.hasher.finalize().to_hex().to_string(), reader.size))
+}
+
+/// Streaming counterpart of `compress_file` for the receiving end: feeds
+/// compressed chunks in, writes the original out, and hashes what it wrote.
+pub struct Decompressor<W: Write> {
+    inner: zstd::stream::write::Decoder<'static, Hashed<W>>,
+}
+
+pub struct Hashed<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+    size: u64,
+    limit: u64,
+}
+
+impl<W: Write> Write for Hashed<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // A peer that lies about the size must not get to fill the disk
+        // before the final check notices.
+        if self.size + buf.len() as u64 > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("content exceeds the declared {} bytes", self.limit),
+            ));
+        }
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.size += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Decompressor<W> {
+    /// `limit` is the most output accepted; anything past it is an error.
+    pub fn new(out: W, limit: u64) -> io::Result<Self> {
+        Ok(Self {
+            inner: zstd::stream::write::Decoder::new(Hashed {
+                inner: out,
+                hasher: blake3::Hasher::new(),
+                size: 0,
+                limit,
+            })?,
+        })
+    }
+
+    pub fn write(&mut self, compressed: &[u8]) -> io::Result<()> {
+        self.inner.write_all(compressed)
+    }
+
+    /// `(blake3 of the output, output size, the writer)`.
+    pub fn finish(mut self) -> io::Result<(String, u64, W)> {
+        self.inner.flush()?;
+        let hashed = self.inner.into_inner();
+        Ok((hashed.hasher.finalize().to_hex().to_string(), hashed.size, hashed.inner))
+    }
+}
+
 pub fn compress_log(text: &str) -> io::Result<Vec<u8>> {
     zstd::encode_all(text.as_bytes(), 3)
 }
@@ -224,5 +385,50 @@ mod tests {
         let packed = compress_log(&text).unwrap();
         assert!(packed.len() < text.len() / 10);
         assert_eq!(decompress_log(&packed).unwrap(), text);
+    }
+
+    #[test]
+    fn a_streamed_blob_lands_under_its_content_hash() {
+        let cas = FsCas::open(tmpdir("stream")).unwrap();
+        let mut w = cas.writer().unwrap();
+        w.write(b"hello ").unwrap();
+        w.write(b"world").unwrap();
+        let (hash, size) = w.finish(None).unwrap();
+        assert_eq!(hash, hash_bytes(b"hello world"));
+        assert_eq!(size, 11);
+        assert_eq!(cas.get(&hash).unwrap(), b"hello world");
+
+        let mut w = cas.writer().unwrap();
+        w.write(b"x").unwrap();
+        assert!(w.finish(Some(&hash_bytes(b"y"))).is_err());
+        let leftovers = fs::read_dir(cas.root().join("tmp")).unwrap().count();
+        assert_eq!(leftovers, 0, "a refused stream leaves nothing behind");
+    }
+
+    #[test]
+    fn a_compressed_file_round_trips_through_the_streaming_decoder() {
+        let dir = tmpdir("zfile");
+        let src = dir.join("app");
+        let payload: Vec<u8> = (0..300_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect();
+        fs::write(&src, &payload).unwrap();
+        let packed = dir.join("app.zst");
+        let (hash, size) = compress_file(&src, &packed).unwrap();
+        assert_eq!(hash, hash_bytes(&payload));
+        assert_eq!(size, payload.len() as u64);
+
+        let mut d = Decompressor::new(Vec::new(), size).unwrap();
+        for chunk in fs::read(&packed).unwrap().chunks(7_000) {
+            d.write(chunk).unwrap();
+        }
+        let (h, n, out) = d.finish().unwrap();
+        assert_eq!((h, n), (hash, size));
+        assert_eq!(out, payload);
+
+        let mut d = Decompressor::new(Vec::new(), size - 1).unwrap();
+        let fed: io::Result<()> = fs::read(&packed)
+            .unwrap()
+            .chunks(7_000)
+            .try_for_each(|c| d.write(c));
+        assert!(fed.is_err() || d.finish().is_err(), "output past the limit is refused");
     }
 }

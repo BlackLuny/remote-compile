@@ -493,6 +493,7 @@ MCP 返回中始终附带 `task_id` 与 `result.kind`，infra_error 附自动重
 | `prepare_env` | `dockerfile` 或 `image`, `project`, `reason?` | `{env_id, status}` | 异步，永不阻塞 |
 | `get_env_status` | `env_id` | 构建进度/健康度 | |
 | `list_workers` | - | 资源池概况 | 诊断用 |
+| `fetch_artifacts` | `task_id`, `paths?`, `dest?` | 写入路径 + 大小 | 下载 build 产物（仅清单进上下文），见 proposals/build-artifacts.md |
 
 错误约定：控制面不可达时明确报错并**建议 agent 本地执行** `cargo check`，不假装成功、不无限重试。
 
@@ -617,6 +618,7 @@ service WorkerApi {          // worker → server 长连接
 | 27 | 断连取消任务 vs 异步轮询承诺矛盾 | 断连不取消，仅 pending TTL 兜底；agent_session 为持久稳定标识（§5.2/§5.3） |
 | 28 | 高频心跳写爆 SQLite 单写者 | 心跳驻内存，落库低频 + rollup 批量（§15.1） |
 | 29 | submodule 内容被 ls-files 跳过 → 远程缺文件 | 递归枚举子模块，内容走 L2 CAS 同步，CAS 去重兜底（§4.3） |
+| 30 | 产物回传时 host 跟随 volume 内 symlink → 读出 worker 主机文件 | 在第二个沙箱内 `cp -L` 解引用，host 侧只收普通文件（proposals/build-artifacts.md §4） |
 
 ## 18. 存储 Schema（rc-server, SQLite v0）
 

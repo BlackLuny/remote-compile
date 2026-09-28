@@ -71,6 +71,18 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE tasks ADD COLUMN units_seen_total INTEGER NOT NULL DEFAULT 0;",
     // Intent scope hash for supersede/delta isolation (intent-and-query-surface §3.7).
     "ALTER TABLE tasks ADD COLUMN scope_hash TEXT NOT NULL DEFAULT '';",
+    // Build artifacts (build-artifacts §6). Held apart from task_blob_refs,
+    // which lives as long as the task row does; these expire on their own.
+    "CREATE TABLE IF NOT EXISTS task_artifacts (
+       task_id    TEXT NOT NULL,
+       path       TEXT NOT NULL,
+       hash       TEXT NOT NULL,
+       size       INTEGER NOT NULL DEFAULT 0,
+       expires_at INTEGER NOT NULL,
+       PRIMARY KEY (task_id, path)
+     );
+     CREATE INDEX IF NOT EXISTS idx_task_artifacts_hash ON task_artifacts(hash);
+     CREATE INDEX IF NOT EXISTS idx_task_artifacts_expiry ON task_artifacts(expires_at);",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -1669,6 +1681,7 @@ impl Store {
             "SELECT b.hash, b.size, b.last_used, b.pinned FROM cas_blobs b
              WHERE b.pinned = 0 AND b.last_used < ?1
                AND NOT EXISTS (SELECT 1 FROM task_blob_refs r WHERE r.hash = b.hash)
+               AND NOT EXISTS (SELECT 1 FROM task_artifacts a WHERE a.hash = b.hash)
              ORDER BY b.last_used ASC LIMIT ?2",
         )?;
         let rows = stmt
@@ -1682,6 +1695,103 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn insert_task_artifacts(
+        &self,
+        task_id: &str,
+        rows: &[(String, String, i64)],
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let expires = now_secs() + ttl_secs;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for (path, hash, size) in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO task_artifacts (task_id, path, hash, size, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![task_id, path, hash, size, expires],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `(path, hash)` of a task's artifacts that have not expired.
+    pub fn live_task_artifacts(&self, task_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path, hash FROM task_artifacts WHERE task_id = ?1 AND expires_at > ?2
+             ORDER BY path",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id, now_secs()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A cache hit answers with another task's artifacts under its own id, and
+    /// asking for them again is a reason to keep them a while longer.
+    pub fn copy_task_artifacts(&self, from: &str, to: &str, ttl_secs: i64) -> Result<()> {
+        let now = now_secs();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_artifacts (task_id, path, hash, size, expires_at)
+             SELECT ?2, path, hash, size, ?3 FROM task_artifacts
+             WHERE task_id = ?1 AND expires_at > ?4",
+            params![from, to, now + ttl_secs, now],
+        )?;
+        Ok(())
+    }
+
+    /// Drop expired artifact rows and return the blobs nothing else holds, so
+    /// GC can reclaim them now instead of after the ordinary cold-blob TTL —
+    /// which is sized for source files, not for release binaries.
+    ///
+    /// A blob touched within `grace_secs` is left alone, rows included, and
+    /// looked at again next round: a running task may have just uploaded the
+    /// same bytes (a reproducible build compresses to the same hash) and not
+    /// yet recorded its own row.
+    pub fn expire_task_artifacts(&self, grace_secs: i64) -> Result<Vec<(String, i64)>> {
+        let now = now_secs();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let expired: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT hash, size FROM task_artifacts WHERE expires_at <= ?1",
+            )?;
+            let out = stmt
+                .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out
+        };
+        let mut orphaned = Vec::new();
+        for (hash, size) in expired {
+            let recent: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM cas_blobs WHERE hash = ?1 AND last_used > ?2)",
+                params![hash, now - grace_secs],
+                |r| r.get(0),
+            )?;
+            if recent {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM task_artifacts WHERE hash = ?1 AND expires_at <= ?2",
+                params![hash, now],
+            )?;
+            let held: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM task_artifacts WHERE hash = ?1)
+                     OR EXISTS (SELECT 1 FROM task_blob_refs WHERE hash = ?1)
+                     OR EXISTS (SELECT 1 FROM cas_blobs WHERE hash = ?1 AND pinned > 0)",
+                params![hash],
+                |r| r.get(0),
+            )?;
+            if !held {
+                orphaned.push((hash, size));
+            }
+        }
+        tx.commit()?;
+        Ok(orphaned)
     }
 
     pub fn forget_blob(&self, hash: &str) -> Result<()> {

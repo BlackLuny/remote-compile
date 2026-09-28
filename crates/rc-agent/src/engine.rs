@@ -60,6 +60,19 @@ fn project_of(task_id: &str) -> Option<String> {
     task_projects().lock().ok().and_then(|m| m.get(task_id).cloned())
 }
 
+/// project_id → the local root it was checked from, so `fetch_artifacts` has
+/// somewhere sensible to put things when the caller names no destination.
+fn project_roots() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static STATE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_project_root(project_id: &str, root: &Path) {
+    if let Ok(mut m) = project_roots().lock() {
+        m.insert(project_id.to_string(), root.to_path_buf());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CheckRequest {
     pub path: String,
@@ -73,6 +86,9 @@ pub struct CheckRequest {
     pub no_remediate: bool,
     /// Baseline for diagnostic delta: auto | none | last_success | <task_id>
     pub baseline: String,
+    /// Per-call artifact paths (build-artifacts §3); `"auto"` selects the
+    /// workspace executables. Overrides the repository's `[artifacts]`.
+    pub artifacts: Vec<String>,
 }
 
 /// What the agent is told. Deliberately three tiers: a verdict, a short
@@ -262,7 +278,10 @@ impl Engine {
         // pre-approval failure for a day, which is the exact bug this is here to
         // prevent. The server's cache still answers — it folds the grant into
         // its own key — so the cost is one round trip, not a rebuild.
-        let local_cache = local_cache_allowed(&egress_hosts);
+        // Artifacts live on the control plane with a TTL; a local verdict can
+        // outlive them and point at blobs that are gone.
+        let local_cache = local_cache_allowed(&egress_hosts)
+            && !rc_core::artifacts::is_declared(profile_pb.artifacts.as_ref());
         let results = ResultCache::open(&self.cfg.results_path())?;
         if !req.no_cache && local_cache {
             if let Some((task_id, kind, cached)) =
@@ -373,6 +392,7 @@ impl Engine {
                 ));
             }
         }
+        remember_project_root(&project_id, &root);
         // Register for async rememediation / cancel ownership (R5/R6).
         // first_env is the full effective env written into the profile (R5').
         if !handle.task_id.is_empty() {
@@ -1147,6 +1167,16 @@ impl Engine {
         if let Some(cmd) = &req.command {
             explicit.tasks.insert(req.task.as_str().to_string(), cmd.clone());
         }
+        if !req.artifacts.is_empty() {
+            let auto = req.artifacts.iter().any(|a| a == "auto");
+            let paths: Vec<String> =
+                req.artifacts.iter().filter(|a| *a != "auto").cloned().collect();
+            explicit.artifacts = Some(rc_core::artifacts::ArtifactsConfig {
+                paths: Some(paths),
+                auto: Some(auto),
+                max_total_mb: None,
+            });
+        }
         layers.push((ProfileSource::Explicit, explicit));
 
         // Repo config: versioned, reviewable, travels with the branch (§3.2).
@@ -1360,6 +1390,73 @@ impl Engine {
             })
             .await?;
         Ok(hash)
+    }
+
+    /// Download a task's artifacts to disk and say where they went. Nothing
+    /// but paths and sizes comes back: binaries do not belong in a context
+    /// window (build-artifacts §7).
+    pub async fn fetch_artifacts(
+        &self,
+        task_id: &str,
+        only: &[String],
+        dest: Option<&str>,
+    ) -> Result<String> {
+        let mut client = self.client().await?;
+        let status = client.get_task(task_id, 0).await?;
+        let result = status
+            .result
+            .ok_or_else(|| anyhow!("任务 {task_id} 还没有结果（状态 {}）", status.status))?;
+        if result.artifacts.is_empty() {
+            let why = if result.artifacts_note.is_empty() {
+                "该任务没有产物：只有声明了 artifacts 的 build/custom 任务才会回传".to_string()
+            } else {
+                format!("该任务没有产物：{}", result.artifacts_note.replace('\n', "; "))
+            };
+            return Err(anyhow!(why));
+        }
+        let dest = match dest {
+            Some(d) if !d.is_empty() => PathBuf::from(d),
+            _ => {
+                let root = project_of(task_id)
+                    .and_then(|p| project_roots().lock().ok().and_then(|m| m.get(&p).cloned()))
+                    .ok_or_else(|| {
+                        anyhow!("不知道任务 {task_id} 属于哪个本地目录（本进程没有提交过它）；请传 dest")
+                    })?;
+                root.join("target").join("remote").join(task_id)
+            }
+        };
+        let wanted: Vec<&pb::Artifact> = result
+            .artifacts
+            .iter()
+            .filter(|a| only.is_empty() || only.contains(&a.path))
+            .collect();
+        if wanted.is_empty() {
+            return Err(anyhow!(
+                "没有匹配的产物；可选: {}",
+                result.artifacts.iter().map(|a| a.path.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+
+        let mut lines = Vec::new();
+        let mut total = 0u64;
+        for a in wanted {
+            // The path came over the wire and is about to name a file here.
+            if !rc_core::artifacts::is_safe_relative(&a.path) {
+                return Err(anyhow!("拒绝不安全的产物路径: {:?}", a.path));
+            }
+            let target = dest.join(&a.path);
+            client
+                .fetch_artifact(task_id, a, &target)
+                .await
+                .with_context(|| format!("下载 {}", a.path))?;
+            total += a.size;
+            lines.push(format!("  {} ({})", target.display(), human_bytes(a.size)));
+        }
+        let mut text = format!("✓ 已写入 {} 个产物 ({})：\n{}", lines.len(), human_bytes(total), lines.join("\n"));
+        if !result.artifact_target.is_empty() {
+            text.push_str(&format!("\n仅可在此平台运行: {}", result.artifact_target));
+        }
+        Ok(text)
     }
 
     pub async fn get_log(&self, query: pb::LogQuery) -> Result<pb::LogChunk> {
@@ -1624,6 +1721,32 @@ fn shellexpand_home(path: &str) -> String {
 ///
 /// When `result.verdict` is present, the headline and agent hint are driven by
 /// attribution; otherwise the legacy `kind` path is kept for old results.
+/// The artifact manifest — names and sizes only; the bytes stay on the
+/// control plane until `fetch_artifacts` asks for them (§1.1).
+fn render_artifacts(task_id: &str, result: &pb::TaskResult) -> String {
+    let mut out = String::new();
+    if !result.artifacts.is_empty() {
+        let total: u64 = result.artifacts.iter().map(|a| a.size).sum();
+        let names: Vec<&str> = result.artifacts.iter().take(8).map(|a| a.path.as_str()).collect();
+        let more = result.artifacts.len().saturating_sub(names.len());
+        out.push_str(&format!(
+            "产物 {} 个 ({})：{}{}\n  → fetch_artifacts(task_id=\"{task_id}\") 下载到本地\n",
+            result.artifacts.len(),
+            human_bytes(total),
+            names.join(", "),
+            if more > 0 { format!(" 等另 {more} 个") } else { String::new() },
+        ));
+        if !result.artifact_target.is_empty() {
+            out.push_str(&format!("  仅可在此平台运行: {}\n", result.artifact_target));
+        }
+    }
+    if !result.artifacts_note.is_empty() {
+        let lines: Vec<&str> = result.artifacts_note.lines().take(6).collect();
+        out.push_str(&format!("⚠ 产物: {}\n", lines.join("; ")));
+    }
+    out
+}
+
 pub fn format_result(
     task_id: &str,
     result: &pb::TaskResult,
@@ -1774,6 +1897,8 @@ pub fn format_result(
             }
         }
     }
+
+    out.push_str(&render_artifacts(task_id, result));
 
     if let Some(delta) = &result.diag_delta {
         let block = rc_core::delta::render_delta(delta, max_diagnostics);
@@ -2243,5 +2368,30 @@ mod tests {
     fn a_missing_path_says_so_plainly() {
         let err = resolve_root("/definitely/not/here").unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn artifacts_render_as_a_manifest_never_as_content() {
+        let result = pb::TaskResult {
+            kind: "success".into(),
+            summary: "success".into(),
+            artifacts: vec![pb::Artifact {
+                path: "target/release/app".into(),
+                size: 3 * 1024 * 1024,
+                ..Default::default()
+            }],
+            artifact_target: "x86_64-linux; image rust@sha256:x".into(),
+            artifacts_note: "not found: dist/*".into(),
+            ..Default::default()
+        };
+        let text = format_result("t-1", &result, 10, false, 0);
+        assert!(text.contains("产物 1 个"), "{text}");
+        assert!(text.contains("target/release/app"), "{text}");
+        assert!(text.contains("fetch_artifacts(task_id=\"t-1\")"), "{text}");
+        assert!(text.contains("x86_64-linux"), "{text}");
+        assert!(text.contains("not found: dist/*"), "{text}");
+
+        let plain = format_result("t-2", &pb::TaskResult { kind: "success".into(), ..Default::default() }, 10, false, 0);
+        assert!(!plain.contains("产物"), "{plain}");
     }
 }

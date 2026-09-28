@@ -296,6 +296,47 @@ impl Runner {
         );
         let (top, truncated) = rc_core::diag::top_diagnostics(&diagnostics, 50);
 
+        // Artifacts only for a build that worked: a failed one's outputs are
+        // stale leftovers from the last success, and shipping them would pass
+        // an old binary off as this code (build-artifacts §4).
+        let mut artifacts = Vec::new();
+        let mut artifact_notes = Vec::new();
+        let mut artifacts_incomplete = false;
+        let declared = rc_core::artifacts::is_declared(profile.artifacts.as_ref());
+        if declared && classification.kind == rc_core::ResultKind::Success {
+            let _ = events
+                .send(client::progress_event(&task_id, "uploading", "collecting artifacts"))
+                .await;
+            match self
+                .collect_artifacts(&assignment, &profile, &root, &output, client)
+                .await
+            {
+                Ok((a, notes)) => {
+                    artifacts = a;
+                    artifact_notes = notes;
+                }
+                Err(e) => {
+                    // Not the code's fault, and possibly transient: the result
+                    // must not be cached as "this build has no artifacts".
+                    tracing::warn!(task = %task_id, error = %e, "artifact collection failed");
+                    artifact_notes.push(format!("collection failed: {e:#}"));
+                    artifacts_incomplete = true;
+                }
+            }
+        } else if declared {
+            artifact_notes.push("not collected: the build did not succeed".into());
+        }
+        let artifact_target = if declared {
+            let target = if profile.target.is_empty() {
+                format!("{}-linux (dynamically linked against the image's libc)", self.cfg.arch())
+            } else {
+                profile.target.clone()
+            };
+            format!("{target}; image {}", profile.image)
+        } else {
+            String::new()
+        };
+
         let _ = events
             .send(client::progress_event(&task_id, "uploading", "storing build log"))
             .await;
@@ -345,11 +386,189 @@ impl Runner {
                     },
                     scope_hash: assignment.scope_hash.clone(),
                 }),
+                artifacts,
+                artifacts_note: rc_core::artifacts::cap_notes(artifact_notes).join("\n"),
+                artifact_target,
+                artifacts_incomplete,
             }),
             log_blob,
             log_lines: combined.lines().count() as u64,
             missing_blobs: vec![],
         })
+    }
+
+    /// Copy the declared outputs out of a second, short-lived sandbox and
+    /// upload them. The copy happens inside the container so that symlinks
+    /// resolve there, never on this host (build-artifacts §4).
+    async fn collect_artifacts(
+        &self,
+        assignment: &TaskAssignment,
+        profile: &pb::ResolvedProfile,
+        root: &Path,
+        output: &docker::RunOutput,
+        client: &mut ServerClient,
+    ) -> Result<(Vec<pb::Artifact>, Vec<String>)> {
+        use rc_core::artifacts as art;
+        let spec = art::normalize(profile.artifacts.as_ref().ok_or_else(|| anyhow!("no artifact spec"))?)
+            .map_err(|e| anyhow!(e))?;
+        let cache = rc_core::adapter::for_name(&profile.adapter).cache_config(profile);
+        let target = cache.target_mount.clone();
+
+        let mut notes = Vec::new();
+        let mut patterns: Vec<String> = spec
+            .paths
+            .iter()
+            .map(|p| art::container_pattern(p, target.as_deref()))
+            .collect();
+        if spec.auto {
+            match &target {
+                Some(t) => {
+                    let exes = art::cargo_executables(&output.stdout, t);
+                    if exes.is_empty() {
+                        notes.push("auto: the build reported no workspace executables".into());
+                    }
+                    patterns.extend(exes);
+                }
+                None => notes.push("auto: this adapter has no cargo target dir; ignored".into()),
+            }
+        }
+        patterns.sort();
+        patterns.dedup();
+        if patterns.is_empty() {
+            return Ok((Vec::new(), notes));
+        }
+
+        let scratch = self
+            .cfg
+            .artifacts_dir()
+            .join(docker::container_name(&assignment.task_id));
+        crate::artifacts::remove_scratch(&scratch);
+        let result = self
+            .collect_into(&scratch, assignment, profile, root, &spec, &patterns, target, client)
+            .await;
+        crate::artifacts::remove_scratch(&scratch);
+        let (artifacts, more) = result?;
+        notes.extend(more);
+        Ok((artifacts, notes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_into(
+        &self,
+        scratch: &Path,
+        assignment: &TaskAssignment,
+        profile: &pb::ResolvedProfile,
+        root: &Path,
+        spec: &pb::ArtifactSpec,
+        patterns: &[String],
+        target: Option<String>,
+        client: &mut ServerClient,
+    ) -> Result<(Vec<pb::Artifact>, Vec<String>)> {
+        use rc_core::artifacts as art;
+        let out = scratch.join("out");
+        let list = scratch.join("list");
+        let packed_dir = scratch.join("packed");
+        std::fs::create_dir_all(&out)?;
+        std::fs::create_dir_all(&packed_dir)?;
+        std::fs::write(&list, format!("{}\n", patterns.join("\n")))?;
+        let max_bytes = u64::from(spec.max_total_mb) * 1024 * 1024;
+
+        let mut volumes = Vec::new();
+        if let Some(mount) = &target {
+            volumes.push((docker::target_volume(&assignment.worktree_id), mount.clone()));
+        }
+        let run = RunSpec {
+            name: docker::container_name(&format!("{}-collect", assignment.task_id)),
+            image: self.sandbox.ensure_image(&profile.image).await?,
+            command: art::collect_script(target.as_deref()),
+            workspace: root.to_path_buf(),
+            env: vec![
+                format!("RC_ARTIFACT_MAX_BYTES={max_bytes}"),
+                "HOME=/rc/home".to_string(),
+                "TERM=dumb".to_string(),
+            ],
+            volumes,
+            binds: vec![
+                (out.clone(), art::OUT_MOUNT.to_string(), false),
+                (list, art::LIST_MOUNT.to_string(), true),
+            ],
+            workdir: subproject_workdir(&assignment_anchor(assignment), &profile.path)?,
+            timeout_secs: 300,
+            memory_mb: self.cfg.memory_mb,
+            cpus: self.cfg.cpus,
+            pids_limit: self.cfg.pids_limit,
+            network: Network::None,
+            labels: HashMap::from([
+                (docker::LABEL_TASK.to_string(), assignment.task_id.clone()),
+                (docker::LABEL_WORKTREE.to_string(), assignment.worktree_id.clone()),
+                (docker::LABEL_PROJECT.to_string(), assignment.project_id.clone()),
+            ]),
+            progress: None,
+        };
+        // Belt and braces for the script's own byte cap: the image's tools are
+        // approved, not proven, and `/rc/out` is this host's disk. Anything
+        // writing well past the budget is killed where it stands.
+        let watchdog = {
+            let sandbox = self.sandbox.clone();
+            let name = run.name.clone();
+            let out = out.clone();
+            let limit = max_bytes + 16 * 1024 * 1024;
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+                loop {
+                    tick.tick().await;
+                    let dir = out.clone();
+                    let used = tokio::task::spawn_blocking(move || crate::artifacts::usage(&dir))
+                        .await
+                        .unwrap_or(0);
+                    if used > limit {
+                        let _ = sandbox.kill(&name).await;
+                        return true;
+                    }
+                }
+            })
+        };
+        let ran = self.sandbox.run(&run).await;
+        watchdog.abort();
+        let tripped = matches!(watchdog.await, Ok(true));
+        if tripped {
+            return Err(anyhow!("collect step wrote past its {} MB budget and was killed", spec.max_total_mb));
+        }
+        let ran = ran?;
+        let mut notes = art::collect_notes(&ran.stdout);
+        if ran.timed_out {
+            notes.push("collect step timed out".into());
+        } else if ran.exit_code != 0 {
+            notes.push(format!("collect step exited {}", ran.exit_code));
+        }
+
+        let (found, more) = crate::artifacts::gather(&out, art::MAX_FILES, max_bytes)?;
+        notes.extend(more);
+        let mut artifacts = Vec::with_capacity(found.len());
+        for (i, f) in found.into_iter().enumerate() {
+            let packed = packed_dir.join(i.to_string());
+            let src = f.path.clone();
+            let dst = packed.clone();
+            let (content_hash, size, blob, compressed_size) =
+                tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                    let (content_hash, size) = rc_core::cas::compress_file(&src, &dst)?;
+                    let blob = rc_core::cas::hash_file(&dst)?;
+                    let compressed = std::fs::metadata(&dst)?.len();
+                    Ok((content_hash, size, blob, compressed))
+                })
+                .await??;
+            client.put_blob_file(&packed, &blob).await?;
+            let _ = std::fs::remove_file(&packed);
+            artifacts.push(pb::Artifact {
+                path: f.rel,
+                blob,
+                size,
+                compressed_size,
+                mode: f.mode,
+                content_hash,
+            });
+        }
+        Ok((artifacts, notes))
     }
 
     async fn run_build(

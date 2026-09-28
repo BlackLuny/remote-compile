@@ -1,6 +1,7 @@
 //! rc-worker — a Linux compile machine that executes untrusted agent code in
 //! a Docker sandbox and reports structured results back to the control plane.
 
+mod artifacts;
 mod client;
 mod config;
 mod docker;

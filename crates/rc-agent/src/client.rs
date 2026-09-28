@@ -159,6 +159,71 @@ impl AgentClient {
             .into_inner())
     }
 
+    /// Stream one artifact to `dest`, decompressing and hashing as it lands.
+    /// Written beside the destination and renamed into place only once the
+    /// content checks out, so a failed download never leaves a half file
+    /// where a binary is expected.
+    pub async fn fetch_artifact(
+        &mut self,
+        task_id: &str,
+        artifact: &Artifact,
+        dest: &std::path::Path,
+    ) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = dest
+            .parent()
+            .ok_or_else(|| anyhow!("no parent directory for {}", dest.display()))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = parent.join(format!(
+            ".{}.rc-partial",
+            dest.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        ));
+        // Removes the partial file on every exit but success — including the
+        // MCP call being dropped mid-download, which no error path sees.
+        struct Partial(std::path::PathBuf, bool);
+        impl Drop for Partial {
+            fn drop(&mut self) {
+                if !self.1 {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+        }
+        let mut guard = Partial(tmp.clone(), false);
+        let result: Result<()> = async {
+            let mut stream = self
+                .inner
+                .fetch_artifact(self.authed(ArtifactQuery {
+                    task_id: task_id.to_string(),
+                    path: artifact.path.clone(),
+                }))
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            let file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+            let mut decoder = cas::Decompressor::new(file, artifact.size)?;
+            while let Some(chunk) = stream.message().await.map_err(status_error)? {
+                decoder.write(&chunk.data)?;
+            }
+            let (hash, size, file) = decoder.finish()?;
+            if hash != artifact.content_hash || size != artifact.size {
+                return Err(anyhow!(
+                    "内容校验失败: 期望 {} ({} B)，实得 {hash} ({size} B)",
+                    artifact.content_hash,
+                    artifact.size
+                ));
+            }
+            let file = file.into_inner().map_err(|e| anyhow!(e.to_string()))?;
+            file.sync_all()?;
+            let mode = if artifact.mode == 0 { 0o644 } else { artifact.mode & 0o777 };
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+            std::fs::rename(&tmp, dest)?;
+            Ok(())
+        }
+        .await;
+        guard.1 = result.is_ok();
+        result
+    }
+
     pub async fn cancel_task(&mut self, task_id: &str, project_id: &str) -> Result<CancelTaskResp> {
         Ok(self
             .inner

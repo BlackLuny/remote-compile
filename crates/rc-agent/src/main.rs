@@ -55,6 +55,13 @@ enum Command {
         /// Override the default command (same as MCP `command`).
         #[arg(long)]
         command: Option<String>,
+        /// Ship a build output back (repeatable; `auto` = every workspace
+        /// executable). Overrides `[artifacts]` in .remote-compile.toml.
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+        /// Download the artifacts into this directory once the build is done.
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -117,6 +124,8 @@ fn main() -> Result<()> {
             wait_secs,
             no_cache,
             command,
+            artifacts,
+            out,
         } => {
             let cfg = AgentConfig::load_or_create()?;
             let engine = Engine::new(cfg);
@@ -129,8 +138,18 @@ fn main() -> Result<()> {
                 env: Default::default(),
                 no_remediate: false,
                 baseline: "auto".into(),
+                artifacts,
             }))?;
             println!("{}", outcome.text);
+            if let Some(dir) = out.filter(|_| outcome.kind == Some(rc_core::ResultKind::Success)) {
+                match rt.block_on(engine.fetch_artifacts(&outcome.task_id, &[], Some(&dir))) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => {
+                        eprintln!("artifact download failed: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             // Some outcomes never became a task at all — nothing was submitted,
             // so there is nothing to poll and no task id to offer.
             let no_task = outcome.task_id.is_empty();

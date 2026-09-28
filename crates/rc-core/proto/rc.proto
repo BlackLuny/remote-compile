@@ -59,6 +59,27 @@ message ResolvedProfile {
   string toolchain = 10;
   string canonical = 11;       // canonical text form; hashed into the fingerprint
   string source = 12;          // explicit | repo | server | detected
+  // Build outputs to ship back (docs/proposals/build-artifacts.md). Absent
+  // means none, and leaves the canonical form byte-identical to before.
+  ArtifactSpec artifacts = 13;
+}
+
+message ArtifactSpec {
+  // Relative to the sub-project directory; a leading `target/` means the
+  // build's CARGO_TARGET_DIR. Globs are expanded inside the sandbox.
+  repeated string paths = 1;
+  // Rust: every executable a workspace member produced (compiler-artifact).
+  bool auto = 2;
+  uint32 max_total_mb = 3;     // 0 = default
+}
+
+message Artifact {
+  string path = 1;             // relative, `/`-separated
+  string blob = 2;             // CAS hash of the zstd-compressed content
+  uint64 size = 3;             // uncompressed
+  uint64 compressed_size = 4;
+  uint32 mode = 5;             // permission bits
+  string content_hash = 6;     // blake3 of the uncompressed content
 }
 
 message Diagnostic {
@@ -201,6 +222,15 @@ message TaskResult {
   DiagDelta diag_delta = 14;
   // Execution receipt: what actually ran (intent-and-query-surface §5).
   EffectivePlan effective_plan = 15;
+  repeated Artifact artifacts = 16;
+  // Why fewer artifacts came back than were declared (missing, over limit).
+  string artifacts_note = 17;
+  // Where the artifacts can run: target triple and image.
+  string artifact_target = 18;
+  // Artifacts were declared but not all could be delivered for a reason
+  // unrelated to the code (upload failure, blob lost). Such a result is never
+  // served from cache: rebuilding may well produce them.
+  bool artifacts_incomplete = 19;
 }
 
 message Empty {}
@@ -355,6 +385,11 @@ message LogChunk {
   string empty_reason = 11;      // "no_log" | "no_match" | ""
 }
 
+message ArtifactQuery {
+  string task_id = 1;
+  string path = 2;
+}
+
 message CancelTaskReq {
   string task_id = 1;
   string agent_session = 2;
@@ -473,6 +508,7 @@ service AgentApi {
   rpc GetEnvStatus(EnvQuery) returns (EnvStatus);
   rpc ListWorkers(Empty) returns (ListWorkersResp);
   rpc CancelTask(CancelTaskReq) returns (CancelTaskResp);
+  rpc FetchArtifact(ArtifactQuery) returns (stream BlobChunk);
 }
 
 // ============================ worker api ============================

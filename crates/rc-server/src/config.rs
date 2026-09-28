@@ -80,6 +80,15 @@ pub struct Policy {
     /// Master switch for admin mirror actions.
     #[serde(default)]
     pub image_registry_enabled: bool,
+    /// How long build artifacts stay fetchable (build-artifacts §6). Kept
+    /// apart from `blob_gc_ttl_secs`: artifacts are large and rarely shared,
+    /// so they leave as soon as nobody can ask for them.
+    #[serde(default = "default_artifact_ttl")]
+    pub artifact_ttl_secs: i64,
+}
+
+fn default_artifact_ttl() -> i64 {
+    rc_core::artifacts::DEFAULT_TTL_SECS
 }
 
 fn default_registry_prefix() -> String {
@@ -116,6 +125,7 @@ impl Default for Policy {
             image_registry: String::new(),
             image_registry_prefix: default_registry_prefix(),
             image_registry_enabled: false,
+            artifact_ttl_secs: default_artifact_ttl(),
         }
     }
 }

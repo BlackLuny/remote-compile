@@ -120,6 +120,7 @@ impl McpServer {
             "check" => self.tool_check(&args).await?,
             "get_result" => self.tool_get_result(&args).await?,
             "get_log" => self.tool_get_log(&args).await?,
+            "fetch_artifacts" => self.tool_fetch_artifacts(&args).await?,
             "get_diagnostics" => self.tool_get_diagnostics(&args).await?,
             "get_build_profile" => self.tool_build_profile(&args).await?,
             "list_envs" => self.tool_list_envs(&args).await?,
@@ -168,12 +169,23 @@ impl McpServer {
                 .and_then(|v| v.as_str())
                 .unwrap_or("auto")
                 .to_string(),
+            artifacts: string_list(args, "artifacts"),
         };
         self.engine
             .check(req)
             .await
             .map(|o| o.text)
             .map_err(|e| McpError::Tool(e.to_string()))
+    }
+
+    async fn tool_fetch_artifacts(&self, args: &Value) -> Result<String, McpError> {
+        let task_id = required_str(args, "task_id")?;
+        let paths = string_list(args, "paths");
+        let dest = args.get("dest").and_then(|v| v.as_str());
+        self.engine
+            .fetch_artifacts(&task_id, &paths, dest)
+            .await
+            .map_err(|e| McpError::Tool(format!("{e:#}")))
     }
 
     async fn tool_get_result(&self, args: &Value) -> Result<String, McpError> {
@@ -497,6 +509,18 @@ fn format_ago(ts: i64) -> String {
 
 /// §12. Descriptions are written for the agent that will read them: what the
 /// tool does, and when *not* to reach for something else.
+/// A string-array argument; a bare string counts as a list of one.
+fn string_list(args: &Value, key: &str) -> Vec<String> {
+    match args.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -514,9 +538,25 @@ pub fn tool_definitions() -> Vec<Value> {
                     "no_cache": { "type": "boolean", "description": "跳过指纹缓存强制重编，默认 false" },
                     "env": { "type": "object", "description": "请求级环境变量（分层叠加；有 denylist）", "additionalProperties": { "type": "string" } },
                     "no_remediate": { "type": "boolean", "description": "关闭 OOM 自动降配重试，默认 false" },
-                    "baseline": { "type": "string", "description": "诊断增量基线：auto|none|last_success|<task_id>，默认 auto" }
+                    "baseline": { "type": "string", "description": "诊断增量基线：auto|none|last_success|<task_id>，默认 auto" },
+                    "artifacts": { "type": "array", "items": { "type": "string" },
+                                   "description": "仅 task=build：回传的产物路径（相对子项目，target/ 指构建目录，支持 glob）；\"auto\" = 所有 workspace 可执行文件。覆盖 .remote-compile.toml 的 [artifacts]" }
                 },
                 "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "fetch_artifacts",
+            "description": "把 build 任务的产物下载到本地（默认 <项目>/target/remote/<task_id>/），只返回写入路径和大小。\
+                            产物是 Linux 二进制，保留 24h。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "只下载这些（结果里列出的路径）；默认全部" },
+                    "dest": { "type": "string", "description": "目标目录；默认 <项目>/target/remote/<task_id>" }
+                },
+                "required": ["task_id"]
             }
         }),
         json!({
@@ -703,10 +743,11 @@ mod tests {
             "prepare_env",
             "get_env_status",
             "list_workers",
+            "fetch_artifacts",
         ] {
             assert!(names.contains(&expected.to_string()), "missing tool {expected}");
         }
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]

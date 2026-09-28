@@ -128,12 +128,19 @@ impl WorkerConfig {
     pub fn state_dir(&self) -> PathBuf {
         self.data_dir.join("state")
     }
+    /// Per-task scratch for the artifact collect step. Nothing in it outlives
+    /// the task, so whatever a crash left behind is swept at startup.
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.data_dir.join("artifacts")
+    }
     pub fn sccache_dir(&self) -> PathBuf {
         self.data_dir.join("sccache")
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
+        let _ = std::fs::remove_dir_all(self.artifacts_dir());
         for d in [
+            self.artifacts_dir(),
             self.cas_dir(),
             self.work_dir(),
             self.mirror_dir(),
