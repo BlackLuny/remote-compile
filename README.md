@@ -69,6 +69,24 @@ sudo -u rc-server /usr/local/bin/rc-server --data-dir /var/lib/rc-server agent-t
 rc-agent configure --server http://<control-plane>:7701 --token <agent-token>
 ```
 
+### Agents behind an outbound proxy
+
+The agent honors `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY`
+(and their lowercase forms). HTTP and HTTPS proxy URLs use HTTP CONNECT;
+`NO_PROXY` keeps matching destinations on the direct path. Origin TLS
+certificate and hostname verification remain enabled inside the tunnel.
+An HTTPS proxy also has its certificate verified using the native trust store.
+Unsupported proxy schemes and failed CONNECT requests return an error and
+do not fall back to a direct connection. Proxy credentials are sent only in
+the sensitive `Proxy-Authorization` CONNECT header.
+
+```bash
+HTTPS_PROXY=http://your-proxy:8080 rc-agent check /path/to/repo
+```
+
+The agent allows 30 seconds for proxy connection establishment, including
+CONNECT and origin TLS; direct connections retain the five-second timeout.
+
 ### Upgrade
 
 Same install scripts replace the binary and restart the unit; **data dirs and

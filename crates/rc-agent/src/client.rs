@@ -19,9 +19,7 @@ pub struct AgentClient {
 
 impl AgentClient {
     pub async fn connect(server: &str, token: &str) -> Result<Self> {
-        let channel = rc_core::transport::endpoint(server)?
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .connect()
+        let channel = crate::transport::connect(server)
             .await
             .map_err(|e| unreachable_error(server, e))?;
         Ok(AgentClient {

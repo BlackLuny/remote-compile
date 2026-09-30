@@ -13,6 +13,7 @@ mod index;
 mod mcp;
 mod multiroot;
 mod scanner;
+mod transport;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
