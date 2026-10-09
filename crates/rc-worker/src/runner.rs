@@ -133,6 +133,9 @@ impl Runner {
 
         let root = docker::workspace_dir(&self.cfg.work_dir(), &assignment.worktree_id);
         std::fs::create_dir_all(&root)?;
+        // GC reads "last used" from this mtime, and syncing into subdirectories
+        // does not bump it.
+        touch_dir(&root);
 
         // ---- L1 baseline ----
         let mut baseline_note = String::new();
@@ -618,7 +621,11 @@ impl Runner {
         ]);
         if let Some(mount) = &cache.target_mount {
             let name = docker::target_volume(&assignment.worktree_id);
-            self.sandbox.ensure_volume(&name, labels.clone()).await?;
+            // GC finds volumes by the owner label; without it a target cache
+            // is never reclaimed.
+            let mut vol_labels = docker::Sandbox::base_labels();
+            vol_labels.extend(labels.clone());
+            self.sandbox.ensure_volume(&name, vol_labels).await?;
             volumes.push((name, mount.clone()));
         }
         if let Some(mount) = &cache.rustup_mount {
@@ -1139,6 +1146,12 @@ fn decide_reclaim(
     }
 }
 
+fn touch_dir(dir: &Path) {
+    if let Err(e) = std::fs::File::open(dir).and_then(|f| f.set_modified(std::time::SystemTime::now())) {
+        tracing::warn!(dir = %dir.display(), error = %e, "could not mark workspace as used");
+    }
+}
+
 fn workspace_last_used_secs(dir: &Path) -> i64 {
     std::fs::metadata(dir)
         .and_then(|m| m.modified())
@@ -1438,6 +1451,18 @@ mod tests {
             decide_reclaim("w-idle", 0, 1_000_000, &policy, &protect),
             ReclaimDecision::Reclaim
         );
+    }
+
+    #[test]
+    fn touching_a_workspace_marks_it_used_now() {
+        let dir = std::env::temp_dir().join(format!("rc-touch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        std::fs::File::open(&dir).unwrap().set_modified(old).unwrap();
+        touch_dir(&dir);
+        let age = rc_core::now_secs() - workspace_last_used_secs(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(age < 60, "workspace still looks {age}s idle");
     }
 
     #[test]

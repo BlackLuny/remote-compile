@@ -695,12 +695,28 @@ impl Sandbox {
                 filters: Some(filters),
             }))
             .await?;
-        Ok(list
+        let mut out: Vec<_> = list
             .volumes
             .unwrap_or_default()
             .into_iter()
             .map(|v| (v.name, v.labels))
-            .collect())
+            .collect();
+
+        // Target caches created before they carried the owner label. Labels
+        // are immutable, so match them by worktree label plus our exact name.
+        let filters = HashMap::from([("label".to_string(), vec![LABEL_WORKTREE.to_string()])]);
+        let legacy = self
+            .docker
+            .list_volumes(Some(ListVolumesOptions {
+                filters: Some(filters),
+            }))
+            .await?;
+        for v in legacy.volumes.unwrap_or_default() {
+            if is_legacy_target_volume(&v.name, &v.labels) {
+                out.push((v.name, v.labels));
+            }
+        }
+        Ok(out)
     }
 
     pub async fn remove_volume(&self, name: &str) -> Result<()> {
@@ -782,6 +798,15 @@ pub fn container_name(task_id: &str) -> String {
 
 pub fn target_volume(worktree_id: &str) -> String {
     format!("rc-target-{worktree_id}")
+}
+
+/// A target cache from before the owner label, recognised by its worktree
+/// label and the exact name we would have given it.
+fn is_legacy_target_volume(name: &str, labels: &HashMap<String, String>) -> bool {
+    !labels.contains_key(LABEL_OWNER)
+        && labels
+            .get(LABEL_WORKTREE)
+            .is_some_and(|w| name == target_volume(w))
 }
 
 /// One rustup store for the whole worker: `rust-toolchain.toml` pins differ per
@@ -959,6 +984,18 @@ mod tests {
         assert_eq!(container_name("t-01J8XYZ"), "rc-task-t-01J8XYZ");
         assert_eq!(target_volume("w-abc"), "rc-target-w-abc");
         assert_eq!(registry_volume("p-abc"), "rc-cargo-p-abc");
+    }
+
+    #[test]
+    fn legacy_target_volumes_are_ours_only_by_exact_name() {
+        let wt = |w: &str| HashMap::from([(LABEL_WORKTREE.to_string(), w.to_string())]);
+        assert!(is_legacy_target_volume("rc-target-w-abc", &wt("w-abc")));
+        assert!(!is_legacy_target_volume("someone-elses", &wt("w-abc")));
+        assert!(!is_legacy_target_volume("rc-target-w-abc", &wt("w-other")));
+        let mut owned = wt("w-abc");
+        owned.insert(LABEL_OWNER.to_string(), OWNER_VALUE.to_string());
+        // Already listed by the owner-label query; must not appear twice.
+        assert!(!is_legacy_target_volume("rc-target-w-abc", &owned));
     }
 
     #[test]
