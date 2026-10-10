@@ -124,6 +124,10 @@ impl AgentConfig {
         self.cache_root().join("cas_known.sqlite")
     }
 
+    pub fn submitted_path(&self) -> PathBuf {
+        self.cache_root().join("submitted.sqlite")
+    }
+
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(self.cache_root().join("indexes"))?;
         Ok(())

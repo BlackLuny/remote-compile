@@ -665,16 +665,20 @@ impl Store {
         Ok(())
     }
 
-    pub fn assign_to_worker(&self, id: &str, worker_id: &str) -> Result<()> {
+    /// `false` when the task reached a terminal state after the dispatcher
+    /// picked it — a cancel landing mid-dispatch must not be turned back into
+    /// a running build (R6').
+    pub fn assign_to_worker(&self, id: &str, worker_id: &str) -> Result<bool> {
         let now = now_ms();
-        self.conn.lock().execute(
+        let n = self.conn.lock().execute(
             "UPDATE tasks SET worker_id = ?2, status = 'running', attempt = attempt + 1,
                  started_at = CASE WHEN started_at = 0 THEN ?3 ELSE started_at END,
                  queue_ms = CASE WHEN queue_ms = 0 THEN ?3 - created_at ELSE queue_ms END
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND status NOT IN ('done','failed','canceled','superseded')",
             params![id, worker_id, now],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Return a task to the queue after an infra failure, remembering which
@@ -692,6 +696,41 @@ impl Store {
             "UPDATE tasks SET status = 'queued', worker_id = ''
              WHERE id = ?1
                AND status NOT IN ('done','failed','canceled','superseded')",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Send a task back to wait for blobs its worker could not fetch (§4.7).
+    /// Unlike `requeue` this records no failed attempt: the worker did nothing
+    /// wrong, and its workspace is the warmest place to resume. Conditional on
+    /// a non-terminal status, so a cancel that already won stays won (R6').
+    pub fn park_for_blobs(&self, id: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET status = 'syncing', worker_id = ''
+             WHERE id = ?1
+               AND status NOT IN ('done','failed','canceled','superseded')",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Tasks `park_for_blobs` set aside. A worker reporting the `syncing`
+    /// phase also leaves a task in `syncing`, but with itself assigned.
+    pub fn blob_parked_tasks(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id FROM tasks WHERE status = 'syncing' AND worker_id = ''")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn resume_parked(&self, id: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET status = 'queued'
+             WHERE id = ?1 AND status = 'syncing' AND worker_id = ''",
             params![id],
         )?;
         Ok(n > 0)
@@ -919,7 +958,10 @@ impl Store {
     pub fn tasks_on_worker(&self, worker_id: &str) -> Result<Vec<TaskRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT * FROM tasks WHERE worker_id = ?1 AND status IN ('running','uploading')",
+            // `syncing` with a worker assigned is that worker fetching the
+            // workspace; a task parked for blobs has no worker and never
+            // matches.
+            "SELECT * FROM tasks WHERE worker_id = ?1 AND status IN ('running','uploading','syncing')",
         )?;
         let rows = stmt
             .query_map(params![worker_id], TaskRow::from_row)?
@@ -989,11 +1031,14 @@ impl Store {
     }
 
     /// After a control-plane restart, anything that was mid-flight has no
-    /// owner: put it back in the queue (§5.3, risk #14).
+    /// owner: put it back in the queue (§5.3, risk #14). A task parked for
+    /// blobs (`syncing`, no worker) is not in flight — it is waiting on the
+    /// agent, and dispatching it again would only fail the same way.
     pub fn reset_inflight_on_boot(&self) -> Result<usize> {
         let n = self.conn.lock().execute(
             "UPDATE tasks SET status = 'queued', worker_id = ''
-             WHERE status IN ('running','uploading','syncing')",
+             WHERE status IN ('running','uploading')
+                OR (status = 'syncing' AND worker_id != '')",
             [],
         )?;
         Ok(n)
@@ -1836,6 +1881,21 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// A worker found these unreachable; stop offering them as bundle bases.
+    pub fn forget_known_commits(&self, project_id: &str, commits: &[String]) -> Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        for c in commits {
+            n += tx.execute(
+                "DELETE FROM project_commits WHERE project_id = ?1 AND commit_sha = ?2",
+                params![project_id, c],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Commits the fleet can already reach — bundle base points (§4.1 step 3).
     pub fn known_commits(&self, project_id: &str, limit: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock();
@@ -2596,6 +2656,21 @@ mod tests {
         assert_eq!(s.reset_inflight_on_boot().unwrap(), 1);
         assert_eq!(s.get_task("t1").unwrap().unwrap().status, "queued");
         assert_eq!(s.get_task("t2").unwrap().unwrap().status, "done");
+    }
+
+    #[test]
+    fn restart_leaves_blob_parked_tasks_waiting_for_their_upload() {
+        let s = store();
+        s.insert_task(&task("t1", "f", "k", "s", "running"), "{}", "{}", "").unwrap();
+        s.assign_to_worker("t1", "w-a").unwrap();
+        assert!(s.park_for_blobs("t1").unwrap());
+        s.insert_task(&task("t2", "f2", "k", "s", "running"), "{}", "{}", "").unwrap();
+        s.assign_to_worker("t2", "w-a").unwrap();
+        s.set_status("t2", "syncing").unwrap();
+        assert_eq!(s.reset_inflight_on_boot().unwrap(), 1, "only the one a worker held");
+        assert_eq!(s.get_task("t1").unwrap().unwrap().status, "syncing");
+        assert_eq!(s.get_task("t2").unwrap().unwrap().status, "queued");
+        assert_eq!(s.blob_parked_tasks().unwrap(), vec!["t1"]);
     }
 
     #[test]

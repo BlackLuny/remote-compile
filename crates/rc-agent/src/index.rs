@@ -233,6 +233,68 @@ impl ResultCache {
     }
 }
 
+/// Tasks this machine submitted, and the project each belongs to. `cancel`
+/// must name the project (mis-cancel protection, §5.5); keeping the mapping on
+/// disk lets a task submitted by one rc-agent process — the CLI, or an MCP
+/// server that has since restarted — be canceled from another.
+pub struct SubmittedTasks {
+    conn: Connection,
+}
+
+pub const SUBMITTED_TTL_SECS: i64 = 7 * 24 * 3600;
+
+impl SubmittedTasks {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Self::init(Connection::open(path)?)
+    }
+
+    #[cfg(test)]
+    pub fn open_memory() -> Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS submitted (
+                task_id    TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                at         INTEGER NOT NULL
+             );",
+        )?;
+        Ok(SubmittedTasks { conn })
+    }
+
+    pub fn record(&self, task_id: &str, project_id: &str) -> Result<()> {
+        let now = rc_core::now_secs();
+        self.conn.execute(
+            "INSERT INTO submitted (task_id, project_id, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(task_id) DO UPDATE SET project_id = ?2, at = ?3",
+            params![task_id, project_id, now],
+        )?;
+        self.conn.execute(
+            "DELETE FROM submitted WHERE at < ?1",
+            params![now - SUBMITTED_TTL_SECS],
+        )?;
+        Ok(())
+    }
+
+    pub fn project_of(&self, task_id: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT project_id FROM submitted WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+}
+
 /// Hashes the control plane confirmed it holds. Purely an optimisation, with a
 /// TTL far shorter than the server's GC window so a stale entry cannot make us
 /// skip a required upload (§4.7).
@@ -475,5 +537,23 @@ mod tests {
     fn the_local_blob_hint_expires_well_before_server_gc() {
         // §4.7: 7 days here vs a 30-day server TTL leaves a wide margin.
         assert!(KNOWN_BLOB_TTL_SECS < 30 * 24 * 3600);
+    }
+
+    #[test]
+    fn a_submitted_task_can_be_traced_back_to_its_project() {
+        let tasks = SubmittedTasks::open_memory().unwrap();
+        tasks.record("t-1", "p-a").unwrap();
+        assert_eq!(tasks.project_of("t-1").as_deref(), Some("p-a"));
+        assert!(tasks.project_of("t-unknown").is_none());
+    }
+
+    #[test]
+    fn two_processes_share_the_submitted_record() {
+        // The CLI submits; the MCP server cancels.
+        let path = std::env::temp_dir()
+            .join(format!("rc-submitted-{}", ulid::Ulid::generate()))
+            .join("submitted.sqlite");
+        SubmittedTasks::open(&path).unwrap().record("t-1", "p-a").unwrap();
+        assert_eq!(SubmittedTasks::open(&path).unwrap().project_of("t-1").as_deref(), Some("p-a"));
     }
 }

@@ -788,10 +788,17 @@ async fn cancel_task(
     }
     app.store.set_status(&id, "canceled").map_err(ApiError::from)?;
     app.store.unpin_task_blobs(&id).map_err(ApiError::from)?;
-    if !task.worker_id.is_empty() {
+    // Re-read: the task may have moved to another worker since the snapshot.
+    let worker_id = app
+        .store
+        .get_task(&id)
+        .map_err(ApiError::from)?
+        .map(|t| t.worker_id)
+        .unwrap_or_default();
+    if !worker_id.is_empty() {
         app.workers
             .send(
-                &task.worker_id,
+                &worker_id,
                 pb::ServerCmd { body: Some(pb::server_cmd::Body::CancelTaskId(id.clone())) },
             )
             .await;

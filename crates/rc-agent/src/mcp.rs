@@ -8,29 +8,60 @@ use crate::engine::{CheckRequest, Engine};
 use rc_core::model::TaskType;
 use rc_core::pb;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::task::{AbortHandle, JoinSet};
 
 pub const SERVER_NAME: &str = "remote-compile";
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
 pub struct McpServer {
     engine: Engine,
+    /// `check` scans and re-indexes the worktree; two at once would only fight
+    /// over the same index. Everything else — polls, logs, cancel — runs
+    /// alongside.
+    check_gate: tokio::sync::Mutex<()>,
 }
 
 impl McpServer {
     pub fn new(engine: Engine) -> Self {
-        McpServer { engine }
+        McpServer { engine, check_gate: tokio::sync::Mutex::new(()) }
     }
 
     /// Read newline-delimited JSON-RPC from stdin, write responses to stdout.
     /// stdout carries protocol only — logs go to stderr, or the transport
     /// breaks.
-    pub async fn run(&self) -> anyhow::Result<()> {
-        let stdin = BufReader::new(tokio::io::stdin());
-        let mut lines = stdin.lines();
-        let mut stdout = tokio::io::stdout();
+    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+        self.serve(BufReader::new(tokio::io::stdin()), tokio::io::stdout())
+            .await
+    }
+
+    /// Requests run concurrently: a `get_result` long-poll must not hold up a
+    /// `cancel` sent after it. A request the client gives up on
+    /// (`notifications/cancelled` — the user pressed Esc) is dropped at once
+    /// and, per the MCP spec, never answered. The remote task is left alone:
+    /// giving up on waiting is not the same as asking to kill the build, and
+    /// `cancel` exists for that.
+    pub async fn serve<R, W>(self: Arc<Self>, reader: R, writer: W) -> anyhow::Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut lines = reader.lines();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let output = tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some(message) = rx.recv().await {
+                write_json(&mut writer, &message).await?;
+            }
+            anyhow::Ok(())
+        });
+        let in_flight: Arc<Mutex<HashMap<String, AbortHandle>>> = Arc::default();
+        let mut running = JoinSet::new();
 
         while let Some(line) = lines.next_line().await? {
+            while running.try_join_next().is_some() {}
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -38,15 +69,50 @@ impl McpServer {
             let request: Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(e) => {
-                    let err = error_response(Value::Null, -32700, &format!("parse error: {e}"));
-                    write_json(&mut stdout, &err).await?;
+                    let _ = tx.send(error_response(Value::Null, -32700, &format!("parse error: {e}")));
                     continue;
                 }
             };
-            if let Some(response) = self.handle(request).await {
-                write_json(&mut stdout, &response).await?;
+            if request.get("method").and_then(|m| m.as_str()) == Some("notifications/cancelled") {
+                let target = request.pointer("/params/requestId").map(|id| id.to_string());
+                if let Some(handle) = target.and_then(|id| lock(&in_flight).remove(&id)) {
+                    handle.abort();
+                }
+                continue;
             }
+            let key = request.get("id").map(|id| id.to_string());
+            let server = self.clone();
+            let tx = tx.clone();
+            let registry = in_flight.clone();
+            let done_key = key.clone();
+            // The task must not finish — and unregister — before it has been
+            // registered, or its entry would never be removed.
+            let (registered, wait_registered) = tokio::sync::oneshot::channel::<()>();
+            let handle = running.spawn(async move {
+                let _ = wait_registered.await;
+                let response = server.handle(request).await;
+                // Unregister before answering, so a cancel arriving after the
+                // answer finds nothing to abort. Only our own entry: a client
+                // that reuses an id must not lose the newer request's handle.
+                if let Some(k) = done_key {
+                    let mut map = lock(&registry);
+                    if map.get(&k).map(|h| h.id()) == Some(tokio::task::id()) {
+                        map.remove(&k);
+                    }
+                }
+                if let Some(response) = response {
+                    let _ = tx.send(response);
+                }
+            });
+            if let Some(k) = key {
+                lock(&in_flight).insert(k, handle);
+            }
+            let _ = registered.send(());
         }
+        // Input closed: finish what was asked, then flush.
+        while running.join_next().await.is_some() {}
+        drop(tx);
+        output.await??;
         Ok(())
     }
 
@@ -65,6 +131,11 @@ impl McpServer {
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
             "tools/call" => self.call_tool(&params).await,
             "ping" => Ok(json!({})),
+            #[cfg(test)]
+            "test/sleep" => {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(json!({}))
+            }
             other => Err(McpError::MethodNotFound(other.to_string())),
         };
 
@@ -119,7 +190,10 @@ impl McpServer {
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let text = match name {
-            "check" => self.tool_check(&args).await?,
+            "check" => {
+                let _gate = self.check_gate.lock().await;
+                self.tool_check(&args).await?
+            }
             "get_result" => self.tool_get_result(&args).await?,
             "get_log" => self.tool_get_log(&args).await?,
             "fetch_artifacts" => self.tool_fetch_artifacts(&args).await?,
@@ -493,7 +567,11 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-async fn write_json(out: &mut tokio::io::Stdout, value: &Value) -> anyhow::Result<()> {
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn write_json<W: AsyncWrite + Unpin>(out: &mut W, value: &Value) -> anyhow::Result<()> {
     let mut line = serde_json::to_string(value)?;
     line.push('\n');
     out.write_all(line.as_bytes()).await?;
@@ -582,7 +660,9 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "cancel",
-            "description": "取消仍在执行的任务（镜像管理端 cancel 路径）。",
+            "description": "取消仍在排队或执行的任务，远端立即停止并释放 worker（镜像管理端 cancel 路径）。\
+                            本机任一 rc-agent 进程（含 CLI）提交的任务都能取消。中断一次工具调用只是不再等待，\
+                            不会停掉远端任务；确定不要这次结果时用这个。",
             "inputSchema": {
                 "type": "object",
                 "properties": { "task_id": { "type": "string" } },
@@ -716,6 +796,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["result"]["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn a_slow_request_does_not_block_the_next_and_can_be_cancelled() {
+        // The bug: one long poll held the transport, so the user's Esc and the
+        // next call both waited for it to run out.
+        let input = [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "test/sleep" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }),
+            json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": { "requestId": 1, "reason": "user pressed Esc" } }),
+        ]
+        .iter()
+        .map(|v| format!("{v}\n"))
+        .collect::<String>();
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let started = std::time::Instant::now();
+        Arc::new(server())
+            .serve(BufReader::new(input.as_bytes()), writer)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "cancel did not stop the sleeper");
+
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut out).await.unwrap();
+        let ids: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].clone())
+            .collect();
+        assert_eq!(ids, vec![json!(2)], "the cancelled request must not be answered");
     }
 
     #[tokio::test]

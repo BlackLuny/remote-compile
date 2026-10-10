@@ -88,7 +88,7 @@ fn main() -> Result<()> {
             let cfg = AgentConfig::load_or_create()?;
             cfg.ensure_dirs()?;
             tracing::info!(server = %cfg.server, session = %cfg.agent_session, "rc-agent MCP server ready");
-            rt.block_on(mcp::McpServer::new(Engine::new(cfg)).run())
+            rt.block_on(std::sync::Arc::new(mcp::McpServer::new(Engine::new(cfg))).run())
         }
         Command::Configure { server, token, new_session } => {
             let mut cfg = AgentConfig::load_or_create()?;

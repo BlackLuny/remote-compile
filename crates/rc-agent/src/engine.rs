@@ -6,7 +6,7 @@ use crate::consent;
 use crate::excludes;
 use crate::multiroot;
 use crate::config::AgentConfig;
-use crate::index::{KnownBlobs, ResultCache, StatIndex};
+use crate::index::{KnownBlobs, ResultCache, StatIndex, SubmittedTasks};
 use crate::scanner::{self, ScanError};
 use anyhow::{anyhow, Context, Result};
 use rc_core::model::TaskType;
@@ -15,7 +15,7 @@ use rc_core::pb;
 use rc_core::profile::{BuildProfile, ProfileSource, Resolution};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct Engine {
     pub cfg: AgentConfig,
@@ -40,6 +40,28 @@ struct RemediateSlot {
     project_id: String,
 }
 
+/// Releases a remediation claim that never became a submitted retry — the
+/// submit failed, or the request was canceled while it was in flight — so a
+/// later poll can try again.
+struct RemediationClaim {
+    task_id: String,
+    held: bool,
+}
+
+impl Drop for RemediationClaim {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let mut m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = m.get_mut(&self.task_id) {
+            if s.retry_task_id.as_deref() == Some("") {
+                s.retry_task_id = None;
+            }
+        }
+    }
+}
+
 fn rem_state() -> &'static Mutex<HashMap<String, RemediateSlot>> {
     static STATE: OnceLock<Mutex<HashMap<String, RemediateSlot>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -58,6 +80,88 @@ fn remember_task_project(task_id: &str, project_id: &str) {
 
 fn project_of(task_id: &str) -> Option<String> {
     task_projects().lock().ok().and_then(|m| m.get(task_id).cloned())
+}
+
+/// Where a submitted task's files live, kept so that a worker's `blob_missing`
+/// report can be answered by uploading them (§4.7).
+struct HealSource {
+    anchor: PathBuf,
+    /// Regular, non-empty files only: nothing else is ever fetched as a blob,
+    /// and a symlink whose target hashes the same must not be read through.
+    entries: Vec<pb::FileEntry>,
+}
+
+impl HealSource {
+    fn new(anchor: &Path, entries: &[pb::FileEntry]) -> Self {
+        HealSource {
+            anchor: anchor.to_path_buf(),
+            entries: entries
+                .iter()
+                .filter(|e| e.r#type == pb::EntryType::EntryFile as i32 && e.size > 0)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// Only recent submissions can still be waiting on anything.
+const HEAL_SOURCES_KEPT: usize = 16;
+
+type HealSources = Mutex<Vec<(String, Arc<HealSource>)>>;
+
+fn heal_sources() -> &'static HealSources {
+    static STATE: OnceLock<HealSources> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn remember_heal_source(task_id: &str, source: Arc<HealSource>) {
+    if let Ok(mut v) = heal_sources().lock() {
+        v.retain(|(id, _)| id != task_id);
+        v.push((task_id.to_string(), source));
+        let excess = v.len().saturating_sub(HEAL_SOURCES_KEPT);
+        v.drain(..excess);
+    }
+}
+
+enum HealState {
+    InProgress,
+    /// `retry_after` is set for a failure: worth another try, just not on
+    /// every poll.
+    Settled { note: String, retry_after: Option<std::time::Instant> },
+}
+
+/// task_id → (park round, what happened to the attempt for it).
+type HealAttempts = Mutex<HashMap<String, (usize, HealState)>>;
+
+fn heal_attempts() -> &'static HealAttempts {
+    static STATE: OnceLock<HealAttempts> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const HEAL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Clears an `InProgress` mark if the attempt never finishes — the MCP
+/// request was canceled or timed out mid-upload — so the next poll tries
+/// again instead of being told someone else is on it, forever.
+struct HealInProgress {
+    task_id: String,
+    round: usize,
+}
+
+impl Drop for HealInProgress {
+    fn drop(&mut self) {
+        let mut attempts = heal_attempts().lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(attempts.get(&self.task_id), Some((r, HealState::InProgress)) if *r == self.round) {
+            attempts.remove(&self.task_id);
+        }
+    }
+}
+
+fn heal_source(task_id: &str) -> Option<Arc<HealSource>> {
+    heal_sources()
+        .lock()
+        .ok()
+        .and_then(|v| v.iter().find(|(id, _)| id == task_id).map(|(_, s)| s.clone()))
 }
 
 /// project_id → the local root it was checked from, so `fetch_artifacts` has
@@ -411,6 +515,11 @@ impl Engine {
                 req.no_remediate,
             );
             remember_task_project(&handle.task_id, &project_id);
+            self.record_submitted(&handle.task_id, &project_id);
+            remember_heal_source(
+                &handle.task_id,
+                Arc::new(HealSource::new(&scan.anchor, &scan.manifest.entries)),
+            );
         }
 
         // Snapshot notices → Critical vs Info for budget slots (R3').
@@ -445,8 +554,14 @@ impl Engine {
 
         // ---- short wait, then hand back a handle (§12) ----
         let wait = req.wait_secs.unwrap_or(self.cfg.default_wait_secs);
-        let status = client.get_task(&handle.task_id, wait).await?;
+        // Subscribing can land on a task already parked for blobs.
+        let (status, heal_note) = self
+            .poll_and_heal(&mut client, &handle.task_id, wait, "auto")
+            .await?;
         let mut outcome = self.render(&status, bytes);
+        if let Some(note) = heal_note {
+            outcome.text = format!("{}\n{note}", outcome.text);
+        }
         outcome.text = attach_notices(outcome.text, &critical_notes, &info_notes);
         if let Some(result) = &status.result {
             // A build that failed *because* an egress approval had not landed
@@ -595,16 +710,21 @@ impl Engine {
         if !rc_core::contract::auto_remediate_allowed(rule) {
             return Ok(None);
         }
+        // Claim the slot before awaiting anything: polls run concurrently, and
+        // two of them seeing the same terminal result must not both submit a
+        // retry. The empty id marks "claimed"; it never matches a real task.
         let mut slot = {
-            let m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
-            m.get(task_id).cloned()
+            let mut m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
+            match m.get_mut(task_id) {
+                Some(s) if !s.no_remediate && s.retry_task_id.is_none() => {
+                    s.retry_task_id = Some(String::new());
+                    s.clone()
+                }
+                _ => return Ok(None),
+            }
         };
-        let Some(ref mut slot) = slot else {
-            return Ok(None);
-        };
-        if slot.no_remediate || slot.retry_task_id.is_some() {
-            return Ok(None);
-        }
+        let slot = &mut slot;
+        let mut claim = RemediationClaim { task_id: task_id.to_string(), held: true };
         slot.first_result = Some(result.clone());
         let task_ty = TaskType::parse_or_default(&slot.submit.task_type);
         // Compare full effective envs (R5'): first_env is profile.env from the
@@ -629,8 +749,14 @@ impl Engine {
         submit.fingerprint.clear();
 
         let handle = client.submit(submit).await?;
+        claim.held = false;
         slot.retry_task_id = Some(handle.task_id.clone());
         remember_task_project(&handle.task_id, &slot.project_id);
+        self.record_submitted(&handle.task_id, &slot.project_id);
+        // Same manifest, so the same files answer a blob_missing report.
+        if let Some(source) = heal_source(task_id) {
+            remember_heal_source(&handle.task_id, source);
+        }
         {
             let mut m = rem_state().lock().unwrap_or_else(|e| e.into_inner());
             m.insert(task_id.to_string(), slot.clone());
@@ -709,9 +835,18 @@ impl Engine {
     }
 
     pub async fn cancel(&self, task_id: &str) -> Result<String> {
-        let project_id = project_of(task_id).ok_or_else(|| {
-            anyhow!("unknown task_id for cancel (must be a task this agent submitted)")
-        })?;
+        // Memory first; then what any rc-agent process on this machine
+        // recorded, so a task submitted from the CLI or before a restart can
+        // still be canceled.
+        let project_id = project_of(task_id)
+            .or_else(|| {
+                SubmittedTasks::open(&self.cfg.submitted_path())
+                    .ok()?
+                    .project_of(task_id)
+            })
+            .ok_or_else(|| {
+                anyhow!("unknown task_id for cancel (must be a task submitted from this machine)")
+            })?;
         let mut client = self.client().await?;
         let resp = client.cancel_task(task_id, &project_id).await?;
         Ok(format!(
@@ -908,8 +1043,13 @@ impl Engine {
         baseline: &str,
     ) -> Result<Outcome> {
         let mut client = self.client().await?;
-        let status = client.get_task_ex(task_id, wait_secs, baseline).await?;
+        let (status, heal_note) = self
+            .poll_and_heal(&mut client, task_id, wait_secs, baseline)
+            .await?;
         let mut outcome = self.render(&status, 0);
+        if let Some(note) = heal_note {
+            outcome.text = format!("{}\n{note}", outcome.text);
+        }
         if let Some(result) = &status.result {
             if rc_core::TaskState::parse_or_default(&status.status).is_terminal() {
                 if let Some(merged) = self
@@ -1300,6 +1440,134 @@ impl Engine {
     }
 
     /// Reconcile and upload the dirty layer (§4.1 L2).
+    fn record_submitted(&self, task_id: &str, project_id: &str) {
+        if let Err(e) = SubmittedTasks::open(&self.cfg.submitted_path())
+            .and_then(|t| t.record(task_id, project_id))
+        {
+            tracing::warn!(task = %task_id, error = %e, "could not record the submitted task");
+        }
+    }
+
+    /// Poll a task, answering a `blob_missing` park on the way (§4.7). Look
+    /// without waiting first: a task parked before the poll began does not end
+    /// the long-poll early, so it has to be answered up front. Then wait, and
+    /// answer a park that happened during the wait.
+    async fn poll_and_heal(
+        &self,
+        client: &mut AgentClient,
+        task_id: &str,
+        wait_secs: u32,
+        baseline: &str,
+    ) -> Result<(pb::TaskStatus, Option<String>)> {
+        let mut status = client.get_task_ex(task_id, 0, baseline).await?;
+        let mut note = self.heal_blob_missing(client, &status).await;
+        let mut refresh = note.is_some();
+        if wait_secs > 0 && !rc_core::TaskState::parse_or_default(&status.status).is_terminal() {
+            status = client.get_task_ex(task_id, wait_secs, baseline).await?;
+            refresh = false;
+            if let Some(n) = self.heal_blob_missing(client, &status).await {
+                note = Some(n);
+                refresh = true;
+            }
+        }
+        if refresh {
+            status = client.get_task_ex(task_id, 0, baseline).await?;
+        }
+        Ok((status, note))
+    }
+
+    /// §4.7 self-heal: a worker could not fetch some of the task's files —
+    /// typically ones the git baseline was meant to provide, from a commit its
+    /// mirror cannot reach. The process that submitted the task still knows
+    /// where they are, and uploading them is all the control plane needs to
+    /// put the task back in the queue. `None` when there was nothing to do.
+    ///
+    /// One attempt per park: a second call for the same round (a concurrent
+    /// poll, or a retry after a failure) gets the first call's answer instead
+    /// of reading and uploading everything again.
+    async fn heal_blob_missing(
+        &self,
+        client: &mut AgentClient,
+        status: &pb::TaskStatus,
+    ) -> Option<String> {
+        if status.missing_blobs.is_empty()
+            || rc_core::TaskState::parse_or_default(&status.status).is_terminal()
+        {
+            return None;
+        }
+        let n = status.missing_blobs.len();
+        let task_id = &status.task_id;
+        let Some(source) = heal_source(task_id) else {
+            return Some(format!(
+                "⚠ worker 缺 {n} 个文件，但它们不是本进程提交的，无法补传。\n\
+                 重新 check(path) 即可（会挂到这个任务上并自动补传），或 cancel(task_id=\"{task_id}\")。"
+            ));
+        };
+        let round = status.timeline.iter().filter(|p| p.phase == "blob_missing").count();
+        {
+            let mut attempts = heal_attempts().lock().unwrap_or_else(|e| e.into_inner());
+            match attempts.get(task_id.as_str()) {
+                Some((r, HealState::InProgress)) if *r == round => {
+                    return Some("⏳ worker 缺文件，本进程另一个调用正在补传。".to_string());
+                }
+                Some((r, HealState::Settled { note, retry_after }))
+                    if *r == round
+                        && retry_after.is_none_or(|t| std::time::Instant::now() < t) =>
+                {
+                    return Some(note.clone());
+                }
+                _ => {}
+            }
+            if attempts.len() >= HEAL_SOURCES_KEPT * 4 {
+                attempts.clear();
+            }
+            attempts.insert(task_id.clone(), (round, HealState::InProgress));
+        }
+        let in_progress = HealInProgress { task_id: task_id.clone(), round };
+        let (note, retry_after) = match self.heal_upload(client, &source, &status.missing_blobs).await {
+            Ok(bytes) => (
+                format!("↻ worker 缺 {n} 个文件，已补传 {}，任务已重新排队。", human_bytes(bytes)),
+                None,
+            ),
+            Err(e) => (
+                format!(
+                    "⚠ worker 缺 {n} 个文件，补传失败：{e}\n\
+                     稍后再 get_result 会重试；文件改过的话重新 check(path)（旧任务会被顶替），\
+                     或 cancel(task_id=\"{task_id}\")。"
+                ),
+                Some(std::time::Instant::now() + HEAL_RETRY_AFTER),
+            ),
+        };
+        heal_attempts().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            task_id.clone(),
+            (round, HealState::Settled { note: note.clone(), retry_after }),
+        );
+        drop(in_progress);
+        Some(note)
+    }
+
+    async fn heal_upload(
+        &self,
+        client: &mut AgentClient,
+        source: &HealSource,
+        missing: &[String],
+    ) -> Result<u64> {
+        let have: std::collections::HashSet<&str> =
+            source.entries.iter().map(|e| e.hash.as_str()).collect();
+        let unsourced = missing.iter().filter(|h| !have.contains(h.as_str())).count();
+        if unsourced > 0 {
+            return Err(anyhow!("其中 {unsourced} 个不在本次提交的文件清单里"));
+        }
+        // Only what the control plane still lacks: someone else may have
+        // supplied part of it already.
+        let still = client
+            .check_blobs(missing.to_vec(), &self.cfg.agent_session)
+            .await?;
+        let mut known = KnownBlobs::open(&self.cfg.cas_known_path())?;
+        self.upload_entries(client, &source.anchor, &source.entries, &still, &mut known)
+            .await
+    }
+
     async fn sync_blobs(
         &self,
         client: &mut AgentClient,
@@ -1331,14 +1599,25 @@ impl Engine {
         hashes: &[String],
         known: &mut KnownBlobs,
     ) -> Result<u64> {
-        use std::collections::HashMap;
+        self.upload_entries(client, &scan.anchor, &scan.manifest.entries, hashes, known)
+            .await
+    }
+
+    async fn upload_entries(
+        &self,
+        client: &mut AgentClient,
+        anchor: &Path,
+        entries: &[pb::FileEntry],
+        hashes: &[String],
+        known: &mut KnownBlobs,
+    ) -> Result<u64> {
         let wanted: std::collections::HashSet<&String> = hashes.iter().collect();
         let mut by_hash: HashMap<String, PathBuf> = HashMap::new();
-        for entry in &scan.manifest.entries {
+        for entry in entries {
             if wanted.contains(&entry.hash) && !by_hash.contains_key(&entry.hash) {
                 // Manifest paths are relative to the anchor, which is the
                 // primary root only when there is nothing else to sync.
-                by_hash.insert(entry.hash.clone(), scan.anchor.join(&entry.path));
+                by_hash.insert(entry.hash.clone(), anchor.join(&entry.path));
             }
         }
 
@@ -2064,6 +2343,42 @@ mod tests {
             column: 5,
             rendered: "rendered text that must not be dumped inline".into(),
         }
+    }
+
+    #[test]
+    fn an_abandoned_heal_does_not_block_the_next_one() {
+        // A canceled MCP request drops the heal mid-upload; the mark it left
+        // must go with it, or every later poll is told "someone is on it".
+        let id = format!("t-abandoned-{}", ulid::Ulid::generate());
+        heal_attempts().lock().unwrap().insert(id.clone(), (1, HealState::InProgress));
+        drop(HealInProgress { task_id: id.clone(), round: 1 });
+        assert!(heal_attempts().lock().unwrap().get(&id).is_none());
+
+        // A finished attempt is left alone.
+        heal_attempts().lock().unwrap().insert(
+            id.clone(),
+            (1, HealState::Settled { note: "done".into(), retry_after: None }),
+        );
+        drop(HealInProgress { task_id: id.clone(), round: 1 });
+        assert!(heal_attempts().lock().unwrap().get(&id).is_some());
+    }
+
+    #[test]
+    fn heal_sources_keep_only_recent_submissions() {
+        let source = || Arc::new(HealSource::new(Path::new("/w"), &[]));
+        let ids: Vec<String> = (0..=HEAL_SOURCES_KEPT)
+            .map(|i| format!("t-heal-{}-{i}", ulid::Ulid::generate()))
+            .collect();
+        for id in &ids {
+            remember_heal_source(id, source());
+        }
+        assert!(heal_source(&ids[0]).is_none(), "the oldest is dropped");
+        assert!(heal_source(ids.last().unwrap()).is_some());
+        // Re-registering a task refreshes it instead of duplicating it.
+        remember_heal_source(&ids[1], source());
+        remember_heal_source(&ids[1], source());
+        let count = heal_sources().lock().unwrap().iter().filter(|(id, _)| id == &ids[1]).count();
+        assert_eq!(count, 1);
     }
 
     #[test]

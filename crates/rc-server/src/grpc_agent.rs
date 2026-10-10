@@ -101,6 +101,15 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// A long-poll ends early when there is something for the caller to do: read
+/// a verdict, or re-upload what a worker could not fetch (§4.7). The second
+/// only counts when it *happens* during the wait — a task already parked when
+/// the poll began is waited on normally, or a caller that cannot supply the
+/// blobs would spin on it.
+fn wants_caller(st: &TaskStatus) -> bool {
+    rc_core::TaskState::parse_or_default(&st.status).is_terminal() || !st.missing_blobs.is_empty()
+}
+
 #[tonic::async_trait]
 impl AgentApi for AgentService {
     /// Reconciliation is also lease renewal: answering "I have it" bumps
@@ -128,6 +137,11 @@ impl AgentApi for AgentService {
         self.app
             .metrics
             .incr("blobs_reconciled_total", req.hashes.len() as f64);
+        // A parked task's blobs may all be here already — uploaded by someone
+        // else — in which case nobody will upload them again (§4.7).
+        if missing.is_empty() {
+            self.app.resume_blob_parked().map_err(internal)?;
+        }
         self.app.metrics.incr("blobs_missing_total", missing.len() as f64);
         Ok(Response::new(CheckBlobsResp { missing }))
     }
@@ -172,6 +186,10 @@ impl AgentApi for AgentService {
         }
         self.app.store.touch_blobs(&stored).map_err(internal)?;
         self.app.metrics.incr("blobs_uploaded_total", accepted as f64);
+        // These may be what a `blob_missing` task is parked on (§4.7).
+        if accepted > 0 {
+            self.app.resume_blob_parked().map_err(internal)?;
+        }
         Ok(Response::new(UploadBlobsResp { accepted, rejected }))
     }
 
@@ -306,7 +324,7 @@ impl AgentApi for AgentService {
                         if let Ok(Some(st)) =
                             self.app.task_status_with_baseline(&task_id, &baseline_c)
                         {
-                            if rc_core::TaskState::parse_or_default(&st.status).is_terminal() {
+                            if wants_caller(&st) {
                                 return Some(st);
                             }
                             if return_on_progress && st.progress_version > seen {
@@ -320,6 +338,8 @@ impl AgentApi for AgentService {
                         if let Ok(Some(st)) =
                             self.app.task_status_with_baseline(&task_id, &baseline_c)
                         {
+                            // Missed events say nothing about *when* a park
+                            // happened, so only a verdict ends the wait here.
                             if rc_core::TaskState::parse_or_default(&st.status).is_terminal() {
                                 return Some(st);
                             }
@@ -679,11 +699,21 @@ impl AgentApi for AgentService {
         }
         self.app.progress.lock().remove(&req.task_id);
         self.app.store.unpin_task_blobs(&req.task_id).map_err(internal)?;
-        if !task.worker_id.is_empty() {
+        // Read the worker now, not from the snapshot above: the task may have
+        // been parked and dispatched elsewhere in between. Once canceled it
+        // can no longer be assigned, so this is the last worker it can be on.
+        let worker_id = self
+            .app
+            .store
+            .get_task(&req.task_id)
+            .map_err(internal)?
+            .map(|t| t.worker_id)
+            .unwrap_or_default();
+        if !worker_id.is_empty() {
             self.app
                 .workers
                 .send(
-                    &task.worker_id,
+                    &worker_id,
                     ServerCmd {
                         body: Some(server_cmd::Body::CancelTaskId(req.task_id.clone())),
                     },

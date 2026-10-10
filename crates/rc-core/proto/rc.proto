@@ -570,6 +570,11 @@ message TaskDone {
   string log_blob = 3;           // zstd-compressed log uploaded to CAS
   uint64 log_lines = 4;
   repeated string missing_blobs = 5;  // triggers blob_missing self-heal
+  // The baseline commit could not be materialised from this worker's mirror:
+  // the commit itself plus every bundle prerequisite the mirror lacks. The
+  // control plane stops treating these as reachable, so the next bundle is
+  // built from a base the fleet actually has (§4.1 step 3).
+  repeated string unreachable_commits = 6;
 }
 
 message ImageBuildDone {

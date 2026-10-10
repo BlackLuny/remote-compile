@@ -320,7 +320,8 @@ v0 采用**单进程 MCP server（stdio）+ 磁盘索引**：被 agent 拉起，
 
 - **对账即续租**：server 回答"已有"的同时 bump 这些 blob 的 `last_used`，并对本次提交任务引用的全部 blob 加 pin，任务进入终态后解除；GC 绝不回收被 pin 或租约期内的 blob；
 - **`cas_known` 只是提示**：rc-agent 本地缓存设 TTL（7 天，远小于服务端 30 天 GC TTL），过期条目重新对账，不作为"无需上传"的最终判据；
-- **丢失自愈**：worker 拉取 blob 遇 404 → 回报 `blob_missing`，server 将任务转回 `syncing` 并通知 rc-agent 补传。全程归入 infra 自动重试，不打扰 agent。
+- **丢失自愈**：worker 拉取 blob 遇 404 → 回报 `blob_missing`，server 将任务停回 `syncing`（不记失败 attempt，原 worker 仍可再接）；`GetTask` 长轮询见到 `missing_blobs` 立即返回，提交该任务的 rc-agent 进程（`check`/`get_result` 里）按本地 manifest 补传；缺的 blob 全部到齐后 server 自动转回 `queued`。连续 3 轮仍缺则以 infra_error 结束，不再空转。非本进程提交的任务无法补传，重新 `check` 会挂到同一任务上并补传。
+- **baseline 不可达**：最常见的 `blob_missing` 来源是 `in_baseline` 文件——对账不传它们，指望 worker 从 git mirror 解出。worker 的 mirror 拿不到 base commit 时，回报 `unreachable_commits`（base commit + 各 bundle 缺失的前置提交），server 把它们移出 `project_commits`，下一次 thin bundle 就从 mirror 真有的基点打起；本次缺的文件走上面的补传。admission 不再把 base commit 记为已知——只有 `RegisterBundle` 能证明 bundle 送达。
 
 ## 5. 任务指纹、去重与 supersede
 

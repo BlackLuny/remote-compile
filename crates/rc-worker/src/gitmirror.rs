@@ -57,10 +57,25 @@ impl Mirror {
             return BaselineSource::AlreadyPresent;
         }
         // Bundles first: they came from the agent, so they are the only source
-        // that can carry unpushed local commits.
-        for bundle in bundles {
-            if self.import_bundle(bundle).is_ok() && self.has_commit(commit) {
-                return BaselineSource::Bundle;
+        // that can carry unpushed local commits. Thin bundles build on one
+        // another and nothing guarantees they arrive in dependency order, so
+        // keep passing over the ones that failed until a pass imports nothing.
+        let mut pending: Vec<&PathBuf> = bundles.iter().collect();
+        loop {
+            let before = pending.len();
+            let mut i = 0;
+            while i < pending.len() {
+                if self.import_bundle(pending[i]).is_ok() {
+                    pending.remove(i);
+                    if self.has_commit(commit) {
+                        return BaselineSource::Bundle;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if pending.is_empty() || pending.len() == before {
+                break;
             }
         }
         if let Some(url) = repo_url.filter(|u| is_anonymous_url(u)) {
@@ -69,6 +84,28 @@ impl Mirror {
             }
         }
         BaselineSource::Unavailable
+    }
+
+    /// Why `commit` could not be materialised: the commit itself, every
+    /// prerequisite a bundle names that this mirror does not hold, and the tip
+    /// of every bundle that failed to import. The control plane believed all
+    /// of these were reachable — that belief is what made the agent ship a
+    /// bundle that cannot be imported here.
+    pub fn unreachable_commits(&self, commit: &str, bundles: &[PathBuf]) -> Vec<String> {
+        const CAP: usize = 200;
+        let mut out = vec![commit.to_string()];
+        for bundle in bundles {
+            let header = bundle_header(bundle).unwrap_or_default();
+            for sha in header.prerequisites.into_iter().chain(header.heads) {
+                if out.len() >= CAP {
+                    return out;
+                }
+                if !out.contains(&sha) && !self.has_commit(&sha) {
+                    out.push(sha);
+                }
+            }
+        }
+        out
     }
 
     fn fetch(&self, url: &str, commit: &str) -> Result<()> {
@@ -154,6 +191,48 @@ pub fn is_anonymous_url(url: &str) -> bool {
     let u = url.trim();
     (u.starts_with("https://") || u.starts_with("http://") || u.starts_with("git://"))
         && !u.contains('@')
+}
+
+#[derive(Default)]
+struct BundleHeader {
+    /// Commits the bundle requires but does not carry (`-<sha> <subject>`).
+    prerequisites: Vec<String>,
+    /// Commits it delivers (`<sha> <ref>`).
+    heads: Vec<String>,
+}
+
+/// Read a bundle's header: the text lines before the first blank one.
+fn bundle_header(bundle: &Path) -> Result<BundleHeader> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(bundle)?);
+    let mut out = BundleHeader::default();
+    let mut line = Vec::new();
+    // The header is text; the pack after it is not. Stop at the separator, and
+    // give up on anything that does not look like a header at all.
+    for _ in 0..100_000 {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end();
+        if text.is_empty() {
+            break;
+        }
+        // `#` is the signature line, `@` a v3 capability.
+        if text.starts_with('#') || text.starts_with('@') {
+            continue;
+        }
+        let (list, rest) = match text.strip_prefix('-') {
+            Some(rest) => (&mut out.prerequisites, rest),
+            None => (&mut out.heads, text),
+        };
+        let sha = rest.split_whitespace().next().unwrap_or_default();
+        if is_sha_like(sha) && !list.iter().any(|s| s == sha) {
+            list.push(sha.to_string());
+        }
+    }
+    Ok(out)
 }
 
 pub fn is_sha_like(s: &str) -> bool {
@@ -267,6 +346,85 @@ mod tests {
             mirror.ensure_commit(&missing, Some("git@github.com:org/private.git"), &[]),
             BaselineSource::Unavailable
         );
+    }
+
+    /// Add a commit on top of `src`'s HEAD and return its sha.
+    fn commit_more(src: &Path, name: &str) -> String {
+        std::fs::write(src.join(name), format!("// {name}\n")).unwrap();
+        git(src, &["add", "-A"]);
+        git(src, &["commit", "--quiet", "-m", name]);
+        let sha = Command::new("git").current_dir(src).args(["rev-parse", "HEAD"]).output().unwrap();
+        String::from_utf8_lossy(&sha.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn thin_bundles_import_even_when_listed_out_of_order() {
+        // b2 needs b1's commit; handing b2 over first must not strand it.
+        let (src, base) = seed_repo();
+        let mid = commit_more(&src, "b.rs");
+        let tip = commit_more(&src, "c.rs");
+        let dir = scratch("bundles-ooo");
+        let b0 = dir.join("b0.bundle");
+        let b1 = dir.join("b1.bundle");
+        let b2 = dir.join("b2.bundle");
+        // `git bundle` records refs, not bare shas.
+        git(&src, &["branch", "at-base", &base]);
+        git(&src, &["branch", "at-mid", &mid]);
+        git(&src, &["bundle", "create", b0.to_str().unwrap(), "at-base"]);
+        git(&src, &["bundle", "create", b1.to_str().unwrap(), "at-mid", "--not", &base]);
+        git(&src, &["bundle", "create", b2.to_str().unwrap(), "HEAD", "--not", &mid]);
+
+        let mirror = Mirror::open(&scratch("mirrors-ooo"), "p1").unwrap();
+        assert_eq!(mirror.ensure_commit(&tip, None, &[b2, b1, b0]), BaselineSource::Bundle);
+        assert!(mirror.has_commit(&tip));
+    }
+
+    #[test]
+    fn a_broken_bundle_chain_names_the_commits_it_is_missing() {
+        // The control plane thought `mid` was reachable, so the agent shipped
+        // only mid..tip. This mirror never got `mid`; saying so is the only
+        // way the next bundle gets built from something it has.
+        let (src, base) = seed_repo();
+        let mid = commit_more(&src, "b.rs");
+        let tip = commit_more(&src, "c.rs");
+        let dir = scratch("bundles-broken");
+        let b0 = dir.join("b0.bundle");
+        let b2 = dir.join("b2.bundle");
+        git(&src, &["branch", "at-base", &base]);
+        git(&src, &["bundle", "create", b0.to_str().unwrap(), "at-base"]);
+        git(&src, &["bundle", "create", b2.to_str().unwrap(), "HEAD", "--not", &mid]);
+        let bundles = vec![b0, b2];
+
+        let mirror = Mirror::open(&scratch("mirrors-broken"), "p1").unwrap();
+        assert_eq!(mirror.ensure_commit(&tip, None, &bundles), BaselineSource::Unavailable);
+        let unreachable = mirror.unreachable_commits(&tip, &bundles);
+        assert_eq!(unreachable, vec![tip.clone(), mid.clone()]);
+        assert!(!unreachable.contains(&base), "base came in with b0 and is reachable");
+    }
+
+    #[test]
+    fn the_tip_of_a_bundle_that_failed_to_import_is_reported_too() {
+        // b1 delivers `mid` but needs `base`, which this mirror never got.
+        // `mid` was recorded as known when b1 was registered; it is exactly
+        // the stale belief that has to go, not just `base`.
+        let (src, base) = seed_repo();
+        let mid = commit_more(&src, "b.rs");
+        let tip = commit_more(&src, "c.rs");
+        let dir = scratch("bundles-tip");
+        let b1 = dir.join("b1.bundle");
+        let b2 = dir.join("b2.bundle");
+        git(&src, &["branch", "at-mid", &mid]);
+        git(&src, &["bundle", "create", b1.to_str().unwrap(), "at-mid", "--not", &base]);
+        git(&src, &["bundle", "create", b2.to_str().unwrap(), "HEAD", "--not", &mid]);
+        let bundles = vec![b1, b2];
+
+        let mirror = Mirror::open(&scratch("mirrors-tip"), "p1").unwrap();
+        assert_eq!(mirror.ensure_commit(&tip, None, &bundles), BaselineSource::Unavailable);
+        let mut unreachable = mirror.unreachable_commits(&tip, &bundles);
+        unreachable.sort();
+        let mut expected = vec![tip, mid, base];
+        expected.sort();
+        assert_eq!(unreachable, expected);
     }
 
     #[test]

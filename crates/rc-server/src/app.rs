@@ -103,6 +103,11 @@ fn required_capabilities(
 /// strand the environment forever (§8.2).
 pub const IMAGE_BUILD_LEASE_SECS: i64 = 3600;
 
+/// How many `blob_missing` reports one task may come back with before it is
+/// failed. One round is normal — a baseline the worker cannot reach turns into
+/// files the agent uploads — a third means re-uploading is not working (§4.7).
+pub const MAX_BLOB_MISSING_ROUNDS: usize = 3;
+
 /// Arch field of the environment image behind a digest-pinned ref, if any.
 fn image_arch_for_ref(store: &Store, image_ref: &str) -> String {
     let digest = image_ref
@@ -414,17 +419,14 @@ impl App {
             .upsert_project(&req.project_id, &req.repo_url, &req.project_root)?;
         self.store
             .upsert_worktree(&req.worktree_id, &req.project_id, &req.worktree_label)?;
-        // Only a submission that actually uses the baseline may claim the
-        // commit is known. `note_known_commit` feeds `GetBaseline`, which tells
-        // the next agent it need not build a bundle — and a submission that ran
-        // with `baseline = false` uploaded no bundle at all. Recording it
-        // regardless leaves the fleet believing it can materialise a commit
-        // nothing ever delivered, and for a private repository the worker has
-        // no other way to get it. (A repo that excludes files runs this way on
-        // every check, so this is not a corner case.)
-        if manifest.baseline && !manifest.base_commit.is_empty() {
-            self.store.note_known_commit(&req.project_id, &manifest.base_commit)?;
-        }
+        // Admission deliberately does not record the base commit as known.
+        // `note_known_commit` feeds `GetBaseline`, which tells the next agent it
+        // need not build a bundle — and only `RegisterBundle` proves a bundle
+        // was delivered. A submission can carry `baseline = true` with no bundle
+        // at all (bundle creation or upload failed and the agent carried on),
+        // and recording it then leaves the fleet believing it can materialise a
+        // commit nothing ever delivered; every later thin bundle is built on top
+        // of it and none of them import (§4.1 step 3).
 
         // Blobs the worker will need but the CAS does not hold.
         let needed = manifest::blobs_to_reconcile(manifest);
@@ -788,10 +790,12 @@ impl App {
             image_pull_ref: images::pull_ref_for_image(self, &task.image).unwrap_or_default(),
         };
 
-        self.store.assign_to_worker(&task.id, &choice.worker_id)?;
+        if !self.store.assign_to_worker(&task.id, &choice.worker_id)? {
+            // Canceled (or superseded) since the queue snapshot was taken.
+            return Ok(false);
+        }
         self.workers.note_assigned(&choice.worker_id, &task.id);
-        // Whatever the agent was asked to re-upload has been re-uploaded, or
-        // admission would have refused the resubmission.
+        // A resumed task is only queued once its blobs are back (§4.7).
         self.clear_missing_blobs(&task.id);
         self.store.add_timeline(
             &task.id,
@@ -907,27 +911,59 @@ impl App {
             return Ok(());
         }
 
-        // §4.7 self-heal: the worker could not fetch a blob. Ask the agent for
-        // it instead of failing the task.
+        // The worker could not reach the baseline commit, and says which
+        // commits its mirror lacks. They were "known" only to this table;
+        // leaving them in it makes every future bundle depend on them again.
+        if !done.unreachable_commits.is_empty() {
+            let n = self
+                .store
+                .forget_known_commits(&task.project_id, &done.unreachable_commits)?;
+            self.store.add_timeline(
+                &done.task_id,
+                "baseline_unreachable",
+                worker_id,
+                &format!("{} commits no longer treated as reachable", n),
+            )?;
+        }
+
+        // §4.7 self-heal: the worker could not fetch a blob. Park the task
+        // until the agent re-uploads it instead of failing the task.
         if !done.missing_blobs.is_empty() {
             self.metrics.incr("blob_missing_selfheal_total", 1.0);
+            let rounds = self
+                .store
+                .timeline(&done.task_id)?
+                .iter()
+                .filter(|p| p.phase == "blob_missing")
+                .count();
+            if rounds >= MAX_BLOB_MISSING_ROUNDS {
+                // Re-uploading has not helped; another round will not either.
+                self.fail_task(
+                    &done.task_id,
+                    ResultKind::InfraError,
+                    &format!(
+                        "worker 连续 {rounds} 次取不到所需文件（blob_missing），已放弃；请重新 check"
+                    ),
+                )?;
+                return Ok(());
+            }
             for h in &done.missing_blobs {
                 self.store.forget_blob(h)?;
             }
-            self.store.set_status(&done.task_id, TaskState::Syncing.as_str())?;
             self.store.add_timeline(
                 &done.task_id,
                 "blob_missing",
                 worker_id,
                 &done.missing_blobs.join(","),
             )?;
-            if !self.store.requeue(&done.task_id, worker_id, "blob_missing")? {
+            if !self.store.park_for_blobs(&done.task_id)? {
                 // Cancel (or another terminal) won the race (R6').
                 return Ok(());
             }
-            self.store.set_status(&done.task_id, TaskState::Syncing.as_str())?;
             self.set_missing_blobs(&done.task_id, &done.missing_blobs)?;
             self.publish_task(&done.task_id);
+            // Whatever was missing may already be back.
+            self.resume_blob_parked()?;
             return Ok(());
         }
 
@@ -1146,6 +1182,34 @@ impl App {
 
     pub fn clear_missing_blobs(&self, task_id: &str) {
         let _ = self.store.set_setting(&format!("missing_blobs:{task_id}"), "[]");
+    }
+
+    /// §4.7: a task parked by `blob_missing` goes back in the queue as soon as
+    /// everything it was missing is in the CAS again. Called whenever blobs
+    /// arrive, so the agent's re-upload is the whole of the handshake.
+    pub fn resume_blob_parked(&self) -> Result<usize> {
+        let mut resumed = 0;
+        for id in self.store.blob_parked_tasks()? {
+            let missing = self.missing_blobs(&id);
+            if missing.is_empty() || !missing.iter().all(|h| self.cas.exists(h)) {
+                continue;
+            }
+            if self.store.resume_parked(&id)? {
+                self.clear_missing_blobs(&id);
+                self.store.add_timeline(
+                    &id,
+                    "blobs_resupplied",
+                    "",
+                    &format!("{} blobs", missing.len()),
+                )?;
+                self.publish_task(&id);
+                resumed += 1;
+            }
+        }
+        if resumed > 0 {
+            self.dispatch_signal.notify_one();
+        }
+        Ok(resumed)
     }
 
     // ------------------------------------------------------------------ logs
@@ -1856,6 +1920,110 @@ mod tests {
         app.on_task_done("w-a", done).await.unwrap();
         assert_eq!(app.store.get_task(&id).unwrap().unwrap().status, "syncing");
         assert_eq!(app.missing_blobs(&id), vec!["c".repeat(64)]);
+        // Not the worker's fault: it stays eligible, warm workspace and all.
+        assert!(app.store.attempted_workers(&id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_parked_task_is_queued_again_once_its_blobs_arrive() {
+        // The deadlock this replaces: parked in `syncing` with nothing that
+        // ever moved it out, until the pending TTL canceled it 30 min later.
+        let app = test_app();
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"x")).unwrap());
+        app.store.assign_to_worker(&id, "w-a").unwrap();
+        let lost = b"tracked in the baseline, never uploaded".to_vec();
+        let hash = rc_core::cas::hash_bytes(&lost);
+        app.on_task_done(
+            "w-a",
+            pb::TaskDone { task_id: id.clone(), missing_blobs: vec![hash.clone()], ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.resume_blob_parked().unwrap(), 0, "nothing arrived yet");
+        assert_eq!(app.store.get_task(&id).unwrap().unwrap().status, "syncing");
+
+        app.cas.put(&lost).unwrap();
+        assert_eq!(app.resume_blob_parked().unwrap(), 1);
+        assert_eq!(app.store.get_task(&id).unwrap().unwrap().status, "queued");
+        assert!(app.missing_blobs(&id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_won_is_not_undone_by_a_blob_missing_report() {
+        let app = test_app();
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"x")).unwrap());
+        app.store.assign_to_worker(&id, "w-a").unwrap();
+        app.store
+            .complete_task(&id, "canceled", &pb::TaskResult::default(), "", "")
+            .unwrap();
+        app.on_task_done(
+            "w-a",
+            pb::TaskDone { task_id: id.clone(), missing_blobs: vec!["c".repeat(64)], ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.store.get_task(&id).unwrap().unwrap().status, "canceled");
+    }
+
+    #[tokio::test]
+    async fn blob_missing_that_keeps_recurring_fails_the_task() {
+        let app = test_app();
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"x")).unwrap());
+        for _ in 0..MAX_BLOB_MISSING_ROUNDS {
+            app.store.assign_to_worker(&id, "w-a").unwrap();
+            app.on_task_done(
+                "w-a",
+                pb::TaskDone { task_id: id.clone(), missing_blobs: vec!["c".repeat(64)], ..Default::default() },
+            )
+            .await
+            .unwrap();
+            assert_eq!(app.store.get_task(&id).unwrap().unwrap().status, "syncing");
+        }
+        app.store.assign_to_worker(&id, "w-a").unwrap();
+        app.on_task_done(
+            "w-a",
+            pb::TaskDone { task_id: id.clone(), missing_blobs: vec!["c".repeat(64)], ..Default::default() },
+        )
+        .await
+        .unwrap();
+        let t = app.store.get_task(&id).unwrap().unwrap();
+        assert_eq!(t.status, "failed");
+        assert_eq!(t.result_kind, "infra_error");
+    }
+
+    #[tokio::test]
+    async fn commits_a_worker_cannot_reach_stop_being_bundle_bases() {
+        let app = test_app();
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"x")).unwrap());
+        let project = app.store.get_task(&id).unwrap().unwrap().project_id;
+        for c in ["a".repeat(40), "b".repeat(40), "c".repeat(40)] {
+            app.store.note_known_commit(&project, &c).unwrap();
+        }
+        app.store.assign_to_worker(&id, "w-a").unwrap();
+        app.on_task_done(
+            "w-a",
+            pb::TaskDone {
+                task_id: id.clone(),
+                missing_blobs: vec!["d".repeat(64)],
+                unreachable_commits: vec!["b".repeat(40), "c".repeat(40)],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.store.known_commits(&project, 20).unwrap(), vec!["a".repeat(40)]);
+    }
+
+    #[test]
+    fn admission_alone_does_not_make_a_commit_known() {
+        // Only RegisterBundle proves the fleet can materialise a commit.
+        let app = test_app();
+        let mut req = request(&app, "s1", "check", b"x");
+        let m = req.manifest.as_mut().unwrap();
+        m.baseline = true;
+        m.base_commit = "e".repeat(40);
+        queued_id(app.submit(&req).unwrap());
+        assert!(!app.store.has_commit(&req.project_id, &"e".repeat(40)).unwrap());
     }
 
     #[tokio::test]

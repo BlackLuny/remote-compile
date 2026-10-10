@@ -60,6 +60,10 @@ pub struct Runner {
     /// of a toolchain image saturates the host, and nothing above guarantees an
     /// order arrives only once.
     building: Arc<Mutex<HashSet<String>>>,
+    /// Tasks canceled before their build container existed — during sync, or
+    /// while still waiting for a slot. Killing by name finds nothing then, so
+    /// the build checks this before it starts.
+    canceled: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Runner {
@@ -75,6 +79,7 @@ impl Runner {
             project_locks: KeyedLocks::default(),
             sccache_available,
             building: Arc::new(Mutex::new(HashSet::new())),
+            canceled: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -89,7 +94,9 @@ impl Runner {
         let lock = self.worktree_locks.get(&assignment.worktree_id).await;
         let _guard = lock.lock().await;
 
-        match self.execute_inner(assignment, client, &events).await {
+        let outcome = self.execute_inner(assignment, client, &events).await;
+        self.canceled.lock().await.remove(&task_id);
+        match outcome {
             Ok(done) => done,
             // Anything that escapes here is our problem, not the code's: the
             // control plane retries it on another machine (§3.5).
@@ -139,6 +146,7 @@ impl Runner {
 
         // ---- L1 baseline ----
         let mut baseline_note = String::new();
+        let mut unreachable_commits = Vec::new();
         if manifest.baseline && !manifest.base_commit.is_empty() {
             let bundles = self
                 .materialize_bundles(&assignment.bundle_blobs, client)
@@ -154,7 +162,15 @@ impl Runner {
                 &bundles,
             );
             baseline_note = format!("{source:?}");
-            if source != BaselineSource::Unavailable {
+            if source == BaselineSource::Unavailable {
+                unreachable_commits = mirror.unreachable_commits(&manifest.base_commit, &bundles);
+                tracing::warn!(
+                    task = %task_id,
+                    commit = %manifest.base_commit,
+                    unreachable = unreachable_commits.len(),
+                    "baseline commit unreachable from the mirror; syncing through the CAS"
+                );
+            } else {
                 // The manifest's paths are relative to the anchor, and the
                 // baseline describes only the primary root, so it materialises
                 // under that root's mount rather than at the top.
@@ -205,7 +221,9 @@ impl Runner {
             missing.sort();
             missing.dedup();
             tracing::warn!(task = %task_id, count = missing.len(), "blobs missing from the CAS");
-            return Ok(client::blob_missing(&task_id, missing));
+            let mut done = client::blob_missing(&task_id, missing);
+            done.unreachable_commits = unreachable_commits;
+            return Ok(done);
         }
         for (path, target) in &plan.symlinks {
             workspace::write_symlink(&root, path, target)?;
@@ -215,6 +233,11 @@ impl Runner {
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
         // ---- execute ----
+        if self.canceled.lock().await.contains(&task_id) {
+            // The control plane already recorded the cancel; this result is
+            // only an acknowledgement it will drop.
+            return Err(anyhow!("canceled before the build started"));
+        }
         let _ = events
             .send(client::progress_event(
                 &task_id,
@@ -397,6 +420,7 @@ impl Runner {
             log_blob,
             log_lines: combined.lines().count() as u64,
             missing_blobs: vec![],
+            unreachable_commits,
         })
     }
 
@@ -711,6 +735,11 @@ impl Runner {
             labels,
             progress,
         };
+        // Pulling the image and preparing volumes can take minutes, and a
+        // cancel in that window found no container to kill.
+        if self.canceled.lock().await.contains(&assignment.task_id) {
+            return Err(anyhow!("canceled before the build container started"));
+        }
         self.sandbox.run(&spec).await
     }
 
@@ -822,9 +851,23 @@ impl Runner {
     }
 
     pub async fn cancel(&self, task_id: &str) {
-        let name = docker::container_name(task_id);
         tracing::info!(task = %task_id, "cancelling");
-        let _ = self.sandbox.kill(&name).await;
+        {
+            let mut canceled = self.canceled.lock().await;
+            // Cancels for tasks this worker never runs are never removed;
+            // keep that from growing without bound.
+            if canceled.len() >= 1024 {
+                canceled.clear();
+            }
+            canceled.insert(task_id.to_string());
+        }
+        // The build, and the sandbox that copies artifacts out after it.
+        for name in [
+            docker::container_name(task_id),
+            docker::container_name(&format!("{task_id}-collect")),
+        ] {
+            let _ = self.sandbox.kill(&name).await;
+        }
     }
 
     /// Push or pull an env image for fleet distribution (admin-driven).
