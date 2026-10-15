@@ -72,7 +72,7 @@ impl Default for WorkerConfig {
             egress_byte_cap: 2 * 1024 * 1024 * 1024,
             allow_private_egress: false,
             egress_ports: default_egress_ports(),
-            worktree_idle_days: 14,
+            worktree_idle_days: 3,
             min_disk_free_gb: 20,
             labels: Default::default(),
         }
@@ -229,5 +229,8 @@ mod tests {
         assert!(c.max_parallel >= 1);
         assert!(c.pids_limit > 0, "a fork bomb guard must be set");
         assert!(c.allowlist.contains(&"crates.io".to_string()));
+        // Worktree caches are the fleet's biggest disk consumer; keep the
+        // default short so idle GC keeps up on machines that churn worktrees.
+        assert_eq!(c.worktree_idle_days, 3);
     }
 }
