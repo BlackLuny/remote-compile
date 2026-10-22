@@ -2228,6 +2228,85 @@ impl Store {
         )?)
     }
 
+    /// Release the stored manifest of tasks that can no longer be dispatched.
+    ///
+    /// Storing a workspace's manifest per task is what makes a retry cheap: the
+    /// control plane can re-place a queued task without asking the agent to
+    /// re-upload anything. It is also the largest thing in this database —
+    /// 17 of 18 GB on a fleet building one monorepo, at roughly 2 MiB a task —
+    /// and it used to be kept forever, because nothing deleted it.
+    ///
+    /// Only the row's payload is cleared; the row stays, so the foreign keys and
+    /// the task's history survive. `try_dispatch` is the only reader, and it is
+    /// only reached for a task that is queued or running, which a terminal task
+    /// is not.
+    pub fn clear_old_task_manifests(&self, retention_secs: i64, limit: usize) -> Result<usize> {
+        let cutoff = now_ms() - retention_secs.max(0) * 1000;
+        let n = self.conn.lock().execute(
+            "UPDATE task_inputs SET manifest_json = ''
+              WHERE task_id IN (
+                    SELECT t.id FROM tasks t JOIN task_inputs i ON i.task_id = t.id
+                     WHERE i.manifest_json != ''
+                       AND t.finished_at > 0 AND t.finished_at < ?1
+                       AND t.status IN ('done','failed','canceled','superseded')
+                     LIMIT ?2)",
+            params![cutoff, limit as i64],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete terminal tasks older than `retention_secs`, with everything that
+    /// hangs off them.
+    ///
+    /// Blob pins are released first: the CAS can only reclaim a blob once no
+    /// task references it (§9), and a deleted task that still pins its inputs
+    /// would keep gigabytes alive forever.
+    pub fn prune_terminal_tasks(&self, retention_secs: i64, limit: usize) -> Result<usize> {
+        let cutoff = now_ms() - retention_secs.max(0) * 1000;
+        let ids: Vec<String> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM tasks
+                  WHERE status IN ('done','failed','canceled','superseded')
+                    AND finished_at > 0 AND finished_at < ?1
+                  ORDER BY finished_at ASC LIMIT ?2",
+            )?;
+            let out = stmt
+                .query_map(params![cutoff, limit as i64], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // Outside the lock above: `unpin_task_blobs` takes it itself.
+        for id in &ids {
+            self.unpin_task_blobs(id)?;
+        }
+        let conn = self.conn.lock();
+        let mut removed = 0;
+        for id in &ids {
+            for table in [
+                "task_events",
+                "task_attempts",
+                "task_artifacts",
+                "task_subs",
+                "task_inputs",
+            ] {
+                conn.execute(
+                    &format!("DELETE FROM {table} WHERE task_id = ?1"),
+                    params![id],
+                )?;
+            }
+            removed += conn.execute(
+                "DELETE FROM tasks
+                  WHERE id = ?1 AND status IN ('done','failed','canceled','superseded')",
+                params![id],
+            )?;
+        }
+        Ok(removed)
+    }
+
     // --------------------------- aggregations ---------------------------
 
     /// Numbers behind the Overview cards.
@@ -3123,5 +3202,137 @@ mod tests {
             .unwrap());
         assert!(!s.requeue("t1", "w-a", "infra").unwrap());
         assert_eq!(s.get_task("t1").unwrap().unwrap().status, "canceled");
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open_memory().unwrap()
+    }
+
+    fn task(id: &str, status: &str, finished_at: i64) -> TaskRow {
+        TaskRow {
+            id: id.into(),
+            task_type: "check".into(),
+            project_id: "p1".into(),
+            worktree_id: "w1".into(),
+            agent_session: "s1".into(),
+            fingerprint: "fp".into(),
+            supersede_key: "k1".into(),
+            status: status.into(),
+            created_at: now_ms(),
+            finished_at,
+            ..Default::default()
+        }
+    }
+
+    fn add(s: &Store, id: &str, status: &str, finished_at: i64) {
+        s.insert_task(
+            &task(id, status, finished_at),
+            r#"{"files":[{"path":"a","hash":"h","size":1}]}"#,
+            "{}",
+            "",
+        )
+        .unwrap();
+        // `insert_task` always writes finished_at = 0 (a task is created
+        // unfinished); the timestamp is what retention keys on, so set it the
+        // way completing a task would.
+        s.conn
+            .lock()
+            .execute(
+                "UPDATE tasks SET finished_at = ?2 WHERE id = ?1",
+                params![id, finished_at],
+            )
+            .unwrap();
+        s.add_timeline(id, "queued", "", "cargo check").unwrap();
+    }
+
+    fn manifest_of(s: &Store, id: &str) -> String {
+        s.get_task_inputs(id).unwrap().map(|(m, _, _)| m).unwrap_or_default()
+    }
+
+    const DAY_MS: i64 = 24 * 3600 * 1000;
+
+    #[test]
+    fn a_finished_task_releases_its_manifest_and_keeps_its_history() {
+        let s = store();
+        add(&s, "t-old", "done", now_ms() - 10 * DAY_MS);
+        assert!(!manifest_of(&s, "t-old").is_empty());
+
+        assert_eq!(s.clear_old_task_manifests(7 * 24 * 3600, 100).unwrap(), 1);
+
+        assert_eq!(manifest_of(&s, "t-old"), "", "payload is what costs disk");
+        assert!(s.get_task("t-old").unwrap().is_some(), "the task stays visible");
+        assert!(
+            !s.get_task_inputs("t-old").unwrap().unwrap().1.is_empty(),
+            "only the manifest goes; the profile is small and still useful"
+        );
+    }
+
+    #[test]
+    fn a_recent_task_keeps_its_manifest() {
+        let s = store();
+        add(&s, "t-new", "done", now_ms() - 2 * DAY_MS);
+        assert_eq!(s.clear_old_task_manifests(7 * 24 * 3600, 100).unwrap(), 0);
+        assert!(!manifest_of(&s, "t-new").is_empty());
+    }
+
+    #[test]
+    fn a_task_that_can_still_run_keeps_its_manifest() {
+        // finished_at is 0 for anything queued or running, and those are the
+        // only tasks dispatch reads a manifest for: clearing it would turn a
+        // retry into an infrastructure failure.
+        let s = store();
+        add(&s, "t-queued", "queued", 0);
+        add(&s, "t-running", "running", 0);
+        assert_eq!(s.clear_old_task_manifests(0, 100).unwrap(), 0);
+        assert!(!manifest_of(&s, "t-queued").is_empty());
+        assert!(!manifest_of(&s, "t-running").is_empty());
+    }
+
+    #[test]
+    fn retention_deletes_the_whole_task_including_its_children() {
+        let s = store();
+        add(&s, "t-gone", "failed", now_ms() - 40 * DAY_MS);
+        add(&s, "t-kept", "done", now_ms() - DAY_MS);
+
+        assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 100).unwrap(), 1);
+
+        assert!(s.get_task("t-gone").unwrap().is_none());
+        assert!(s.get_task_inputs("t-gone").unwrap().is_none());
+        let events: i64 = s
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = 't-gone'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "timeline rows must not outlive the task");
+        assert!(s.get_task("t-kept").unwrap().is_some());
+    }
+
+    #[test]
+    fn retention_never_touches_a_task_that_is_still_queued() {
+        let s = store();
+        add(&s, "t-queued", "queued", 0);
+        assert_eq!(s.prune_terminal_tasks(0, 100).unwrap(), 0);
+        assert!(s.get_task("t-queued").unwrap().is_some());
+    }
+
+    #[test]
+    fn retention_is_batched() {
+        let s = store();
+        for i in 0..5 {
+            add(&s, &format!("t-{i}"), "done", now_ms() - 40 * DAY_MS);
+        }
+        assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 2);
+        assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 2);
+        assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 1);
+        assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 0);
     }
 }

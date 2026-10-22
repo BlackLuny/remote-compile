@@ -85,6 +85,28 @@ pub struct Policy {
     /// so they leave as soon as nobody can ask for them.
     #[serde(default = "default_artifact_ttl")]
     pub artifact_ttl_secs: i64,
+    /// §9 — how long a task that has reached a terminal state keeps the file
+    /// manifest of its workspace.
+    ///
+    /// The manifest is the largest thing this database stores (every path, size
+    /// and hash of the tree — about 2 MiB per task, which was 17 of its 18 GB),
+    /// and it is read in one place: `try_dispatch`, for a task about to run. A
+    /// finished task is never dispatched again, so keeping it bought nothing.
+    #[serde(default = "default_manifest_retention")]
+    pub manifest_retention_secs: i64,
+    /// §9 — how long terminal tasks keep their own row, timeline and attempts.
+    /// Longer than the manifest window on purpose: the history is what makes
+    /// "what happened last week" answerable, and it is small.
+    #[serde(default = "default_task_retention")]
+    pub task_retention_secs: i64,
+}
+
+fn default_manifest_retention() -> i64 {
+    7 * 24 * 3600
+}
+
+fn default_task_retention() -> i64 {
+    30 * 24 * 3600
 }
 
 fn default_artifact_ttl() -> i64 {
@@ -126,6 +148,8 @@ impl Default for Policy {
             image_registry_prefix: default_registry_prefix(),
             image_registry_enabled: false,
             artifact_ttl_secs: default_artifact_ttl(),
+            manifest_retention_secs: default_manifest_retention(),
+            task_retention_secs: default_task_retention(),
         }
     }
 }

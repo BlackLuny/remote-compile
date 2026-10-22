@@ -256,6 +256,10 @@ export interface Policy {
   pending_ttl_secs: number;
   blob_gc_ttl_secs: number;
   log_retention_secs: number;
+  /** How long a finished task keeps its stored manifest (the big column). */
+  manifest_retention_secs?: number;
+  /** How long finished tasks keep their row, timeline and attempts. */
+  task_retention_secs?: number;
   worker_offline_secs: number;
   max_infra_retries: number;
   require_image_approval: boolean;

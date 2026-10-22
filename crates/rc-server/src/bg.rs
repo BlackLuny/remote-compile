@@ -34,6 +34,13 @@ async fn dispatch_loop(app: Arc<App>) {
     }
 }
 
+/// How many tasks one retention pass may touch.
+///
+/// The loop runs every 60 s, so this is a ceiling on how fast history can be
+/// let go of — not a limit on how much is kept. 200 at a time drains months of
+/// backlog within an hour while keeping each write small.
+const TASK_PRUNE_BATCH: usize = 200;
+
 #[derive(Debug, Default)]
 pub struct GcReport {
     pub deleted: u64,
@@ -127,6 +134,28 @@ async fn maintenance_loop(app: Arc<App>) {
         let now = now_secs();
         app.store.prune_rollups("1min", now - 7 * 24 * 3600).ok();
         app.store.prune_rollups("1hour", now - 90 * 24 * 3600).ok();
+
+        // Task history has no natural end, and the manifest it carries is
+        // megabytes each: 17 of the 18 GB database on a fleet building one
+        // monorepo, growing all the time, because nothing ever deleted it.
+        // Batched, so a first pass over months of history cannot stall the
+        // control plane behind one enormous write.
+        match app
+            .store
+            .clear_old_task_manifests(policy.manifest_retention_secs, TASK_PRUNE_BATCH)
+        {
+            Ok(n) if n > 0 => tracing::info!(tasks = n, "released stored task manifests"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "manifest retention failed"),
+        }
+        match app
+            .store
+            .prune_terminal_tasks(policy.task_retention_secs, TASK_PRUNE_BATCH)
+        {
+            Ok(n) if n > 0 => tracing::info!(tasks = n, "pruned old task history"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "task retention failed"),
+        }
 
         let (blobs, bytes, _) = app.store.cas_summary().unwrap_or((0, 0, 0));
         app.metrics.set("cas_blobs", blobs as f64);

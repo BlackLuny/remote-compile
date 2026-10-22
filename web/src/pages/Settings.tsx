@@ -166,6 +166,20 @@ export function Settings({ role }: { role: Role }) {
               readOnly={readOnly}
             />
             <NumberField
+              label="任务清单保留"
+              hint={`当前 ${duration(draft.manifest_retention_secs ?? 0)} — 每个任务的清单约 2 MB，是库里最大的东西；终态任务不再被调度，超期即释放（§9）`}
+              value={draft.manifest_retention_secs ?? 0}
+              onChange={(v) => set("manifest_retention_secs", v)}
+              readOnly={readOnly}
+            />
+            <NumberField
+              label="任务历史保留"
+              hint={`当前 ${duration(draft.task_retention_secs ?? 0)} — 终态任务连同时间线、重试记录一起删除（§9）`}
+              value={draft.task_retention_secs ?? 0}
+              onChange={(v) => set("task_retention_secs", v)}
+              readOnly={readOnly}
+            />
+            <NumberField
               label="worker 离线判定"
               hint={duration(draft.worker_offline_secs)}
               value={draft.worker_offline_secs}
