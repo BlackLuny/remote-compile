@@ -2,6 +2,7 @@
 //! a Docker sandbox and reports structured results back to the control plane.
 
 mod artifacts;
+mod breaker;
 mod client;
 mod config;
 mod docker;
@@ -123,7 +124,8 @@ async fn enroll(data_dir: PathBuf, server: String, token: String, max_parallel: 
 }
 
 async fn run(data_dir: PathBuf, offline: bool) -> Result<()> {
-    let cfg = WorkerConfig::load(&data_dir)?;
+    let mut cfg = WorkerConfig::load(&data_dir)?;
+    clamp_cpus(&mut cfg);
     cfg.ensure_dirs()?;
 
     let sandbox = Arc::new(Sandbox::connect()?);
@@ -181,6 +183,35 @@ async fn run(data_dir: PathBuf, offline: bool) -> Result<()> {
     }
 }
 
+/// Clamp the per-container CPU budget to what this host can actually give.
+///
+/// `worker.json` travels between machines — copied when a fleet grows, restored
+/// from a backup onto different hardware — and `docker create` rejects a
+/// `--cpus` above the *daemon's* CPU count with "Range of CPUs is from 0.01 to
+/// 1.00, as there are only N CPUs available". That fails every single create,
+/// which is an infra error the control plane can only answer by retrying
+/// elsewhere, so one stale number quietly empties a machine out of the fleet
+/// (§8.1). A warning and a clamp is the whole fix.
+fn clamp_cpus(cfg: &mut WorkerConfig) {
+    // `available_parallelism` honours the affinity mask, so a host pinned with
+    // `systemctl set-property system.slice AllowedCPUs=0` clamps to 1 — the same
+    // number dockerd computes for itself — rather than to what `lscpu` prints.
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get() as f64)
+        .unwrap_or(1.0);
+    if cfg.cpus > available {
+        tracing::warn!(
+            configured = cfg.cpus,
+            available,
+            "cpus exceeds what this host can run; clamping, because docker refuses a budget above its own CPU count"
+        );
+        cfg.cpus = available;
+    }
+    if cfg.cpus <= 0.0 {
+        cfg.cpus = 1.0;
+    }
+}
+
 async fn start_proxy(
     sandbox: &Sandbox,
     cfg: &WorkerConfig,
@@ -213,6 +244,12 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
     // both refuse to touch these worktrees.
     let active: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Takes this machine out of the fleet when the sandbox stops working, and
+    // puts it back after the cooldown. See breaker.rs.
+    let breaker = Arc::new(breaker::CircuitBreaker::new(
+        breaker::DEFAULT_FAILURE_LIMIT,
+        breaker::DEFAULT_COOLDOWN,
+    ));
     // Only one admin cleanup at a time; also aborts with the session.
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
     let mut cleanup_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -223,13 +260,18 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
         let tx = events_tx.clone();
         let active = active.clone();
         let draining = draining.clone();
+        let breaker = breaker.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 ticker.tick().await;
                 let running: Vec<String> = active.lock().await.keys().cloned().collect();
                 let stats = collect_stats(&cfg, &runner, running.len() as u32).await;
-                let status = if draining.load(std::sync::atomic::Ordering::Relaxed) {
+                // An open breaker reports draining, so the scheduler stops
+                // handing this machine work without an operator doing anything.
+                let status = if draining.load(std::sync::atomic::Ordering::Relaxed)
+                    || breaker.is_open()
+                {
                     "draining"
                 } else {
                     "online"
@@ -287,7 +329,7 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
         let Some(body) = cmd.body else { continue };
         match body {
             pb::server_cmd::Body::Assign(assignment) => {
-                if draining.load(std::sync::atomic::Ordering::Relaxed) {
+                if draining.load(std::sync::atomic::Ordering::Relaxed) || breaker.is_open() {
                     tracing::info!(task = %assignment.task_id, "refusing work while draining");
                     let _ = events_tx
                         .send(client::done_event(client::infra_failure(
@@ -302,6 +344,7 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
                 let tx = events_tx.clone();
                 let active = active.clone();
                 let cfg = cfg.clone();
+                let breaker = breaker.clone();
                 let task_id = assignment.task_id.clone();
                 let worktree_id = assignment.worktree_id.clone();
                 // Protect the worktree before parking on the semaphore so a
@@ -314,8 +357,26 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
                     // slow download cannot stall the command channel.
                     let done = match ServerClient::connect(&cfg.server, &cfg.worker_id, &cfg.worker_token).await {
                         Ok(mut blob_client) => runner.execute(assignment, &mut blob_client, tx.clone()).await,
-                        Err(e) => client::infra_failure(&task_id, e),
+                        // `{e:#}` keeps the anyhow chain: a bare context line
+                        // ("create container for rc-task-…") is what hid a
+                        // one-line docker diagnostic for 22 hours.
+                        Err(e) => client::infra_failure(&task_id, format!("{e:#}")),
                     };
+                    // Only failures on our side feed the breaker; a compile
+                    // error is the worker doing its job.
+                    match done.result.as_ref() {
+                        Some(result) if result.kind == rc_core::ResultKind::InfraError.as_str() => {
+                            if breaker.record_failure() {
+                                tracing::error!(
+                                    failures = breaker.limit(),
+                                    cooldown = ?breaker.cooldown(),
+                                    last_error = %result.summary,
+                                    "sandbox failed repeatedly; leaving the fleet until the cooldown expires"
+                                );
+                            }
+                        }
+                        _ => breaker.record_success(),
+                    }
                     active.lock().await.remove(&task_id);
                     let _ = tx.send(client::done_event(done)).await;
                 });

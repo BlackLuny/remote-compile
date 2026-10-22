@@ -101,8 +101,12 @@ impl Runner {
             // Anything that escapes here is our problem, not the code's: the
             // control plane retries it on another machine (§3.5).
             Err(e) => {
-                tracing::error!(task = %task_id, error = %e, "task failed with an infrastructure error");
-                client::infra_failure(&task_id, e)
+                // `{e:#}` keeps the whole anyhow chain. A bare context line —
+                // "create container for rc-task-…" — is what hid a one-line
+                // docker diagnostic behind 22 hours of silent retries (§8.1).
+                let detail = format!("{e:#}");
+                tracing::error!(task = %task_id, error = %detail, "task failed with an infrastructure error");
+                client::infra_failure(&task_id, detail)
             }
         }
     }
