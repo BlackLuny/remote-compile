@@ -603,3 +603,45 @@ async fn uninstall(data_dir: PathBuf, yes: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_cpus(cpus: f64) -> WorkerConfig {
+        WorkerConfig {
+            cpus,
+            ..Default::default()
+        }
+    }
+
+    fn host_cpus() -> f64 {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as f64)
+            .unwrap_or(1.0)
+    }
+
+    #[test]
+    fn a_cpu_budget_above_the_host_is_clamped_to_it() {
+        // The exact shape of the 22 hour outage: worker.json copied from a
+        // bigger box, docker refusing every create with "Range of CPUs is from
+        // 0.01 to 1.00".
+        let mut cfg = cfg_with_cpus(host_cpus() + 32.0);
+        clamp_cpus(&mut cfg);
+        assert_eq!(cfg.cpus, host_cpus());
+    }
+
+    #[test]
+    fn a_budget_the_host_can_meet_is_left_alone() {
+        let mut cfg = cfg_with_cpus(1.0);
+        clamp_cpus(&mut cfg);
+        assert_eq!(cfg.cpus, 1.0);
+    }
+
+    #[test]
+    fn a_nonsense_budget_becomes_one_cpu() {
+        let mut cfg = cfg_with_cpus(0.0);
+        clamp_cpus(&mut cfg);
+        assert_eq!(cfg.cpus, 1.0);
+    }
+}
