@@ -298,9 +298,10 @@ async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
                 ticker.tick().await;
                 let protect: HashSet<String> = active.lock().await.values().cloned().collect();
                 match runner.gc(idle_days, &protect).await {
-                    Ok(r) if r.reclaimed > 0 => {
+                    Ok(r) if r.reclaimed > 0 || r.reclaimed_orphan_dirs > 0 => {
                         tracing::info!(
                             reclaimed = r.reclaimed,
+                            orphan_dirs = r.reclaimed_orphan_dirs,
                             skipped_active = r.skipped_active,
                             "worktree caches reclaimed"
                         )
@@ -497,6 +498,7 @@ async fn run_cleanup(
             tracing::info!(
                 request = %request_id,
                 reclaimed = report.reclaimed,
+                orphan_dirs = report.reclaimed_orphan_dirs,
                 skipped_active = report.skipped_active,
                 skipped_fresh = report.skipped_fresh,
                 disk_before,
@@ -507,8 +509,8 @@ async fn run_cleanup(
                 request_id,
                 ok: true,
                 message: format!(
-                    "reclaimed {} worktree cache(s); skipped {} active, {} still fresh",
-                    report.reclaimed, report.skipped_active, report.skipped_fresh
+                    "reclaimed {} worktree cache(s) and {} workspace dir(s); skipped {} active, {} still fresh",
+                    report.reclaimed, report.reclaimed_orphan_dirs, report.skipped_active, report.skipped_fresh
                 ),
                 reclaimed: report.reclaimed,
                 skipped_active: report.skipped_active,

@@ -1118,7 +1118,13 @@ impl Runner {
         let now = rc_core::now_secs();
         let mut report = GcReport::default();
 
-        for (name, labels) in self.sandbox.our_volumes().await? {
+        let volumes = self.sandbox.our_volumes().await?;
+        // Every volume we can see, including the ones this pass is about to
+        // remove — the directory sweep below runs after this loop and needs to
+        // know what a worktree is still supposed to have.
+        let mut present: HashSet<String> = volumes.iter().map(|(name, _)| name.clone()).collect();
+
+        for (name, labels) in &volumes {
             let Some(worktree) = labels.get(docker::LABEL_WORKTREE) else {
                 continue; // per-project registry caches are kept
             };
@@ -1136,13 +1142,45 @@ impl Runner {
                 }
             }
             tracing::info!(volume = %name, %worktree, "reclaiming worktree cache");
-            if self.sandbox.remove_volume(&name).await.is_ok() {
+            if self.sandbox.remove_volume(name).await.is_ok() {
+                present.remove(name);
                 report.reclaimed += 1;
                 report.reclaimed_worktrees.push(worktree.clone());
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
+
+        // Workspaces with no cache volume behind them are invisible to the loop
+        // above, which iterates volumes: a directory whose target volume is
+        // already gone — created before volumes carried labels, removed by a
+        // manual `docker volume prune`, or left behind by a `remove_volume`
+        // that failed after the directory was kept — is never visited and its
+        // files stay for good. One fleet had 99 of them holding 13 GB with
+        // nothing in the log, because the GC had no reason to look.
+        report.reclaimed_orphan_dirs = self.reclaim_orphan_dirs(&policy, protect, now, &present);
+
         Ok(report)
+    }
+
+    /// Delete idle workspace directories that have no cache volume left.
+    fn reclaim_orphan_dirs(
+        &self,
+        policy: &GcPolicy,
+        protect: &HashSet<String>,
+        now: i64,
+        present: &HashSet<String>,
+    ) -> u64 {
+        let mut removed = 0;
+        for dir in orphan_workspaces(&self.cfg.work_dir(), policy, protect, now, present) {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    tracing::info!(dir = %dir.display(), "reclaiming workspace with no cache volume");
+                    removed += 1;
+                }
+                Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "could not remove workspace"),
+            }
+        }
+        removed
     }
 }
 
@@ -1161,6 +1199,8 @@ pub struct GcReport {
     pub reclaimed: u64,
     pub skipped_active: u64,
     pub skipped_fresh: u64,
+    /// Workspace directories deleted because no cache volume was left for them.
+    pub reclaimed_orphan_dirs: u64,
     pub reclaimed_worktrees: Vec<String>,
 }
 
@@ -1197,6 +1237,44 @@ fn touch_dir(dir: &Path) {
     if let Err(e) = std::fs::File::open(dir).and_then(|f| f.set_modified(std::time::SystemTime::now())) {
         tracing::warn!(dir = %dir.display(), error = %e, "could not mark workspace as used");
     }
+}
+
+/// Idle workspace directories that have no cache volume behind them.
+///
+/// Split out of `reclaim_orphan_dirs` so the rule — ours, idle, unprotected,
+/// no volume — can be tested without a Docker daemon.
+fn orphan_workspaces(
+    work_root: &Path,
+    policy: &GcPolicy,
+    protect: &HashSet<String>,
+    now: i64,
+    present: &HashSet<String>,
+) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(work_root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let worktree = entry.file_name().to_string_lossy().to_string();
+        // Only our own cache directories (`w-…`); anything else here was put
+        // there by an operator and is not ours to delete.
+        if !worktree.starts_with("w-") || present.contains(&docker::target_volume(&worktree)) {
+            continue;
+        }
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        // Idleness, not just absence of a volume: a directory with no volume
+        // yet is a sync in flight. `protect` already covers that task, but a
+        // race is cheaper to avoid than to explain.
+        let last_used = workspace_last_used_secs(&dir);
+        if decide_reclaim(&worktree, last_used, now, policy, protect) != ReclaimDecision::Reclaim {
+            continue;
+        }
+        out.push(dir);
+    }
+    out
 }
 
 fn workspace_last_used_secs(dir: &Path) -> i64 {
@@ -1638,5 +1716,135 @@ mod tests {
         }
         drop(tx);
         let _ = emitter.await;
+    }
+}
+
+#[cfg(test)]
+mod orphan_workspace_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rc-orphan-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn age(dir: &Path, secs_ago: i64) {
+        let f = std::fs::File::open(dir).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago as u64);
+        f.set_modified(when).unwrap();
+    }
+
+    fn policy(idle_days: i64) -> GcPolicy {
+        GcPolicy {
+            all_unused: false,
+            idle_days,
+        }
+    }
+
+    #[test]
+    fn an_idle_workspace_without_a_volume_is_reclaimed() {
+        let root = scratch("idle");
+        let dir = root.join("w-aaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        age(&dir, 10 * 24 * 3600);
+        let found = orphan_workspaces(
+            &root,
+            &policy(3),
+            &HashSet::new(),
+            rc_core::now_secs(),
+            &HashSet::new(),
+        );
+        assert_eq!(found, vec![dir]);
+    }
+
+    #[test]
+    fn a_workspace_that_still_has_a_volume_is_left_alone() {
+        let root = scratch("hasvol");
+        let dir = root.join("w-bbb");
+        std::fs::create_dir_all(&dir).unwrap();
+        age(&dir, 10 * 24 * 3600);
+        let present: HashSet<String> = [docker::target_volume("w-bbb")].into_iter().collect();
+        let found = orphan_workspaces(
+            &root,
+            &policy(3),
+            &HashSet::new(),
+            rc_core::now_secs(),
+            &present,
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_recent_workspace_is_kept_even_without_a_volume() {
+        // A sync in flight has a directory before it has a volume, and deleting
+        // it would throw away a download in progress.
+        let root = scratch("fresh");
+        let dir = root.join("w-ccc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let found = orphan_workspaces(
+            &root,
+            &policy(3),
+            &HashSet::new(),
+            rc_core::now_secs(),
+            &HashSet::new(),
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_protected_workspace_is_kept() {
+        let root = scratch("protect");
+        let dir = root.join("w-ddd");
+        std::fs::create_dir_all(&dir).unwrap();
+        age(&dir, 10 * 24 * 3600);
+        let protect: HashSet<String> = ["w-ddd".to_string()].into_iter().collect();
+        let found = orphan_workspaces(
+            &root,
+            &policy(3),
+            &protect,
+            rc_core::now_secs(),
+            &HashSet::new(),
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn directories_that_are_not_ours_survive() {
+        let root = scratch("foreign");
+        let dir = root.join("someone-elses-files");
+        std::fs::create_dir_all(&dir).unwrap();
+        age(&dir, 10 * 24 * 3600);
+        let found = orphan_workspaces(
+            &root,
+            &policy(3),
+            &HashSet::new(),
+            rc_core::now_secs(),
+            &HashSet::new(),
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn all_unused_takes_every_orphan_regardless_of_age() {
+        let root = scratch("allunused");
+        let dir = root.join("w-eee");
+        std::fs::create_dir_all(&dir).unwrap();
+        let found = orphan_workspaces(
+            &root,
+            &GcPolicy {
+                all_unused: true,
+                idle_days: 14,
+            },
+            &HashSet::new(),
+            rc_core::now_secs(),
+            &HashSet::new(),
+        );
+        assert_eq!(found, vec![dir]);
     }
 }
