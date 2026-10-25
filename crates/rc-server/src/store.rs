@@ -8,12 +8,17 @@
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rc_core::{now_ms, now_secs};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// `?1,?2,…` for an `IN (...)` clause over `n` bound values.
+fn in_placeholders(n: usize) -> String {
+    (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",")
 }
 
 /// Ordered migration steps. `MIGRATIONS[i]` takes a database at
@@ -377,6 +382,11 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // A WAL that grew to 10 GB under a first, months-deep retention sweep
+        // stays 10 GB forever by default: SQLite reuses the file but never
+        // gives the space back. Cap what has to be scanned at startup and
+        // after every checkpoint.
+        conn.pragma_update(None, "journal_size_limit", 128 * 1024 * 1024)?;
         let store = Store { conn: Mutex::new(conn) };
         store.migrate()?;
         Ok(store)
@@ -2303,36 +2313,59 @@ impl Store {
         if ids.is_empty() {
             return Ok(0);
         }
-        // Outside the lock above: `unpin_task_blobs` takes it itself.
-        for id in &ids {
-            self.unpin_task_blobs(id)?;
-        }
-        let conn = self.conn.lock();
-        let mut removed = 0;
-        for id in &ids {
-            for table in [
-                "task_events",
-                "task_attempts",
-                "task_artifacts",
-                "task_subs",
-                "task_inputs",
-            ] {
-                conn.execute(
-                    &format!("DELETE FROM {table} WHERE task_id = ?1"),
-                    params![id],
-                )?;
-            }
-            removed += conn.execute(
-                "DELETE FROM tasks
-                  WHERE id = ?1 AND status IN ('done','failed','canceled','superseded')",
-                params![id],
+
+        // One transaction for the whole batch. The per-row, per-table shape
+        // this replaced committed a thousand times per batch — a thousand
+        // WAL appends and fsyncs — which is how a retention pass ended up
+        // holding the single writer for minutes on a cold, multi-GB volume.
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let marks = in_placeholders(ids.len());
+
+        // Blob pins are released first: the CAS can only reclaim a blob once
+        // no task references it (§9). The count comes from the batch, not a
+        // flat `- 1` per distinct hash — two pruned tasks sharing a blob must
+        // drop its pin by two.
+        //
+        // Numbered placeholders are reused by SQLite across both `IN` clauses,
+        // so the batch binds once even though the list appears twice.
+        tx.execute(
+            &format!(
+                "UPDATE cas_blobs SET pinned = MAX(0, pinned - (
+                     SELECT COUNT(*) FROM task_blob_refs r
+                      WHERE r.hash = cas_blobs.hash AND r.task_id IN ({marks})))
+                  WHERE hash IN (SELECT hash FROM task_blob_refs WHERE task_id IN ({marks}))"
+            ),
+            params_from_iter(ids.iter()),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM task_blob_refs WHERE task_id IN ({marks})"),
+            params_from_iter(ids.iter()),
+        )?;
+        for table in [
+            "task_events",
+            "task_attempts",
+            "task_artifacts",
+            "task_subs",
+            "task_inputs",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE task_id IN ({marks})"),
+                params_from_iter(ids.iter()),
             )?;
         }
+        let removed = tx.execute(
+            &format!(
+                "DELETE FROM tasks WHERE status IN ('done','failed','canceled','superseded')
+                   AND id IN ({marks})"
+            ),
+            params_from_iter(ids.iter()),
+        )?;
+        tx.commit()?;
         Ok(removed)
     }
 
     // --------------------------- aggregations ---------------------------
-
     /// Numbers behind the Overview cards.
     pub fn overview_counters(&self, window_secs: i64) -> Result<OverviewCounters> {
         let since = now_ms() - window_secs * 1000;
@@ -3402,5 +3435,41 @@ mod retention_tests {
         assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 2);
         assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 1);
         assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn pruning_a_batch_releases_every_blob_reference_it_held() {
+        // A blob shared by two pruned tasks has two pins. Batching the unpin
+        // into one statement must count references among the batch, not apply
+        // a single `- 1` per distinct hash — otherwise a blob stays pinned
+        // forever and GC can never reclaim it (§9).
+        let s = store();
+        let shared = "a".repeat(64);
+        for id in ["t-1", "t-2"] {
+            add(&s, id, "done", now_ms() - 40 * DAY_MS);
+            s.pin_task_blobs(id, std::slice::from_ref(&shared)).unwrap();
+        }
+        assert_eq!(pinned(&s, &shared), 2);
+
+        assert_eq!(s.prune_terminal_tasks(30 * 24 * 3600, 100).unwrap(), 2);
+
+        assert_eq!(pinned(&s, &shared), 0);
+        let refs: i64 = s
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM task_blob_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 0, "the batch deletion must not leak refs");
+    }
+
+    fn pinned(s: &Store, hash: &str) -> i64 {
+        s.conn
+            .lock()
+            .query_row(
+                "SELECT pinned FROM cas_blobs WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 }

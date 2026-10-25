@@ -34,12 +34,21 @@ async fn dispatch_loop(app: Arc<App>) {
     }
 }
 
-/// How many tasks one retention pass may touch.
+/// How many tasks one retention batch may touch.
 ///
-/// The loop runs every 60 s, so this is a ceiling on how fast history can be
-/// let go of — not a limit on how much is kept. 200 at a time drains months of
-/// backlog within an hour while keeping each write small.
-const TASK_PRUNE_BATCH: usize = 200;
+/// A batch is one transaction, so this is also what bounds how long the
+/// single SQLite writer is held. 200 manifests (each up to a few MB) held it
+/// for minutes on a cold volume and took the whole process down with it; the
+/// loop below runs several smaller batches per pass instead, so the same
+/// backlog drains without any single write becoming a stall.
+const TASK_PRUNE_BATCH: usize = 20;
+
+/// How much wall-clock time one maintenance pass may spend draining history.
+///
+/// Without a budget, months of backlog become one enormous write per tick and
+/// the console is unusable until it finishes. With it, retention makes steady
+/// progress and yields the rest of the minute to requests.
+const RETENTION_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 pub struct GcReport {
@@ -87,79 +96,117 @@ async fn maintenance_loop(app: Arc<App>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(60));
     loop {
         ticker.tick().await;
-        let policy = app.policy();
-
-        // Abandoned queue entries. Disconnection alone never cancels a task
-        // (§5.3, risk #27) — only this TTL does.
-        match app.store.expire_pending(policy.pending_ttl_secs) {
-            Ok(ids) => {
-                for id in ids {
-                    app.store.unpin_task_blobs(&id).ok();
-                    app.publish_task(&id);
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "pending expiry failed"),
-        }
-
-        if let Err(e) = collect_garbage(&app) {
-            tracing::error!(error = %e, "gc failed");
+        // Everything in `maintenance_pass` is synchronous SQLite and file I/O.
+        // Running it inline blocks a runtime worker, and a worker blocked in
+        // `pread` takes the reactor with it: no accept loop, no health checks,
+        // no static files, for as long as the query runs. On a database with
+        // months of history behind a cold cache that was minutes.
+        let pass = tokio::task::spawn_blocking({
+            let app = app.clone();
+            move || maintenance_pass(&app)
+        });
+        if let Err(e) = pass.await {
+            tracing::error!(error = %e, "maintenance pass panicked");
         }
 
         // Env images distribute themselves once a registry is configured.
         if let Err(e) = crate::images::publish_pending(&app).await {
             tracing::warn!(error = %e, "env image publish failed");
         }
+    }
+}
 
-        // Workers that stopped heartbeating.
-        match app.store.stale_workers(policy.worker_offline_secs) {
-            Ok(ids) => {
-                for id in ids {
-                    if app.workers.is_connected(&id) {
-                        continue;
-                    }
-                    app.store.set_worker_status(&id, "offline").ok();
-                    app.store
-                        .raise_alert(
-                            &format!("worker_offline:{id}"),
-                            "warn",
-                            &format!("worker {id} has not reported in"),
-                        )
-                        .ok();
-                }
+/// One synchronous maintenance tick: expiry, GC, liveness, rollups and
+/// retention. Called from the blocking pool — never from a runtime worker.
+fn maintenance_pass(app: &App) {
+    let policy = app.policy();
+
+    // Abandoned queue entries. Disconnection alone never cancels a task
+    // (§5.3, risk #27) — only this TTL does.
+    match app.store.expire_pending(policy.pending_ttl_secs) {
+        Ok(ids) => {
+            for id in ids {
+                app.store.unpin_task_blobs(&id).ok();
+                app.publish_task(&id);
             }
-            Err(e) => tracing::error!(error = %e, "worker liveness check failed"),
         }
+        Err(e) => tracing::error!(error = %e, "pending expiry failed"),
+    }
 
-        // Long-window rollups are pruned on the same schedule (§15.1).
-        let now = now_secs();
-        app.store.prune_rollups("1min", now - 7 * 24 * 3600).ok();
-        app.store.prune_rollups("1hour", now - 90 * 24 * 3600).ok();
+    if let Err(e) = collect_garbage(app) {
+        tracing::error!(error = %e, "gc failed");
+    }
 
-        // Task history has no natural end, and the manifest it carries is
-        // megabytes each: 17 of the 18 GB database on a fleet building one
-        // monorepo, growing all the time, because nothing ever deleted it.
-        // Batched, so a first pass over months of history cannot stall the
-        // control plane behind one enormous write.
+    // Workers that stopped heartbeating.
+    match app.store.stale_workers(policy.worker_offline_secs) {
+        Ok(ids) => {
+            for id in ids {
+                if app.workers.is_connected(&id) {
+                    continue;
+                }
+                app.store.set_worker_status(&id, "offline").ok();
+                app.store
+                    .raise_alert(
+                        &format!("worker_offline:{id}"),
+                        "warn",
+                        &format!("worker {id} has not reported in"),
+                    )
+                    .ok();
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "worker liveness check failed"),
+    }
+
+    // Long-window rollups are pruned on the same schedule (§15.1).
+    let now = now_secs();
+    app.store.prune_rollups("1min", now - 7 * 24 * 3600).ok();
+    app.store.prune_rollups("1hour", now - 90 * 24 * 3600).ok();
+
+    drain_history(app, &policy);
+
+    let (blobs, bytes, _) = app.store.cas_summary().unwrap_or((0, 0, 0));
+    app.metrics.set("cas_blobs", blobs as f64);
+    app.metrics.set("cas_bytes", bytes as f64);
+}
+
+/// Task history has no natural end, and the manifest it carries is megabytes
+/// each: 17 of the 18 GB database on a fleet building one monorepo, growing all
+/// the time, because nothing ever deleted it.
+///
+/// Batches run back-to-back until [`RETENTION_BUDGET`] is spent, so a first pass
+/// over months of history still finishes in a bounded time without any single
+/// transaction becoming a multi-minute stall.
+fn drain_history(app: &App, policy: &crate::config::Policy) {
+    let deadline = std::time::Instant::now() + RETENTION_BUDGET;
+    let (mut manifests, mut tasks) = (0usize, 0usize);
+    loop {
         match app
             .store
             .clear_old_task_manifests(policy.manifest_retention_secs, TASK_PRUNE_BATCH)
         {
-            Ok(n) if n > 0 => tracing::info!(tasks = n, "released stored task manifests"),
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "manifest retention failed"),
+            Ok(n) => manifests += n,
+            Err(e) => return tracing::error!(error = %e, "manifest retention failed"),
         }
         match app
             .store
             .prune_terminal_tasks(policy.task_retention_secs, TASK_PRUNE_BATCH)
         {
-            Ok(n) if n > 0 => tracing::info!(tasks = n, "pruned old task history"),
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "task retention failed"),
+            Ok(n) => tasks += n,
+            Err(e) => return tracing::error!(error = %e, "task retention failed"),
         }
-
-        let (blobs, bytes, _) = app.store.cas_summary().unwrap_or((0, 0, 0));
-        app.metrics.set("cas_blobs", blobs as f64);
-        app.metrics.set("cas_bytes", bytes as f64);
+        // Nothing left, or the pass has done its share for this minute.
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        // A short gap between batches keeps the writer lock fair for the
+        // request path instead of handing it straight back to the sweep.
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if manifests > 0 {
+        tracing::info!(tasks = manifests, "released stored task manifests");
+    }
+    if tasks > 0 {
+        tracing::info!(tasks = tasks, "pruned old task history");
     }
 }
 
