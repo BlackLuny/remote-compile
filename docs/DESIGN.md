@@ -469,6 +469,11 @@ agent 提交 Dockerfile（或引用上游镜像）→ server 记录 `pending_app
 | 本地索引（rc-agent） | path 不存在即删 + 30 天 TTL |
 | worker 离线 | 超过阈值（默认 24h）无心跳 → 标记 offline，其独占缓存 volume 进入可回收队列 |
 
+保留策略第一次面对历史积压时最贵：老库里 17/18 GB 是每个任务的 manifest（约 2 MB）。
+这类清理必须**小批量 + 每轮时间预算**，并且绝不能占用 async 运行时线程——SQLite 是同步接口
+一次多分钟的 `pread` 会把 reactor 一起拖住，连静态控制台和 `/healthz` 都会停摆（§15.1）。
+同理，`journal_size_limit` 要有上限，否则第一次清扫撑大的 WAL 会永远停在那个高位。
+
 ## 10. 语言适配器
 
 ### 10.1 接口
