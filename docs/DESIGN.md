@@ -437,6 +437,7 @@ worker 收到任务 → 从 server CAS 拉取缺失 blob → 容器内重建：L
 
 - **一键安装**：`curl ... | sh` 或单静态二进制 + `rc-worker install --server ... --token ...`；systemd unit 自动注册；
 - **注册认证**：enrollment token（管理后台生成，限时单次使用）→ 换取 worker 证书，之后心跳/任务走双向认证；
+- **命名**：控制台可给 worker 起显示名（`workers.name`，留空即回落到 id），只影响展示；`id` 仍是登记身份，token、任务历史与调度亲和都按它索引，重命名不会搬动任何一条；
 - **升级/下线**：`drain` 模式——不接新任务、跑完存量再退出；
 - **卸载**：`rc-worker uninstall` 清理自身创建的容器/volume（按 `rc.*` label）、systemd unit、二进制；
 - **崩溃恢复**：启动时按 label reconcile，清理僵尸容器；向 server 对账任务状态。

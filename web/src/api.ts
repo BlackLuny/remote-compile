@@ -134,6 +134,7 @@ export interface WorkerStats {
 
 export interface Worker {
   id: string;
+  name: string;
   arch: string;
   labels: string;
   capacity: string;

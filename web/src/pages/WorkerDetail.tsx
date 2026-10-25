@@ -43,6 +43,8 @@ export function WorkerDetail({ role }: { role: Role }) {
   const [cleanupResult, setCleanupResult] = useState<WorkerCleanupResult | null>(null);
   const [mode, setMode] = useState<"idle" | "all">("idle");
   const [idleDays, setIdleDays] = useState("7");
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [name, setName] = useState("");
 
   const q = useQuery({
     queryKey: ["worker", id],
@@ -58,6 +60,15 @@ export function WorkerDetail({ role }: { role: Role }) {
       api.post<WorkerCleanupResult>(`/api/workers/${id}/cleanup`, body),
     onSuccess: (data) => {
       setCleanupResult(data);
+      qc.invalidateQueries({ queryKey: ["worker", id] });
+      qc.invalidateQueries({ queryKey: ["workers"] });
+    },
+  });
+
+  const rename = useMutation({
+    mutationFn: (next: string) => api.post(`/api/workers/${id}/rename`, { name: next }),
+    onSuccess: () => {
+      setRenameOpen(false);
       qc.invalidateQueries({ queryKey: ["worker", id] });
       qc.invalidateQueries({ queryKey: ["workers"] });
     },
@@ -120,10 +131,31 @@ export function WorkerDetail({ role }: { role: Role }) {
             ← 返回 Worker 列表
           </Link>
           <h1 className="mt-1 text-[16px] font-semibold">
-            <Mono>{worker.id}</Mono>
+            {worker.name ? (
+              <>
+                {worker.name}
+                <span className="ml-2 text-[12px] font-normal text-[var(--color-ink-faint)]">
+                  <Mono>{worker.id}</Mono>
+                </span>
+              </>
+            ) : (
+              <Mono>{worker.id}</Mono>
+            )}
           </h1>
         </div>
         <div className="flex items-center gap-2">
+          {role === "admin" && (
+            <Button
+              onClick={() => {
+                setName(worker.name ?? "");
+                rename.reset();
+                setRenameOpen(true);
+              }}
+              title="给这台机器起个一眼能认出的名字"
+            >
+              重命名
+            </Button>
+          )}
           {role === "admin" && live && (
             <Button
               onClick={() => {
@@ -223,6 +255,59 @@ export function WorkerDetail({ role }: { role: Role }) {
           )}
         </Card>
       </div>
+
+      {renameOpen && (
+        <Modal
+          title="重命名 worker"
+          onClose={() => {
+            if (rename.isPending) return;
+            setRenameOpen(false);
+            rename.reset();
+          }}
+        >
+          <p className="mb-3 text-[12px] text-[var(--color-ink-dim)]">
+            只改控制台里显示的名字；<Mono>{worker.id}</Mono> 仍是登记身份，任务历史与调度不受影响。
+          </p>
+          <Input
+            autoFocus
+            className="w-full"
+            placeholder={worker.id}
+            maxLength={48}
+            value={name}
+            disabled={rename.isPending}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !rename.isPending) rename.mutate(name.trim());
+            }}
+          />
+          <p className="mt-2 text-[11px] text-[var(--color-ink-faint)]">
+            留空并保存即恢复为默认 ID。最多 48 个字符。
+          </p>
+          {rename.isError && (
+            <div className="mt-3">
+              <ErrorBox message={(rename.error as Error).message} />
+            </div>
+          )}
+          <div className="mt-4 flex justify-end gap-2">
+            <Button
+              disabled={rename.isPending}
+              onClick={() => {
+                setRenameOpen(false);
+                rename.reset();
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              disabled={rename.isPending}
+              onClick={() => rename.mutate(name.trim())}
+            >
+              {rename.isPending ? "保存中…" : "保存"}
+            </Button>
+          </div>
+        </Modal>
+      )}
 
       {cleanupOpen && (
         <Modal

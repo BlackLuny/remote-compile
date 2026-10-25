@@ -23,13 +23,14 @@ import {
   Td,
   Th,
 } from "../components/ui";
-import { agoSecs, percent, statusTone } from "../lib/format";
+import { agoSecs, percent, shortId, statusTone } from "../lib/format";
 
 export function Workers({ role }: { role: Role }) {
   const qc = useQueryClient();
   const [token, setToken] = useState<string | null>(null);
   const [cleanupFor, setCleanupFor] = useState<Worker | null>(null);
   const [cleanupResult, setCleanupResult] = useState<WorkerCleanupResult | null>(null);
+  const [renameFor, setRenameFor] = useState<Worker | null>(null);
 
   const q = useQuery({
     queryKey: ["workers"],
@@ -57,6 +58,15 @@ export function Workers({ role }: { role: Role }) {
   const enroll = useMutation({
     mutationFn: () => api.post<{ token: string; expires_in: number }>("/api/enrollment-tokens", {}),
     onSuccess: (data) => setToken(data.token),
+  });
+
+  const rename = useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) =>
+      api.post(`/api/workers/${id}/rename`, { name }),
+    onSuccess: () => {
+      setRenameFor(null);
+      qc.invalidateQueries({ queryKey: ["workers"] });
+    },
   });
 
   return (
@@ -101,10 +111,21 @@ export function Workers({ role }: { role: Role }) {
               {q.data!.workers.map((w) => (
                 <tr key={w.id} className="hover:bg-[var(--color-panel-2)]/50">
                   <Td>
-                    <Link to={`/workers/${w.id}`} className="hover:text-[var(--color-accent)]">
-                      <Mono>{w.id}</Mono>
+                    <Link
+                      to={`/workers/${w.id}`}
+                      className="hover:text-[var(--color-accent)]"
+                      title={w.id}
+                    >
+                      {w.name ? <span className="font-medium">{w.name}</span> : <Mono>{w.id}</Mono>}
                     </Link>
-                    <div className="text-[11px] text-[var(--color-ink-faint)]">{w.arch}</div>
+                    <div className="text-[11px] text-[var(--color-ink-faint)]">
+                      {w.name && (
+                        <>
+                          <Mono>{shortId(w.id, 12)}</Mono> ·{" "}
+                        </>
+                      )}
+                      {w.arch}
+                    </div>
                   </Td>
                   <Td>
                     <Badge tone={statusTone[w.connected ? w.status : "offline"] ?? "muted"}>
@@ -138,6 +159,9 @@ export function Workers({ role }: { role: Role }) {
                   {role === "admin" && (
                     <Td>
                       <div className="flex justify-end gap-1.5">
+                        <Button onClick={() => setRenameFor(w)} title="给这台机器起个一眼能认出的名字">
+                          重命名
+                        </Button>
                         {w.status === "draining" ? (
                           <Button onClick={() => act.mutate({ id: w.id, action: "resume" })}>
                             恢复
@@ -168,7 +192,7 @@ export function Workers({ role }: { role: Role }) {
                         <Button
                           variant="danger"
                           onClick={() => {
-                            if (confirm(`从资源池移除 ${w.id}？运行中的任务会重新排队。`)) {
+                            if (confirm(`从资源池移除 ${w.name || w.id}？运行中的任务会重新排队。`)) {
                               act.mutate({ id: w.id, action: "delete" });
                             }
                           }}
@@ -206,6 +230,20 @@ export function Workers({ role }: { role: Role }) {
         </Modal>
       )}
 
+      {renameFor && (
+        <RenameModal
+          worker={renameFor}
+          pending={rename.isPending}
+          error={rename.isError ? (rename.error as Error).message : null}
+          onClose={() => {
+            if (rename.isPending) return;
+            setRenameFor(null);
+            rename.reset();
+          }}
+          onRun={(name) => rename.mutate({ id: renameFor.id, name })}
+        />
+      )}
+
       {cleanupFor && (
         <CleanupModal
           worker={cleanupFor}
@@ -222,6 +260,62 @@ export function Workers({ role }: { role: Role }) {
         />
       )}
     </div>
+  );
+}
+
+function RenameModal({
+  worker,
+  pending,
+  error,
+  onClose,
+  onRun,
+}: {
+  worker: Worker;
+  pending: boolean;
+  error: string | null;
+  onClose: () => void;
+  onRun: (name: string) => void;
+}) {
+  const [name, setName] = useState(worker.name ?? "");
+  const trimmed = name.trim();
+  const invalid = trimmed.length > 48;
+
+  return (
+    <Modal title="重命名 worker" onClose={onClose}>
+      <p className="mb-3 text-[12px] text-[var(--color-ink-dim)]">
+        只改控制台里显示的名字。<Mono>{worker.id}</Mono> 是这台机器的登记身份，
+        任务历史、token 和调度亲和都按它索引，重命名不会影响它们。
+      </p>
+      <Input
+        autoFocus
+        className="w-full"
+        placeholder={worker.id}
+        maxLength={48}
+        value={name}
+        disabled={pending}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !pending && !invalid) onRun(trimmed);
+        }}
+      />
+      <p className="mt-2 text-[11px] text-[var(--color-ink-faint)]">
+        留空并保存即恢复为默认 ID。最多 48 个字符。
+      </p>
+      {invalid && <p className="mt-2 text-[12px] text-[var(--color-warn)]">名字最多 48 个字符。</p>}
+      {error && (
+        <div className="mt-3">
+          <ErrorBox message={error} />
+        </div>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <Button onClick={onClose} disabled={pending}>
+          取消
+        </Button>
+        <Button variant="primary" disabled={pending || invalid} onClick={() => onRun(trimmed)}>
+          {pending ? "保存中…" : "保存"}
+        </Button>
+      </div>
+    </Modal>
   );
 }
 

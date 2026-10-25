@@ -145,7 +145,11 @@ export function Overview() {
                   <tr key={w.id}>
                     <Td>
                       <Link to={`/workers/${w.id}`} className="hover:text-[var(--color-accent)]" title={w.id}>
-                        <Mono>{shortId(w.id, 14)}</Mono>
+                        {w.name ? (
+                          <span className="font-medium">{w.name}</span>
+                        ) : (
+                          <Mono>{shortId(w.id, 14)}</Mono>
+                        )}
                       </Link>
                       <div className="mt-0.5">
                         <Badge tone={statusTone[w.status] ?? "muted"}>{w.status}</Badge>

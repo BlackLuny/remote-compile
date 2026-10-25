@@ -83,6 +83,10 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS idx_task_artifacts_hash ON task_artifacts(hash);
      CREATE INDEX IF NOT EXISTS idx_task_artifacts_expiry ON task_artifacts(expires_at);",
+    // Operators recognise a machine by a name, not by `worker-3fa9c1d2e4`. The
+    // name is display only: `id` stays the identity that tokens, task history
+    // and scheduling are keyed by.
+    "ALTER TABLE workers ADD COLUMN name TEXT NOT NULL DEFAULT '';",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -289,6 +293,8 @@ pub struct ImageRow {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerRow {
     pub id: String,
+    /// Display name; empty means the console shows `id`.
+    pub name: String,
     pub arch: String,
     pub labels: String,
     pub capacity: String,
@@ -1572,16 +1578,20 @@ impl Store {
     // ------------------------------ workers ------------------------------
 
     pub fn upsert_worker(&self, w: &WorkerRow, token_hash: &str) -> Result<()> {
+        // `name` is deliberately absent from the DO UPDATE: re-enrolling a
+        // machine (new token, same id) must not throw away the name an
+        // operator gave it.
         self.conn.lock().execute(
-            "INSERT INTO workers (id, arch, labels, capacity, status, version, max_parallel,
+            "INSERT INTO workers (id, name, arch, labels, capacity, status, version, max_parallel,
                  enrolled_at, last_hb, token_hash)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)
              ON CONFLICT(id) DO UPDATE SET arch = excluded.arch, labels = excluded.labels,
                  capacity = excluded.capacity, status = excluded.status,
                  version = excluded.version, max_parallel = excluded.max_parallel,
                  token_hash = excluded.token_hash",
             params![
                 w.id,
+                w.name,
                 w.arch,
                 w.labels,
                 w.capacity,
@@ -1617,6 +1627,19 @@ impl Store {
         Ok(())
     }
 
+    /// Rename a worker for display. An empty `name` restores the id fallback.
+    ///
+    /// Not every caller has a row yet (a stale console can act on a worker that
+    /// was just deleted), so the number of changed rows is returned rather than
+    /// pretending success.
+    pub fn set_worker_name(&self, id: &str, name: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE workers SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn list_workers(&self) -> Result<Vec<WorkerRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT * FROM workers ORDER BY id")?;
@@ -1624,6 +1647,7 @@ impl Store {
             .query_map([], |r| {
                 Ok(WorkerRow {
                     id: r.get("id")?,
+                    name: r.get("name")?,
                     arch: r.get("arch")?,
                     labels: r.get("labels")?,
                     capacity: r.get("capacity")?,
@@ -2835,6 +2859,7 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN egress_key;
                  ALTER TABLE tasks DROP COLUMN units_seen_total;
                  ALTER TABLE tasks DROP COLUMN scope_hash;
+                 ALTER TABLE workers DROP COLUMN name;
                  INSERT INTO images (id, digest) VALUES ('e1', 'd');
                  INSERT INTO tasks (id, task_type, fingerprint) VALUES ('t1', 'check', 'fp1');",
             )
@@ -2850,6 +2875,11 @@ mod tests {
         // grant, which is what `with_egress` treats as "no grant" — so its
         // cached result stays reachable across the upgrade.
         assert_eq!(s.get_task("t1").unwrap().unwrap().egress_key, "");
+        // The workers table gained `name`; an existing machine simply reads
+        // back with no name, which the console renders as its id.
+        s.upsert_worker(&WorkerRow { id: "w1".into(), ..Default::default() }, "h").unwrap();
+        assert_eq!(s.list_workers().unwrap()[0].name, "");
+        assert!(s.set_worker_name("w1", "beefy-01").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2913,6 +2943,44 @@ mod tests {
         let img = s.get_image("e1").unwrap().unwrap();
         assert_eq!(img.status, "healthy");
         assert_eq!(img.consecutive_env_errors, 0);
+    }
+
+    #[test]
+    fn a_worker_can_be_renamed_without_moving_its_identity() {
+        // The id keys the token hash, task history and scheduler affinity, so a
+        // rename must be a display concern only.
+        let s = store();
+        let row = WorkerRow { id: "w1".into(), arch: "x86_64".into(), ..Default::default() };
+        s.upsert_worker(&row, "h1").unwrap();
+        assert_eq!(s.list_workers().unwrap()[0].name, "");
+
+        assert!(s.set_worker_name("w1", "beefy-01").unwrap());
+        let w = s.list_workers().unwrap().remove(0);
+        assert_eq!(w.name, "beefy-01");
+        assert_eq!(w.id, "w1");
+        assert_eq!(s.worker_token_hash("w1").unwrap().unwrap(), "h1");
+
+        // Clearing the name is how an operator asks for the id fallback back.
+        assert!(s.set_worker_name("w1", "").unwrap());
+        assert_eq!(s.list_workers().unwrap()[0].name, "");
+        assert!(!s.set_worker_name("gone", "x").unwrap());
+    }
+
+    #[test]
+    fn re_enrolling_a_machine_keeps_its_name() {
+        // Re-enrollment rewrites arch/capacity/version/token; the operator's
+        // name is not one of the facts the worker gets to reset.
+        let s = store();
+        let row = WorkerRow { id: "w1".into(), ..Default::default() };
+        s.upsert_worker(&row, "h1").unwrap();
+        s.set_worker_name("w1", "beefy-01").unwrap();
+
+        let again = WorkerRow { id: "w1".into(), arch: "aarch64".into(), ..Default::default() };
+        s.upsert_worker(&again, "h2").unwrap();
+        let w = s.list_workers().unwrap().remove(0);
+        assert_eq!(w.name, "beefy-01");
+        assert_eq!(w.arch, "aarch64");
+        assert_eq!(s.worker_token_hash("w1").unwrap().unwrap(), "h2");
     }
 
     #[test]
