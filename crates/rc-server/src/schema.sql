@@ -99,6 +99,10 @@ CREATE INDEX IF NOT EXISTS idx_images_digest ON images(digest);
 
 CREATE TABLE IF NOT EXISTS workers (
   id            TEXT PRIMARY KEY,
+  -- Operator-set display name. `id` is the enrollment identity (it keys the
+  -- token hash, task history and scheduling), so renaming must never touch it;
+  -- an empty name means "call it by its id".
+  name          TEXT NOT NULL DEFAULT '',
   arch          TEXT NOT NULL DEFAULT '',
   labels        TEXT NOT NULL DEFAULT '{}',
   capacity      TEXT NOT NULL DEFAULT '{}',

@@ -163,6 +163,9 @@ impl WorkerApi for WorkerService {
             stored.max_parallel as u32,
             tx,
         );
+        // A fresh live entry starts with no name; the operator's name lives in
+        // the enrollment row, so reconnecting must not lose it.
+        self.app.workers.set_name(&worker_id, &stored.name);
         self.app.store.touch_worker(&worker_id, "online").ok();
         self.app.store.resolve_alert(&format!("worker_offline:{worker_id}")).ok();
         tracing::info!(worker = %worker_id, "worker channel opened");

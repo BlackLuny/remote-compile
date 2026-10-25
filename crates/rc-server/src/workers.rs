@@ -15,6 +15,9 @@ pub type CmdSender = mpsc::Sender<Result<ServerCmd, tonic::Status>>;
 #[derive(Clone)]
 pub struct WorkerConn {
     pub id: String,
+    /// Operator-set display name, refreshed from the enrollment row on connect
+    /// and by the rename API while connected. Empty means "show the id".
+    pub name: String,
     pub arch: String,
     pub version: String,
     pub status: String,
@@ -69,6 +72,7 @@ impl WorkerRegistry {
             id.to_string(),
             WorkerConn {
                 id: id.to_string(),
+                name: String::new(),
                 arch: arch.to_string(),
                 version: version.to_string(),
                 status: "online".into(),
@@ -150,6 +154,15 @@ impl WorkerRegistry {
         v
     }
 
+    /// Set the display name on the live entry. The registry is rebuilt on every
+    /// connect, so a rename that only reached SQLite would disappear from the
+    /// overview until the worker reconnected.
+    pub fn set_name(&self, id: &str, name: &str) {
+        if let Some(w) = self.inner.lock().get_mut(id) {
+            w.name = name.to_string();
+        }
+    }
+
     pub fn set_status(&self, id: &str, status: &str) {
         if let Some(w) = self.inner.lock().get_mut(id) {
             w.status = status.to_string();
@@ -221,6 +234,24 @@ mod tests {
         r.heartbeat("w1", WorkerStats::default(), "online", &[], &[]);
         assert_eq!(r.get("w1").unwrap().status, "online");
         assert!(!r.get("w1").unwrap().admin_drain);
+    }
+
+    #[tokio::test]
+    async fn a_rename_is_not_undone_by_a_heartbeat() {
+        // Heartbeats refresh stats/status/capabilities, never the operator's
+        // name — and a reconnect seeds it from the enrollment row.
+        let (r, _rx) = registry_with("w1", 2);
+        r.set_name("w1", "beefy-01");
+        r.heartbeat("w1", WorkerStats::default(), "online", &[], &[]);
+        assert_eq!(r.get("w1").unwrap().name, "beefy-01");
+
+        let (tx2, _rx2) = mpsc::channel(8);
+        r.connect("w1", "x86_64", "0.1.0", 2, tx2);
+        assert_eq!(r.get("w1").unwrap().name, "", "a fresh connect starts empty");
+        r.set_name("w1", "beefy-01");
+        assert_eq!(r.get("w1").unwrap().name, "beefy-01");
+        r.set_name("other", "ignored");
+        assert!(r.get("other").is_none());
     }
 
     #[tokio::test]

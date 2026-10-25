@@ -120,6 +120,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/workers/{id}", get(get_worker).delete(delete_worker))
         .route("/api/workers/{id}/drain", post(drain_worker))
         .route("/api/workers/{id}/resume", post(resume_worker))
+        .route("/api/workers/{id}/rename", post(rename_worker))
         .route("/api/workers/{id}/cleanup", post(cleanup_worker))
         .route("/api/enrollment-tokens", get(list_enrollment).post(create_enrollment))
         .route("/api/agent-tokens", get(list_agent_tokens).post(create_agent_token))
@@ -283,9 +284,14 @@ async fn overview(
     })))
 }
 
+/// Longest worker display name the console will accept. Names sit in table
+/// cells next to the id and status, so a paragraph is never useful there.
+const WORKER_NAME_MAX: usize = 48;
+
 fn worker_json(w: crate::workers::WorkerConn) -> serde_json::Value {
     json!({
         "id": w.id,
+        "name": w.name,
         "arch": w.arch,
         "version": w.version,
         "status": w.status,
@@ -370,9 +376,10 @@ async fn list_workers(_u: User, State(app): State<Arc<App>>) -> ApiResult<Json<s
         .into_iter()
         .map(|r| {
             let mut base = json!({
-                "id": r.id, "arch": r.arch, "labels": r.labels, "capacity": r.capacity,
-                "status": r.status, "version": r.version, "max_parallel": r.max_parallel,
-                "enrolled_at": r.enrolled_at, "last_hb": r.last_hb, "connected": false,
+                "id": r.id, "name": r.name, "arch": r.arch, "labels": r.labels,
+                "capacity": r.capacity, "status": r.status, "version": r.version,
+                "max_parallel": r.max_parallel, "enrolled_at": r.enrolled_at,
+                "last_hb": r.last_hb, "connected": false,
             });
             if let Some(l) = live.get(&r.id) {
                 base["connected"] = json!(true);
@@ -432,6 +439,46 @@ async fn resume_worker(
     app.store.audit(&u.username, "resume_worker", &id, "").ok();
     app.dispatch_signal.notify_one();
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RenameReq {
+    #[serde(default)]
+    name: String,
+}
+
+/// Give a worker a human name for the console.
+///
+/// Only the display name changes. `id` is the enrollment identity: it keys the
+/// token hash, the task history and the scheduler's cache affinity, so a rename
+/// that touched it would orphan running work and strand cached volumes.
+/// An empty `name` clears the alias and falls back to the id.
+async fn rename_worker(
+    AdminUser(u): AdminUser,
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let name = req.name.trim();
+    if name.chars().count() > WORKER_NAME_MAX {
+        return Err(ApiError::bad(format!(
+            "name must be at most {WORKER_NAME_MAX} characters"
+        )));
+    }
+    // A name is rendered next to status and task counts in tight table cells;
+    // control characters would either break the layout or hide the id it is
+    // meant to clarify.
+    if name.chars().any(|c| c.is_control()) {
+        return Err(ApiError::bad("name must not contain control characters"));
+    }
+    if !app.store.set_worker_name(&id, name).map_err(ApiError::from)? {
+        return Err(ApiError::not_found("unknown worker"));
+    }
+    // The overview reads the live registry, so update both or the console
+    // shows two different names for the same machine.
+    app.workers.set_name(&id, name);
+    app.store.audit(&u.username, "rename_worker", &id, name).ok();
+    Ok(Json(json!({ "ok": true, "name": name })))
 }
 
 #[derive(Deserialize)]
