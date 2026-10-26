@@ -251,6 +251,7 @@ async fn overview(
         .store
         .list_tasks(&TaskFilter { limit: Some(15), ..Default::default() })
         .map_err(ApiError::from)?;
+    let names = app.store.worker_names().map_err(ApiError::from)?;
 
     let (metric_counters, metric_gauges) = app.metrics.snapshot();
 
@@ -279,7 +280,7 @@ async fn overview(
         })).collect::<Vec<_>>(),
         "storage": { "blobs": cas_count, "bytes": cas_bytes, "pinned": cas_pinned },
         "alerts": app.store.list_alerts(false).map_err(ApiError::from)?,
-        "recent_tasks": recent,
+        "recent_tasks": recent.iter().map(|t| task_json(t, &names)).collect::<Vec<_>>(),
         "metrics": { "counters": metric_counters, "gauges": metric_gauges },
     })))
 }
@@ -311,6 +312,24 @@ fn worker_json(w: crate::workers::WorkerConn) -> serde_json::Value {
             "gc_reclaimed_mb": w.stats.gc_reclaimed_mb,
         },
     })
+}
+
+/// The operator-given name of a worker, or `""` when it has none.
+fn worker_name<'a>(names: &'a std::collections::HashMap<String, String>, id: &str) -> &'a str {
+    names.get(id).map(String::as_str).unwrap_or("")
+}
+
+/// Task rows keep `worker_id` because that is the identity (it keys tokens,
+/// history and scheduler affinity). The console renders the machine an operator
+/// renamed, so the display name rides along as an extra field — it is never
+/// written back into task history.
+fn task_json(
+    task: &crate::store::TaskRow,
+    names: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let mut v = json!(task);
+    v["worker_name"] = json!(worker_name(names, &task.worker_id));
+    v
 }
 
 /// Live updates (§14.1). SSE rather than WebSocket: the traffic is one-way and
@@ -727,8 +746,12 @@ async fn list_tasks(
     Query(f): Query<TaskFilter>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tasks = app.store.list_tasks(&f).map_err(ApiError::from)?;
+    let names = app.store.worker_names().map_err(ApiError::from)?;
     let total = app.store.count_tasks(&f).map_err(ApiError::from)?;
-    Ok(Json(json!({ "tasks": tasks, "total": total })))
+    Ok(Json(json!({
+        "tasks": tasks.iter().map(|t| task_json(t, &names)).collect::<Vec<_>>(),
+        "total": total
+    })))
 }
 
 async fn get_task(
@@ -744,25 +767,28 @@ async fn get_task(
     let timeline = app.store.timeline(&id).map_err(ApiError::from)?;
     let attempts = app.store.attempt_records(&id).map_err(ApiError::from)?;
     let inputs = app.store.get_task_inputs(&id).map_err(ApiError::from)?;
+    let names = app.store.worker_names().map_err(ApiError::from)?;
     // A task sitting in the queue is the case operators most often need
     // explained, so say why no worker took it.
     let placement = if task.status == "queued" {
         app.explain_placement(&task)
             .into_iter()
-            .map(|(w, r)| json!({ "worker_id": w, "reason": r }))
+            .map(|(w, r)| {
+                json!({ "worker_name": worker_name(&names, &w), "worker_id": w, "reason": r })
+            })
             .collect::<Vec<_>>()
     } else {
         vec![]
     };
     Ok(Json(json!({
-        "task": task,
+        "task": task_json(&task, &names),
         "placement": placement,
         "result": task.result(),
         "timeline": timeline.iter().map(|p| json!({
             "phase": p.phase, "at_ms": p.at_ms, "worker_id": p.worker_id, "detail": p.detail
         })).collect::<Vec<_>>(),
         "attempts": attempts.iter().map(|(w, at, err)| json!({
-            "worker_id": w, "at": at, "error": err
+            "worker_id": w, "worker_name": worker_name(&names, w), "at": at, "error": err
         })).collect::<Vec<_>>(),
         "profile": inputs.as_ref().map(|(_, p, _)| p.clone()),
         "base_commit": inputs.as_ref().map(|(_, _, b)| b.clone()),
@@ -1352,3 +1378,26 @@ async fn prometheus(State(app): State<Arc<App>>) -> Response {
         .into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::TaskRow;
+
+    #[test]
+    fn a_task_is_rendered_with_the_name_of_the_worker_that_ran_it() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("w1".to_string(), "beefy-01".to_string());
+
+        let task =
+            TaskRow { id: "t1".into(), worker_id: "w1".into(), ..Default::default() };
+        let v = task_json(&task, &names);
+        assert_eq!(v["worker_id"], "w1", "history keeps the identity, not the alias");
+        assert_eq!(v["worker_name"], "beefy-01");
+
+        // A worker nobody renamed (or one already deleted) still serializes the
+        // field, so the console has exactly one rule: empty means show the id.
+        let task =
+            TaskRow { id: "t2".into(), worker_id: "gone".into(), ..Default::default() };
+        assert_eq!(task_json(&task, &names)["worker_name"], "");
+    }
+}

@@ -62,6 +62,9 @@ export interface Task {
   image: string;
   log_ref: string;
   worker_id: string;
+  // Display-only: the operator-given name for `worker_id`, or "" when the
+  // machine has none (then the console falls back to the id).
+  worker_name?: string;
   attempt: number;
   created_at: number;
   started_at: number;
@@ -114,8 +117,8 @@ export interface TaskDetail {
   task: Task;
   result: TaskResult | null;
   timeline: TimelinePhase[];
-  attempts: { worker_id: string; at: number; error: string }[];
-  placement: { worker_id: string; reason: string }[];
+  attempts: { worker_id: string; worker_name?: string; at: number; error: string }[];
+  placement: { worker_id: string; worker_name?: string; reason: string }[];
   profile: string | null;
   base_commit: string | null;
 }
