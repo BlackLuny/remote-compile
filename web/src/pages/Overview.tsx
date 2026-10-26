@@ -4,7 +4,7 @@ import type { EChartsOption } from "echarts";
 import { api, type Overview as OverviewData } from "../api";
 import { Badge, Card, Empty, ErrorBox, Meter, Mono, Spinner, Stat, Table, Td, Th } from "../components/ui";
 import { Chart, axisStyle, chartBase } from "../components/Chart";
-import { ago, bytes, ms, percent, resultTone, shortId, statusTone } from "../lib/format";
+import { ago, bytes, disk, ms, percent, resultTone, shortId, statusTone } from "../lib/format";
 
 export function Overview() {
   const q = useQuery({
@@ -166,7 +166,8 @@ export function Overview() {
                         </span>
                       </div>
                       <div className="tnum mt-1 text-[11px] text-[var(--color-ink-faint)]">
-                        {w.stats.disk_free_gb}GB 空闲 · {w.stats.running_tasks}/{w.max_parallel} 任务
+                        {disk(w.stats.disk_free_gb, w.stats.disk_total_gb)} 空闲 ·{" "}
+                        {w.stats.running_tasks}/{w.max_parallel} 任务
                       </div>
                     </Td>
                   </tr>

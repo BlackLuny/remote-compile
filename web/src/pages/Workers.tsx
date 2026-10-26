@@ -24,7 +24,7 @@ import {
   Td,
   Th,
 } from "../components/ui";
-import { agoSecs, percent, shortId, statusTone } from "../lib/format";
+import { agoSecs, disk, percent, shortId, statusTone } from "../lib/format";
 
 export function Workers({ role }: { role: Role }) {
   const qc = useQueryClient();
@@ -148,7 +148,9 @@ export function Workers({ role }: { role: Role }) {
                       <span className="text-[var(--color-ink-faint)]">–</span>
                     )}
                   </Td>
-                  <Td className="tnum">{w.stats ? `${w.stats.disk_free_gb} GB` : "–"}</Td>
+                  <Td className="tnum">
+                    {w.stats ? disk(w.stats.disk_free_gb, w.stats.disk_total_gb) : "–"}
+                  </Td>
                   <Td className="tnum">
                     {w.stats ? `${w.stats.running_tasks}/${w.max_parallel}` : `–/${w.max_parallel}`}
                   </Td>

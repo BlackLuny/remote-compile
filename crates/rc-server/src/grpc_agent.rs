@@ -681,7 +681,7 @@ impl AgentApi for AgentService {
         let won = self
             .app
             .store
-            .complete_task(&req.task_id, "canceled", &canceled, "", "")
+            .complete_task(&req.task_id, "canceled", &canceled, "", "", 0)
             .map_err(internal)?;
         if !won {
             let latest = self

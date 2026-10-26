@@ -54,6 +54,16 @@ pub struct Policy {
     pub w_image_affinity: f64,
     /// Hard filter: worker is skipped below this much free disk.
     pub min_disk_free_gb: u64,
+    /// Hard filter: worker is also skipped below this share of **its own** disk.
+    ///
+    /// §6.2 wants a disk that still has room to be pruned, and "room to be
+    /// pruned" is a fraction of the volume, not a number of GB: the same 30 GB
+    /// that keeps a 128 GB worker healthy leaves a 4 TB one with nothing to GC
+    /// into. Both floors apply, and neither ever lowers the other.
+    ///
+    /// Workers that do not report a total size are gated on GB alone.
+    #[serde(default = "default_min_disk_free_percent")]
+    pub min_disk_free_percent: f64,
     /// §15.3 — alert webhook (DingTalk / Feishu / Slack compatible).
     pub alert_webhook: String,
     /// Fallback image when nothing else is known.
@@ -121,6 +131,12 @@ fn default_true() -> bool {
     true
 }
 
+fn default_min_disk_free_percent() -> f64 {
+    // §6.1: "below 10% is out". Kept in one place because the scoring term
+    // reads it too, and a console-set value has to mean the same thing in both.
+    10.0
+}
+
 impl Default for Policy {
     fn default() -> Self {
         Policy {
@@ -137,6 +153,7 @@ impl Default for Policy {
             w_cache_affinity: 2.0,
             w_image_affinity: 0.8,
             min_disk_free_gb: 20,
+            min_disk_free_percent: default_min_disk_free_percent(),
             alert_webhook: String::new(),
             default_image: "docker.io/library/rust:1-bookworm".into(),
             verdict_v2: true,

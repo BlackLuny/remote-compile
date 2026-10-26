@@ -547,9 +547,13 @@ async fn collect_stats(cfg: &WorkerConfig, runner: &Runner, running: u32) -> pb:
         .map(|v| v.into_iter().map(|(n, _)| n).collect())
         .unwrap_or_default();
     let local_images = runner.sandbox.local_image_refs().await.unwrap_or_default();
+    // One `df` for both numbers: they are read from the same output line, and
+    // two calls could straddle a build finishing and disagree with each other.
+    let disk = sysinfo::disk_usage(&cfg.data_dir);
     pb::WorkerStats {
         cpu_load: sysinfo::cpu_load(),
-        disk_free_gb: sysinfo::disk_free_gb(&cfg.data_dir),
+        disk_free_gb: disk.free_gb,
+        disk_total_gb: disk.total_gb,
         running_tasks: running,
         cached_worktrees,
         cached_projects,

@@ -47,6 +47,23 @@ export function percent(x: number): string {
   return `${Math.round(x * 100)}%`;
 }
 
+/**
+ * Free disk space, with the volume size when the worker reports one.
+ *
+ * Both halves matter: 300 GB left is healthy on a 2 TB volume and is almost
+ * full on a 400 GB one, so a bare "300 GB" invites the wrong conclusion.
+ */
+export function disk(freeGb: number, totalGb?: number): string {
+  if (!freeGb && !totalGb) return "–";
+  return totalGb ? `${freeGb} / ${totalGb} GB` : `${freeGb} GB`;
+}
+
+/** Share of the volume still free, or null when its size is unknown. */
+export function diskShare(freeGb: number, totalGb?: number): number | null {
+  if (!totalGb) return null;
+  return Math.max(0, Math.min(1, freeGb / totalGb));
+}
+
 export function duration(secs: number): string {
   if (secs % 86400 === 0) return `${secs / 86400} 天`;
   if (secs % 3600 === 0) return `${secs / 3600} 小时`;

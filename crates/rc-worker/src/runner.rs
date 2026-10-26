@@ -94,10 +94,25 @@ impl Runner {
         let lock = self.worktree_locks.get(&assignment.worktree_id).await;
         let _guard = lock.lock().await;
 
+        // What this task costs on disk, measured rather than assumed.
+        //
+        // The scheduler's per-project estimate used to be the constant 20 GB
+        // with a comment claiming it came from history. This is the history:
+        // the drop in free space while the assignment runs. It is a coarse
+        // observation — another task on this worker moves the same number, and
+        // cargo reusing a warm target volume legitimately measures ~0 — so the
+        // control plane takes the high-water mark across recent builds and
+        // never lets the estimate fall below the conservative default.
+        let free_before = crate::sysinfo::disk_free_gb(&self.cfg.data_dir);
         let outcome = self.execute_inner(assignment, client, &events).await;
+        let free_after = crate::sysinfo::disk_free_gb(&self.cfg.data_dir);
+        let disk_used_gb = free_before.saturating_sub(free_after);
         self.canceled.lock().await.remove(&task_id);
         match outcome {
-            Ok(done) => done,
+            Ok(mut done) => {
+                done.disk_used_gb = disk_used_gb;
+                done
+            }
             // Anything that escapes here is our problem, not the code's: the
             // control plane retries it on another machine (§3.5).
             Err(e) => {
@@ -380,6 +395,9 @@ impl Runner {
 
         Ok(TaskDone {
             task_id,
+            // Filled in by `execute`, which is the only place that brackets the
+            // whole assignment with disk measurements.
+            disk_used_gb: 0,
             result: Some(TaskResult {
                 kind: classification.kind.as_str().to_string(),
                 diagnostics: top,

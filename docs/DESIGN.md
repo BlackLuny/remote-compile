@@ -175,6 +175,7 @@ status: online | draining | offline
 stats:                        # 心跳上报，参与调度
   cpu_load: 0.42
   disk_free_gb: 830
+  disk_total_gb: 2000      # 同一块盘的总容量，用于百分比阈值
   running_tasks: 3
   cached_projects: [proj-a]   # 本地有 target volume / git mirror 的项目
   cached_images: [...]
@@ -367,21 +368,33 @@ fingerprint = blake3(
 任务分配到 worker 采用加权打分（所有指标来自心跳上报 + 本地状态）：
 
 ```
-score = w1 * disk_fit          # 磁盘余量是否 > 预估需求 * 1.5（预估来自该项目历史统计，新项目用默认值）
+score = w1 * disk_fit          # 磁盘余量：绝对余量（预估需求 * 3）与「全盘空闲占比 / 2 倍预留占比」取小
       + w2 * (1 - cpu_load)    # CPU 余量
       + w3 * cache_affinity    # 本地已有该 worktree 的 target volume = 1；有 project 的 = 0.6；无 = 0
       + w4 * image_affinity    # 本地已拉取所需镜像 = 1，否则 0
       + w5 * arch_match        # 架构/标签匹配为硬过滤，不参与打分
 ```
 
-硬过滤先行：架构、磁盘低于阈值（< 10% 或 < 预估需求）、status != online 的直接排除。
+硬过滤先行：架构、磁盘低于阈值、status != online 的直接排除。磁盘阈值取三者中的**最大**：
+
+| 阈值 | 来源 | 说明 |
+|---|---|---|
+| `min_disk_free_gb`（默认 20 GB） | 管理端策略 | 绝对下限；也是不报盘大小的老 worker 唯一的依据 |
+| `est_disk_gb * 1.5` | 该项目历史实测（取近 20 次的高水位，无历史时默认 20 GB） | 本任务自身占地 + 收尾余量 |
+| `min_disk_free_percent`（默认 10%）× worker 自己的盘 | 管理端策略 | 留出可 GC 的空间 |
+
+三者取 max 而不是取其一：占比不能把绝对下限拉低（64 GB 的机器不能在剩 6 GB 时接活），预估需求也不能被占比盖掉。只报剩余、不报总量的老 worker（`disk_total_gb = 0`）跳过占比项，行为与改动前完全一致。
+
+`est_disk_gb` 的来源是**实测**：worker 在任务前后各测一次 data 目录的可用空间，差值随 `TaskDone.disk_used_gb` 上报，控制面按项目取近 20 次成功/编译错误/环境错误任务的**高水位**。取最大值而不是均值：低估是“撑爆磁盘”的那一边，一次真的需要 300 GB 是这个仓库的事实，不是可以平均掉的噪声。并发跑多个任务时测量会被邻居抬高，那是安全的方向；老 worker 报 0 表示“没测”，直接忽略而不当作“这次不占地”，且预估永远不会低于默认的 20 GB。
+
+为什么必须有占比项：「还剩 40 GB」在 500 GB 的盘上是健康、在 4 TB 的盘上意味着这台机器已经写满，下一次大构建会把盘吃光并把上面的**所有** worktree 一起拖下水。绝对 GB 无法同时表达这两件事——不是饿死小盘，就是放行大盘。
 
 ### 6.2 约束
 
 - **同一 (worktree, worker) 的任务串行**：共享同一 target volume，cargo 文件锁下并行只会互等。worker 内按 worktree 排队，不同 worktree 之间并行，并行度 = worker 配置；
 - **同一 worktree 可用多台 worker**：不同任务（check/clippy/test、不同 target）天然可分布到多机；单条 cargo 命令不拆分；
 - **infra_error 自动换机重试**：最多 2 次，且不得落到同一 worker；重试耗尽才上报 agent；
-- **磁盘水位**：worker 上报 disk_free；低于阈值触发本地 GC（见 §9），仍低于硬阈值则从调度池摘除并告警。
+- **磁盘水位**：worker 上报 disk_free 与 disk_total；低于上述阈值即不进调度池（由调度器判定，worker 的 `status` 不因磁盘变化），低于阈值期间的管理端清理走 §9 的手动路径。
 
 ## 7. 执行环境（rc-worker）
 
