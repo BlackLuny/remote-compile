@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Task } from "../api";
 import { Badge, Button, Card, Empty, ErrorBox, Input, Mono, Select, Spinner, Table, Td, Th } from "../components/ui";
+import { WorkerRef } from "../components/WorkerRef";
 import { ago, bytes, ms, resultTone, shortId, statusTone } from "../lib/format";
 
 const PAGE = 50;
@@ -152,17 +153,7 @@ export function Tasks() {
                     </span>
                   </Td>
                   <Td>
-                    {t.worker_id ? (
-                      <Link
-                        to={`/workers/${t.worker_id}`}
-                        className="hover:text-[var(--color-accent)]"
-                        title={t.worker_id}
-                      >
-                        <Mono className="text-[var(--color-ink-dim)]">{shortId(t.worker_id, 14)}</Mono>
-                      </Link>
-                    ) : (
-                      <Mono className="text-[var(--color-ink-dim)]">–</Mono>
-                    )}
+                    <WorkerRef id={t.worker_id} name={t.worker_name} />
                   </Td>
                   <Td className="tnum text-right text-[var(--color-ink-dim)]">{ms(t.queue_ms)}</Td>
                   <Td className="tnum text-right text-[var(--color-ink-dim)]">{ms(t.sync_ms)}</Td>

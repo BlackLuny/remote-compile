@@ -1650,6 +1650,18 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Display names of every renamed worker, keyed by id.
+    ///
+    /// Task history stores the id — that is the identity — but the console
+    /// should show the machine an operator named. One cheap lookup per page
+    /// beats a join on every task read.
+    pub fn worker_names(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT id, name FROM workers WHERE name != ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn list_workers(&self) -> Result<Vec<WorkerRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT * FROM workers ORDER BY id")?;
@@ -3014,6 +3026,20 @@ mod tests {
         assert_eq!(w.name, "beefy-01");
         assert_eq!(w.arch, "aarch64");
         assert_eq!(s.worker_token_hash("w1").unwrap().unwrap(), "h2");
+    }
+
+    #[test]
+    fn task_pages_can_look_up_the_name_behind_a_worker_id() {
+        let s = store();
+        s.upsert_worker(&WorkerRow { id: "w1".into(), ..Default::default() }, "h").unwrap();
+        s.upsert_worker(&WorkerRow { id: "w2".into(), ..Default::default() }, "h").unwrap();
+        s.set_worker_name("w1", "beefy-01").unwrap();
+
+        let names = s.worker_names().unwrap();
+        assert_eq!(names.get("w1").map(String::as_str), Some("beefy-01"));
+        // An unnamed machine is absent rather than a blank entry: the console
+        // renders its id, and there is no second way to spell "no name".
+        assert!(!names.contains_key("w2"));
     }
 
     #[test]

@@ -1,10 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
+import type { ReactNode } from "react";
 import type { EChartsOption } from "echarts";
 import { api, type Role, type TaskDetail as Detail } from "../api";
 import { Badge, Button, Card, Empty, ErrorBox, Mono, Spinner, Table, Td, Th } from "../components/ui";
 import { Chart, axisStyle, chartBase } from "../components/Chart";
 import { LogViewer } from "../components/LogViewer";
+import { WorkerRef } from "../components/WorkerRef";
 import { bytes, clock, ms, resultTone, shortDigest, statusTone } from "../lib/format";
 
 export function TaskDetail({ role }: { role: Role }) {
@@ -60,7 +62,10 @@ export function TaskDetail({ role }: { role: Role }) {
         <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-[12px] lg:grid-cols-4">
           <Field label="类型" value={task.task_type} />
           <Field label="状态" value={task.status} />
-          <Field label="Worker" value={task.worker_id || "–"} mono />
+          <Field
+            label="Worker"
+            value={<WorkerRef id={task.worker_id} name={task.worker_name} showId />}
+          />
           <Field label="尝试次数" value={String(task.attempt)} />
           <Field label="Project" value={task.project_id} mono />
           <Field label="Worktree" value={task.worktree_id} mono />
@@ -98,7 +103,7 @@ export function TaskDetail({ role }: { role: Role }) {
               {placement.map((p) => (
                 <tr key={p.worker_id}>
                   <Td>
-                    <Mono>{p.worker_id}</Mono>
+                    <WorkerRef id={p.worker_id} name={p.worker_name} />
                   </Td>
                   <Td className="text-[var(--color-ink-dim)]">{explainReject(p.reason)}</Td>
                 </tr>
@@ -186,7 +191,7 @@ export function TaskDetail({ role }: { role: Role }) {
               {attempts.map((a, i) => (
                 <tr key={i}>
                   <Td>
-                    <Mono>{a.worker_id}</Mono>
+                    <WorkerRef id={a.worker_id} name={a.worker_name} showId />
                   </Td>
                   <Td className="text-[var(--color-ink-dim)]">{clock(a.at)}</Td>
                   <Td className="text-[var(--color-ink-dim)]">{a.error}</Td>
@@ -212,7 +217,7 @@ export function TaskDetail({ role }: { role: Role }) {
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Field({ label, value, mono }: { label: string; value: ReactNode; mono?: boolean }) {
   return (
     <div>
       <div className="text-[11px] tracking-wide text-[var(--color-ink-dim)] uppercase">{label}</div>
