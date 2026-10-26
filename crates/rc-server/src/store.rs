@@ -827,11 +827,16 @@ impl Store {
     pub fn project_disk_high_water(&self, project_id: &str, n: usize) -> Result<Option<u64>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
+            // `finished_at` is milliseconds and two tasks routinely share one,
+            // so ordering by it alone leaves "the last n" up to SQLite. ULIDs
+            // do not break the tie either — the 80 random bits inside a
+            // millisecond do not sort by creation — so the tie-break is the
+            // insertion order SQLite already keeps.
             "SELECT disk_used_gb FROM tasks
              WHERE project_id = ?1 AND status = 'done'
                AND result_kind IN ('success','compile_error','env_error')
                AND disk_used_gb > 0
-             ORDER BY finished_at DESC LIMIT ?2",
+             ORDER BY finished_at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![project_id, n as i64], |r| r.get::<_, i64>(0))?;
         let mut high: Option<u64> = None;
@@ -3358,9 +3363,35 @@ mod tests {
         build(45, "compile_error", "done");
         // The high-water mark, not the last or the mean.
         assert_eq!(s.project_disk_high_water("p1", 20).unwrap(), Some(120));
-        // Only the most recent `n` rows are considered.
+        // Only the most recent `n` rows are considered. Both of those builds
+        // finished inside the same millisecond, which is the normal case, not
+        // the exception — so this also pins the ordering: the newer row is the
+        // one with the greater id.
         assert_eq!(s.project_disk_high_water("p1", 1).unwrap(), Some(45));
         assert_eq!(s.project_disk_high_water("p-other", 20).unwrap(), None);
+    }
+
+    #[test]
+    fn same_millisecond_builds_are_ordered_by_creation_not_by_luck() {
+        // `finished_at` has millisecond resolution and a queue drain routinely
+        // completes several tasks in one, so "the last n" must not depend on
+        // which row SQLite happens to visit first. Task ids do not help here:
+        // they are ULIDs, whose random bits do not sort by creation within a
+        // millisecond. Insertion order is what the window is built on.
+        let s = store();
+        let ok = TaskResult { kind: "success".into(), ..Default::default() };
+        for gb in [10u64, 20, 30] {
+            let tid = rc_core::ids::task_id();
+            s.insert_task(&task(&tid, "fp", "k", "s", "running"), "{}", "{}", "")
+                .unwrap();
+            s.complete_task(&tid, "done", &ok, "", "", gb).unwrap();
+        }
+        // One row: the one inserted last, which is the newest.
+        assert_eq!(s.project_disk_high_water("p1", 1).unwrap(), Some(30));
+        // Two rows: the newest two, so still the max of those two.
+        assert_eq!(s.project_disk_high_water("p1", 2).unwrap(), Some(30));
+        // All three: the overall max.
+        assert_eq!(s.project_disk_high_water("p1", 3).unwrap(), Some(30));
     }
 
     #[test]
