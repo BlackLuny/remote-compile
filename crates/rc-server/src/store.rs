@@ -573,11 +573,17 @@ impl Store {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
+                // Two submissions with one fingerprint can finish inside the
+                // same millisecond (a queue drain completes several at once),
+                // and without a tie-break "the newest cached result" is
+                // whichever row SQLite visits first. Insertion order is the
+                // only ordering here that is actually chronological: ULIDs
+                // carry random bits within a millisecond.
                 "SELECT * FROM tasks
                  WHERE fingerprint = ?1 AND egress_key = ?2 AND status = 'done'
                    AND result_kind IN ('success','compile_error')
                    AND finished_at > ?3
-                 ORDER BY finished_at DESC LIMIT 1",
+                 ORDER BY finished_at DESC, rowid DESC LIMIT 1",
                 params![fingerprint, egress_key, cutoff],
                 TaskRow::from_row,
             )
@@ -820,7 +826,7 @@ impl Store {
             "SELECT build_ms, units_seen_total FROM tasks
              WHERE project_id = ?1 AND task_type = ?2 AND status = 'done'
                AND result_kind IN ('success','compile_error','env_error')
-             ORDER BY finished_at DESC LIMIT ?3",
+             ORDER BY finished_at DESC, rowid DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![project_id, task_type, n as i64], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -879,10 +885,12 @@ impl Store {
             "SELECT * FROM tasks
              WHERE project_id = ?1 AND worktree_id = ?2 AND task_type = ?3
                AND status = 'done' AND id != ?4
-               AND (finished_at < ?5 OR (finished_at = ?5 AND id < ?4))
+               AND (finished_at < ?5
+                    OR (finished_at = ?5
+                        AND rowid < (SELECT rowid FROM tasks WHERE id = ?4)))
                AND scope_hash = ?6
                {kind_filter}
-             ORDER BY finished_at DESC, id DESC LIMIT 1"
+             ORDER BY finished_at DESC, rowid DESC LIMIT 1"
         );
         let conn = self.conn.lock();
         let current_scope: String = conn
@@ -961,10 +969,16 @@ impl Store {
     }
 
     /// Queued work in FIFO order, oldest first.
+    ///
+    /// `created_at` has millisecond resolution and one dispatch tick can queue
+    /// several tasks in the same one, so insertion order breaks the tie and the
+    /// order the fleet sees stays the order the work arrived in.
     pub fn queued_tasks(&self) -> Result<Vec<TaskRow>> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 200")?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM tasks WHERE status = 'queued'
+             ORDER BY created_at ASC, rowid ASC LIMIT 200",
+        )?;
         let rows = stmt
             .query_map([], TaskRow::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1002,6 +1016,11 @@ impl Store {
         let limit = f.limit.unwrap_or(50).min(500) as i64;
         let offset = f.offset.unwrap_or(0) as i64;
         let conn = self.conn.lock();
+        // `created_at` is milliseconds and a batch of tasks routinely shares
+        // one, so "newest first" needs a second key to be a total order. Rows
+        // tied on the timestamp then come back in insertion order, newest last
+        // inserted first, instead of in whatever order an index or the paging
+        // plan happens to visit them.
         let mut stmt = conn.prepare(
             "SELECT * FROM tasks
              WHERE (?1 IS NULL OR project_id = ?1)
@@ -1010,7 +1029,7 @@ impl Store {
                AND (?4 IS NULL OR status = ?4)
                AND (?5 IS NULL OR result_kind = ?5)
                AND (?6 IS NULL OR task_type = ?6)
-             ORDER BY created_at DESC LIMIT ?7 OFFSET ?8",
+             ORDER BY created_at DESC, rowid DESC LIMIT ?7 OFFSET ?8",
         )?;
         let rows = stmt
             .query_map(
@@ -3260,6 +3279,136 @@ mod tests {
             .resolve_baseline("p1", "w-other", "check", "auto", "t2", t2.finished_at)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_sibling_that_finished_in_the_same_millisecond_is_not_history() {
+        // A queue drain completes several tasks inside one millisecond, and
+        // ULIDs do not sort by creation within a millisecond — 80 random bits
+        // decide. So "finished before me" has to mean "inserted before me", or
+        // a *later* sibling comes back as this task's baseline, which is the
+        // one thing the diagnostic delta (R4/B1) exists to prevent.
+        //
+        // Real task ids on purpose: tidy names like "t1".."t4" sort by creation
+        // and would make this test pass against a tie-break that does not.
+        let s = store();
+        let result = TaskResult { kind: "compile_error".into(), ..Default::default() };
+        let same_ms = rc_core::now_ms();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let id = rc_core::ids::task_id();
+            s.insert_task(&task(&id, "fp", "k", "s", "queued"), "{}", "{}", "")
+                .unwrap();
+            s.complete_task(&id, "done", &result, "", "").unwrap();
+            s.conn
+                .lock()
+                .execute(
+                    "UPDATE tasks SET finished_at = ?2 WHERE id = ?1",
+                    params![id, same_ms],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        for i in 1..ids.len() {
+            let base = s
+                .resolve_baseline("p1", "w1", "check", "auto", &ids[i], same_ms)
+                .unwrap()
+                .unwrap_or_else(|| panic!("task {i} should see task {} as history", i - 1));
+            assert_eq!(base.id, ids[i - 1], "baseline for task {i}");
+        }
+        assert!(
+            s.resolve_baseline("p1", "w1", "check", "auto", &ids[0], same_ms)
+                .unwrap()
+                .is_none(),
+            "the earliest sibling has no history"
+        );
+    }
+
+    #[test]
+    fn the_newest_cached_result_is_the_one_that_arrived_last() {
+        let s = store();
+        let now = rc_core::now_ms();
+        let mut ids = Vec::new();
+        // Distinct kinds so a wrong pick is visible, not just a wrong id.
+        for kind in ["compile_error", "success", "compile_error", "success", "success"] {
+            let id = rc_core::ids::task_id();
+            let result = TaskResult { kind: kind.into(), summary: id.clone(), ..Default::default() };
+            s.insert_task(&task(&id, "same-fp", "k", "s", "queued"), "{}", "{}", "")
+                .unwrap();
+            s.complete_task(&id, "done", &result, "", "").unwrap();
+            s.conn
+                .lock()
+                .execute(
+                    "UPDATE tasks SET finished_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )
+                .unwrap();
+            ids.push((id, kind));
+        }
+        // Same fingerprint, same millisecond: the answer must be the one that
+        // arrived last, not whichever row the engine reached first.
+        let cached = s.find_cached_result("same-fp", "", 3600).unwrap().expect("a cache hit");
+        assert_eq!(cached.id, ids.last().unwrap().0);
+    }
+
+    #[test]
+    fn tasks_tied_on_created_at_do_not_repeat_or_skip_across_pages() {
+        // The console pages with LIMIT/OFFSET over `created_at`, which is
+        // milliseconds. This is a determinism guard rather than a reproduction:
+        // with today's index the same ties come back in the same order twice, so
+        // the old query also passed. It pins the property that makes paging
+        // safe, so a future index or plan change cannot quietly break it.
+        let s = store();
+        let created = rc_core::now_ms();
+        for id in ["t1", "t2", "t3", "t4"] {
+            s.insert_task(&task(id, "fp", "k", "s", "queued"), "{}", "{}", "")
+                .unwrap();
+            s.conn
+                .lock()
+                .execute(
+                    "UPDATE tasks SET created_at = ?2 WHERE id = ?1",
+                    params![id, created],
+                )
+                .unwrap();
+        }
+        let page = |offset: u32| {
+            s.list_tasks(&TaskFilter {
+                limit: Some(2),
+                offset: Some(offset),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>()
+        };
+        let mut seen = page(0);
+        seen.extend(page(2));
+        seen.sort();
+        assert_eq!(seen, vec!["t1", "t2", "t3", "t4"], "every task exactly once");
+    }
+
+    #[test]
+    fn queued_work_of_one_millisecond_keeps_its_arrival_order() {
+        // Same honesty as the paging test: a guard on FIFO within a millisecond,
+        // not a reproduction. Tasks queued in one tick are milliseconds apart at
+        // best, and the fleet should still see them in arrival order.
+        let s = store();
+        let created = rc_core::now_ms();
+        for id in ["t1", "t2", "t3"] {
+            s.insert_task(&task(id, "fp", "k", "s", "queued"), "{}", "{}", "")
+                .unwrap();
+            s.conn
+                .lock()
+                .execute(
+                    "UPDATE tasks SET created_at = ?2 WHERE id = ?1",
+                    params![id, created],
+                )
+                .unwrap();
+        }
+        let ids: Vec<String> = s.queued_tasks().unwrap().into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec!["t1", "t2", "t3"], "FIFO within one millisecond");
     }
 
     #[test]
