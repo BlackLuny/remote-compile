@@ -30,11 +30,16 @@ pub async fn serve(uri: Uri) -> Response {
 fn respond(path: &str, body: Vec<u8>) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     // Vite emits content-hashed asset filenames, so those are immutable; the
-    // shell must never be cached or a deploy would not take effect.
+    // shell must never be cached at all. A shell served from cache points at
+    // asset hashes the deploy has already deleted, and the tab then waits on
+    // a file that will never arrive — exactly the "loading spinner forever"
+    // failure. `no-store` keeps the shell out of every cache, including the
+    // back/forward one, so a reload always fetches a shell matching the
+    // binary that is actually running.
     let cache = if path.starts_with("assets/") {
         "public, max-age=31536000, immutable"
     } else {
-        "no-cache"
+        "no-store"
     };
     (
         StatusCode::OK,
@@ -67,5 +72,23 @@ mod tests {
         // a parse failure instead of a 404.
         let res = serve("/api/does-not-exist".parse().unwrap()).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_shell_is_never_cached_while_hashed_assets_are_immutable() {
+        // A cached shell outlives the deploy that changed the asset hashes: it
+        // keeps asking for files the new binary no longer embeds, and the tab
+        // spins on a request that can never be answered.
+        let shell = serve("/tasks".parse().unwrap()).await;
+        assert_eq!(shell.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        let asset = Assets::iter()
+            .find(|p| p.starts_with("assets/"))
+            .expect("the console build must be embedded");
+        let res = serve(format!("/{asset}").parse().unwrap()).await;
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
     }
 }

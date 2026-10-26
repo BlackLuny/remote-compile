@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import type { EChartsOption } from "echarts";
 import {
+  CLEANUP_TIMEOUT_MS,
   api,
   type Role,
   type Task,
@@ -57,7 +58,9 @@ export function WorkerDetail({ role }: { role: Role }) {
 
   const cleanup = useMutation({
     mutationFn: (body: WorkerCleanupReq) =>
-      api.post<WorkerCleanupResult>(`/api/workers/${id}/cleanup`, body),
+      api.post<WorkerCleanupResult>(`/api/workers/${id}/cleanup`, body, {
+        timeoutMs: CLEANUP_TIMEOUT_MS,
+      }),
     onSuccess: (data) => {
       setCleanupResult(data);
       qc.invalidateQueries({ queryKey: ["worker", id] });

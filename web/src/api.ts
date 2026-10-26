@@ -11,33 +11,62 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    credentials: "same-origin",
-    headers: init?.body ? { "content-type": "application/json" } : undefined,
-    ...init,
-  });
-  if (!res.ok) {
-    let message = res.statusText;
-    try {
-      const body = await res.json();
-      if (body?.error) message = body.error;
-    } catch {
-      // A non-JSON error body means the server is not the one we expect.
+// How long any single call may take before the console gives up on it.
+//
+// A request that never settles is the worst failure mode here: the page spins
+// with no way to tell "still working" from "never coming back". Bounded
+// requests turn that into a visible error the user can act on.
+const DEFAULT_TIMEOUT_MS = 20_000;
+
+// Cleanup runs a disk reclaim on the worker and the server waits up to 300 s
+// for the report, so its caller has to outlast that.
+export const CLEANUP_TIMEOUT_MS = 320_000;
+
+export interface RequestOpts {
+  timeoutMs?: number;
+}
+
+async function request<T>(path: string, init?: RequestInit & RequestOpts): Promise<T> {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...rest } = init ?? {};
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  try {
+    const res = await fetch(path, {
+      credentials: "same-origin",
+      headers: rest.body ? { "content-type": "application/json" } : undefined,
+      ...rest,
+      signal: abort.signal,
+    });
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const body = await res.json();
+        if (body?.error) message = body.error;
+      } catch {
+        // A non-JSON error body means the server is not the one we expect.
+      }
+      throw new ApiError(res.status, message);
     }
-    throw new ApiError(res.status, message);
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  } catch (err) {
+    // The abort surfaces as a plain AbortError; say what actually happened.
+    if (abort.signal.aborted) {
+      throw new ApiError(0, `请求超时（${Math.round(timeoutMs / 1000)} 秒）：${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
 }
 
 export const api = {
-  get: <T,>(path: string) => request<T>(path),
-  post: <T,>(path: string, body?: unknown) =>
-    request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : "{}" }),
-  put: <T,>(path: string, body: unknown) =>
-    request<T>(path, { method: "PUT", body: JSON.stringify(body) }),
-  del: <T,>(path: string) => request<T>(path, { method: "DELETE" }),
+  get: <T,>(path: string, opts?: RequestOpts) => request<T>(path, opts),
+  post: <T,>(path: string, body?: unknown, opts?: RequestOpts) =>
+    request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : "{}", ...opts }),
+  put: <T,>(path: string, body: unknown, opts?: RequestOpts) =>
+    request<T>(path, { method: "PUT", body: JSON.stringify(body), ...opts }),
+  del: <T,>(path: string, opts?: RequestOpts) => request<T>(path, { method: "DELETE", ...opts }),
 };
 
 // ---------------------------------------------------------------- types
