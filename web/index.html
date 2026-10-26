@@ -7,6 +7,28 @@
   </head>
   <body>
     <div id="root"></div>
+    <!--
+      When the bundle never arrives the tab spins forever with nothing on
+      screen and no way to tell why: a deploy that swaps asset hashes into a
+      cached shell, a proxy that dropped the download, or a cache entry left
+      half-written all look identical. Say something instead of nothing, and
+      name the one action that actually fixes it.
+    -->
+    <script>
+      window.setTimeout(function () {
+        var root = document.getElementById("root");
+        if (!root || root.childElementCount > 0) return;
+        root.innerHTML =
+          '<div style="padding:32px;font:13px/1.7 system-ui,-apple-system,sans-serif;color:#c9d1d9;background:#0d1117;min-height:100vh">' +
+          "<strong>控制台没有加载出来。</strong><br>" +
+          "通常是前端资源没下载完（部署瞬间被打断、或缓存里留了半个文件）。<br><br>" +
+          "按 F12 打开开发者工具 → Network 面板勾选 <em>Disable cache</em> → " +
+          "右键浏览器刷新按钮选「清空缓存并硬性重新加载」；" +
+          "或者直接换无痕窗口打开。<br><br>" +
+          "仍然空白的话，把 Console 里的红色报错发给我。" +
+          "</div>";
+      }, 15000);
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
