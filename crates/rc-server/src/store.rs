@@ -92,6 +92,10 @@ const MIGRATIONS: &[&str] = &[
     // name is display only: `id` stays the identity that tokens, task history
     // and scheduling are keyed by.
     "ALTER TABLE workers ADD COLUMN name TEXT NOT NULL DEFAULT '';",
+    // What a task actually cost on disk, measured by the worker (§6.1). The
+    // scheduler's per-project estimate used to be the constant 20 GB wearing a
+    // doc comment that claimed it came from history; this is the history.
+    "ALTER TABLE tasks ADD COLUMN disk_used_gb INTEGER NOT NULL DEFAULT 0;",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -773,6 +777,10 @@ impl Store {
 
     /// Write a terminal result only if the row is still non-terminal.
     /// Returns true when this caller won the race (R6).
+    ///
+    /// `disk_used_gb` is the worker's measurement of what this attempt cost on
+    /// disk; 0 means it did not measure (an older worker), and is stored as
+    /// such so the estimate below can ignore it.
     pub fn complete_task(
         &self,
         id: &str,
@@ -780,6 +788,7 @@ impl Store {
         result: &rc_core::pb::TaskResult,
         log_ref: &str,
         image: &str,
+        disk_used_gb: u64,
     ) -> Result<bool> {
         let stats = result.stats.unwrap_or_default();
         let json = serde_json::to_string(result)?;
@@ -787,7 +796,7 @@ impl Store {
             "UPDATE tasks SET status = ?2, result_kind = ?3, result_json = ?4, log_ref = ?5,
                  finished_at = ?6, sync_ms = ?7, build_ms = ?8, bytes_synced = ?9,
                  image = CASE WHEN ?10 != '' THEN ?10 ELSE image END,
-                 units_seen_total = ?11
+                 units_seen_total = ?11, disk_used_gb = ?12
              WHERE id = ?1
                AND status NOT IN ('done','failed','canceled','superseded')",
             params![
@@ -802,9 +811,35 @@ impl Store {
                 stats.bytes_synced as i64,
                 image,
                 result.units_seen_total as i64,
+                disk_used_gb as i64,
             ],
         )?;
         Ok(n > 0)
+    }
+
+    /// The largest disk footprint this project's recent builds left behind.
+    ///
+    /// High-water mark rather than mean: under-estimating is the failure that
+    /// fills a disk, and one build that once needed 300 GB is a fact about this
+    /// repository, not noise to average away. Rows with no measurement (`0`,
+    /// from a worker that predates the field) are skipped rather than counted
+    /// as "this build was free".
+    pub fn project_disk_high_water(&self, project_id: &str, n: usize) -> Result<Option<u64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT disk_used_gb FROM tasks
+             WHERE project_id = ?1 AND status = 'done'
+               AND result_kind IN ('success','compile_error','env_error')
+               AND disk_used_gb > 0
+             ORDER BY finished_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, n as i64], |r| r.get::<_, i64>(0))?;
+        let mut high: Option<u64> = None;
+        for row in rows {
+            let gb = row?.max(0) as u64;
+            high = Some(high.map_or(gb, |h: u64| h.max(gb)));
+        }
+        Ok(high)
     }
 
     /// Recent completed tasks' build_ms p50 and last units_seen_total for
@@ -2585,6 +2620,7 @@ mod tests {
             &TaskResult { kind: "compile_error".into(), ..Default::default() },
             "",
             "",
+            0,
         )
         .unwrap();
 
@@ -2760,13 +2796,13 @@ mod tests {
     fn cache_lookup_ignores_infra_errors_and_expired_rows() {
         let s = store();
         s.insert_task(&task("t1", "fp", "k", "s", "queued"), "{}", "{}", "").unwrap();
-        s.complete_task("t1", "done", &TaskResult { kind: "infra_error".into(), ..Default::default() }, "", "")
+        s.complete_task("t1", "done", &TaskResult { kind: "infra_error".into(), ..Default::default() }, "", "", 0)
             .unwrap();
         // Risk: replaying an infra failure would tell the agent its code is fine.
         assert!(s.find_cached_result("fp", "", 3600).unwrap().is_none());
 
         s.insert_task(&task("t2", "fp", "k", "s", "queued"), "{}", "{}", "").unwrap();
-        s.complete_task("t2", "done", &TaskResult { kind: "success".into(), ..Default::default() }, "", "")
+        s.complete_task("t2", "done", &TaskResult { kind: "success".into(), ..Default::default() }, "", "", 0)
             .unwrap();
         assert!(s.find_cached_result("fp", "", 3600).unwrap().is_some());
         // TTL boundary: a zero-second TTL must never hit.
@@ -2904,6 +2940,7 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN egress_key;
                  ALTER TABLE tasks DROP COLUMN units_seen_total;
                  ALTER TABLE tasks DROP COLUMN scope_hash;
+                 ALTER TABLE tasks DROP COLUMN disk_used_gb;
                  ALTER TABLE workers DROP COLUMN name;
                  INSERT INTO images (id, digest) VALUES ('e1', 'd');
                  INSERT INTO tasks (id, task_type, fingerprint) VALUES ('t1', 'check', 'fp1');",
@@ -3228,6 +3265,7 @@ mod tests {
             },
             "",
             "",
+            0,
         )
         .unwrap();
         s.insert_task(&task("t2", "fp2", "k", "s", "queued"), "{}", "{}", "")
@@ -3241,6 +3279,7 @@ mod tests {
             },
             "",
             "",
+            0,
         )
         .unwrap();
         let t2 = s.get_task("t2").unwrap().unwrap();
@@ -3277,15 +3316,51 @@ mod tests {
             summary: "ok".into(),
             ..Default::default()
         };
-        assert!(s.complete_task("t1", "canceled", &cancel, "", "").unwrap());
-        assert!(!s.complete_task("t1", "done", &done, "", "").unwrap());
+        assert!(s.complete_task("t1", "canceled", &cancel, "", "", 0).unwrap());
+        assert!(!s.complete_task("t1", "done", &done, "", "", 0).unwrap());
         assert_eq!(s.get_task("t1").unwrap().unwrap().status, "canceled");
 
         s.insert_task(&task("t2", "fp2", "k", "s", "running"), "{}", "{}", "")
             .unwrap();
-        assert!(s.complete_task("t2", "done", &done, "", "").unwrap());
-        assert!(!s.complete_task("t2", "canceled", &cancel, "", "").unwrap());
+        assert!(s.complete_task("t2", "done", &done, "", "", 0).unwrap());
+        assert!(!s.complete_task("t2", "canceled", &cancel, "", "", 0).unwrap());
         assert_eq!(s.get_task("t2").unwrap().unwrap().status, "done");
+    }
+
+    #[test]
+    fn a_projects_disk_high_water_ignores_what_was_never_measured() {
+        let s = store();
+        // Nothing built yet: no estimate, so the caller keeps its default.
+        assert_eq!(s.project_disk_high_water("p1", 20).unwrap(), None);
+
+        let ok = TaskResult { kind: "success".into(), ..Default::default() };
+        let mut id = 0;
+        let mut build = |gb: u64, kind: &str, status: &str| {
+            id += 1;
+            let tid = format!("t{id}");
+            s.insert_task(&task(&tid, "fp", "k", "s", "running"), "{}", "{}", "")
+                .unwrap();
+            let result = if kind == "success" {
+                ok.clone()
+            } else {
+                TaskResult { kind: kind.into(), ..Default::default() }
+            };
+            s.complete_task(&tid, status, &result, "", "", gb).unwrap();
+        };
+
+        // Unmeasured (older worker) and an infra failure both say nothing about
+        // what this repository needs.
+        build(0, "success", "done");
+        build(900, "infra_error", "failed");
+        assert_eq!(s.project_disk_high_water("p1", 20).unwrap(), None);
+
+        build(120, "success", "done");
+        build(45, "compile_error", "done");
+        // The high-water mark, not the last or the mean.
+        assert_eq!(s.project_disk_high_water("p1", 20).unwrap(), Some(120));
+        // Only the most recent `n` rows are considered.
+        assert_eq!(s.project_disk_high_water("p1", 1).unwrap(), Some(45));
+        assert_eq!(s.project_disk_high_water("p-other", 20).unwrap(), None);
     }
 
     #[test]
@@ -3302,6 +3377,7 @@ mod tests {
             },
             "",
             "",
+            0,
         )
         .unwrap();
         s.set_status("t1", "running").unwrap();
@@ -3325,6 +3401,7 @@ mod tests {
                 },
                 "",
                 "",
+                0,
             )
             .unwrap());
         assert!(!s.requeue("t1", "w-a", "infra").unwrap());

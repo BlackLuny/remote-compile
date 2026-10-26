@@ -581,6 +581,12 @@ message TaskDone {
   // control plane stops treating these as reachable, so the next bundle is
   // built from a base the fleet actually has (§4.1 step 3).
   repeated string unreachable_commits = 6;
+  // Free space this assignment consumed, measured by the worker as
+  // (before - after) on its data directory. Feeds the scheduler's per-project
+  // disk estimate (§6.1), so it is an observation, not a promise: a worker
+  // running several tasks at once cannot attribute precisely and reports a
+  // number that is too high rather than too low. 0 means "not measured".
+  uint64 disk_used_gb = 7;
 }
 
 message ImageBuildDone {

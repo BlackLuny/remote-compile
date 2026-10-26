@@ -18,6 +18,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Notify};
 
+/// How many recent measurements the per-project disk estimate looks at.
+const DISK_HISTORY: usize = 20;
+
+/// What a project nobody has measured yet is assumed to need. Deliberately
+/// conservative: this is the value the estimate was hardcoded to before it
+/// started learning, so nothing regresses while the history fills up.
+const DEFAULT_EST_DISK_GB: u64 = 20;
+
 pub struct App {
     pub cfg: Config,
     pub store: Arc<Store>,
@@ -845,11 +853,25 @@ impl App {
         Ok(out)
     }
 
-    /// Disk estimate from this project's history, with a conservative default
-    /// for a project nobody has built yet.
+    /// Disk this project's builds need, from what they actually used.
+    ///
+    /// The high-water mark of the last [`DISK_HISTORY`] measurements, not an
+    /// average: under-estimating is the failure that fills a disk, and a build
+    /// that once needed 300 GB is a fact about the repository rather than noise
+    /// to be averaged away. A project nobody has built yet — or one whose only
+    /// builds ran on a worker too old to measure — gets the conservative
+    /// default, so the estimate can only ever rise above where it started.
     pub fn estimate_disk_gb(&self, project_id: &str) -> u64 {
-        let _ = project_id;
-        20
+        let measured = self
+            .store
+            .project_disk_high_water(project_id, DISK_HISTORY)
+            .unwrap_or_else(|e| {
+                // A read that fails costs us nothing but the optimisation; it
+                // must never stop a task from being scheduled.
+                tracing::warn!(error = %e, project = %project_id, "disk history unreadable");
+                None
+            });
+        measured.unwrap_or(0).max(DEFAULT_EST_DISK_GB)
     }
 
     /// Host arch this task must land on, or empty for "any".
@@ -987,10 +1009,18 @@ impl App {
             return Ok(());
         }
 
-        self.finish(&task, &result, &done.log_blob).await
+        self.finish(&task, &result, &done.log_blob, done.disk_used_gb).await
     }
 
-    async fn finish(&self, task: &TaskRow, result: &pb::TaskResult, log_ref: &str) -> Result<()> {
+    /// `disk_used_gb` is the worker's own measurement of this attempt; see
+    /// `Store::project_disk_high_water` for what it is used for.
+    async fn finish(
+        &self,
+        task: &TaskRow,
+        result: &pb::TaskResult,
+        log_ref: &str,
+        disk_used_gb: u64,
+    ) -> Result<()> {
         // What is stored must list only artifacts that can actually be
         // fetched, or the agent is offered files that answer not_found.
         let checked;
@@ -1008,7 +1038,7 @@ impl App {
         };
         let won = self
             .store
-            .complete_task(&task.id, status.as_str(), result, log_ref, &task.image)?;
+            .complete_task(&task.id, status.as_str(), result, log_ref, &task.image, disk_used_gb)?;
         if !won {
             // Lost the race to cancel (or another complete). Drop late result.
             tracing::info!(task = %task.id, "complete_task lost race; discarding late result");
@@ -1140,7 +1170,7 @@ impl App {
         };
         if self
             .store
-            .complete_task(task_id, status.as_str(), &result, "", "")?
+            .complete_task(task_id, status.as_str(), &result, "", "", 0)?
         {
             self.progress.lock().remove(task_id);
             self.store.unpin_task_blobs(task_id)?;
@@ -1645,6 +1675,68 @@ mod tests {
     }
 
     #[test]
+    fn the_disk_estimate_learns_from_what_builds_actually_used() {
+        // Before any measurement the estimate is the conservative default —
+        // this is the number the scheduler used to hardcode, so a fresh
+        // project is scheduled exactly as it was.
+        let app = test_app();
+        assert_eq!(app.estimate_disk_gb(TEST_PROJECT), DEFAULT_EST_DISK_GB);
+
+        // A build that ate 300 GB is a fact about this repository: the next
+        // placement must reserve room for it instead of assuming 20 GB.
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"fat")).unwrap());
+        app.store
+            .complete_task(
+                &id,
+                "done",
+                &pb::TaskResult { kind: "success".into(), ..Default::default() },
+                "",
+                "",
+                300,
+            )
+            .unwrap();
+        assert_eq!(app.estimate_disk_gb(TEST_PROJECT), 300);
+
+        // A later, smaller build does not drag the estimate back down: the
+        // high-water mark is what protects the next one.
+        let id2 = queued_id(app.submit(&request(&app, "s2", "check", b"thin")).unwrap());
+        app.store
+            .complete_task(
+                &id2,
+                "done",
+                &pb::TaskResult { kind: "success".into(), ..Default::default() },
+                "",
+                "",
+                40,
+            )
+            .unwrap();
+        assert_eq!(app.estimate_disk_gb(TEST_PROJECT), 300);
+
+        // And another project is unaffected by this one's appetite.
+        assert_eq!(app.estimate_disk_gb("p-fedcba9876543210"), DEFAULT_EST_DISK_GB);
+    }
+
+    #[test]
+    fn an_unmeasured_build_never_looks_free() {
+        // A worker too old to report `disk_used_gb` sends 0. Counting that as
+        // "this build used no disk" would make the estimate fall to nothing and
+        // wave every task onto a full machine.
+        let app = test_app();
+        let id = queued_id(app.submit(&request(&app, "s1", "check", b"unmeasured")).unwrap());
+        app.store
+            .complete_task(
+                &id,
+                "done",
+                &pb::TaskResult { kind: "success".into(), ..Default::default() },
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+        assert_eq!(app.estimate_disk_gb(TEST_PROJECT), DEFAULT_EST_DISK_GB);
+    }
+
+    #[test]
     fn a_completed_result_is_served_from_cache() {
         let app = test_app();
         let id = queued_id(app.submit(&request(&app, "s1", "check", b"cached")).unwrap());
@@ -1655,6 +1747,7 @@ mod tests {
                 &pb::TaskResult { kind: "success".into(), ..Default::default() },
                 "",
                 "",
+                0,
             )
             .unwrap();
         match app.submit(&request(&app, "s1", "check", b"cached")).unwrap() {
@@ -1689,6 +1782,7 @@ mod tests {
                 },
                 "",
                 "",
+                0,
             )
             .unwrap();
         let id2 = queued_id(app.submit(&request(&app, "s1", "check", b"delta-b")).unwrap());
@@ -1710,6 +1804,7 @@ mod tests {
                 },
                 "",
                 "",
+                0,
             )
             .unwrap();
         let st = app
@@ -1785,6 +1880,7 @@ mod tests {
                 &pb::TaskResult { kind: "infra_error".into(), ..Default::default() },
                 "",
                 "",
+                0,
             )
             .unwrap();
         assert!(matches!(
@@ -1798,7 +1894,7 @@ mod tests {
         let app = test_app();
         let id = queued_id(app.submit(&request(&app, "s1", "check", b"c")).unwrap());
         app.store
-            .complete_task(&id, "done", &pb::TaskResult { kind: "success".into(), ..Default::default() }, "", "")
+            .complete_task(&id, "done", &pb::TaskResult { kind: "success".into(), ..Default::default() }, "", "", 0)
             .unwrap();
         let mut req = request(&app, "s1", "check", b"c");
         req.no_cache = true;
@@ -1955,7 +2051,7 @@ mod tests {
         let id = queued_id(app.submit(&request(&app, "s1", "check", b"x")).unwrap());
         app.store.assign_to_worker(&id, "w-a").unwrap();
         app.store
-            .complete_task(&id, "canceled", &pb::TaskResult::default(), "", "")
+            .complete_task(&id, "canceled", &pb::TaskResult::default(), "", "", 0)
             .unwrap();
         app.on_task_done(
             "w-a",
@@ -2246,7 +2342,7 @@ mod tests {
             .put(&rc_core::cas::compress_log(&text).unwrap())
             .unwrap();
         app.store
-            .complete_task(&id, "done", &pb::TaskResult::default(), &blob, "")
+            .complete_task(&id, "done", &pb::TaskResult::default(), &blob, "", 0)
             .unwrap();
 
         let page = app
@@ -2278,7 +2374,7 @@ mod tests {
         let text: String = (0..5000).map(|i| format!("line {i}\n")).collect();
         let blob = app.cas.put(&rc_core::cas::compress_log(&text).unwrap()).unwrap();
         app.store
-            .complete_task(&id, "done", &pb::TaskResult::default(), &blob, "")
+            .complete_task(&id, "done", &pb::TaskResult::default(), &blob, "", 0)
             .unwrap();
         let page = app
             .get_log(&pb::LogQuery { task_id: id, limit: 0, ..Default::default() })
@@ -2309,6 +2405,7 @@ mod tests {
                 },
                 "",
                 "",
+                0,
             )
             .unwrap();
         let id2 = queued_id(app.submit(&request(&app, "s1", "check", b"mem-b")).unwrap());
@@ -2329,6 +2426,7 @@ mod tests {
                 },
                 "",
                 "",
+                0,
             )
             .unwrap();
         let st1 = app.task_status_with_baseline(&id2, "auto").unwrap().unwrap();
