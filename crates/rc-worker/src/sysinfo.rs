@@ -42,32 +42,59 @@ fn parse_uptime_load(text: &str) -> Option<f64> {
         .ok()
 }
 
+/// Space on the filesystem holding a path.
+///
+/// The total matters as much as the free space: "20 GB left" means something
+/// different on a 100 GB machine and on a 2 TB one, and the scheduler can only
+/// express a reserve as a fraction of the disk if it is told how big it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUsage {
+    /// Available to unprivileged writers. Zero means unknown/unreadable.
+    pub free_gb: u64,
+    /// Filesystem size. Zero when `df` did not give one, which is what an
+    /// older worker reports and what the scheduler must treat as "no total".
+    pub total_gb: u64,
+}
+
 /// Free space in GB on the filesystem holding `path`.
 pub fn disk_free_gb(path: &Path) -> u64 {
+    disk_usage(path).free_gb
+}
+
+pub fn disk_usage(path: &Path) -> DiskUsage {
     let Ok(out) = std::process::Command::new("df")
         .arg("-Pk")
         .arg(path)
         .output()
     else {
-        return 0;
+        return DiskUsage::default();
     };
-    parse_df_available_kb(&String::from_utf8_lossy(&out.stdout))
-        .map(|kb| kb / (1024 * 1024))
-        .unwrap_or(0)
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some((total_kb, available_kb)) = parse_df_kb(&text) else {
+        return DiskUsage::default();
+    };
+    DiskUsage {
+        free_gb: available_kb / (1024 * 1024),
+        total_gb: total_kb / (1024 * 1024),
+    }
 }
 
 /// `df -Pk` guarantees POSIX output: a header line, then
 /// `Filesystem 1024-blocks Used Available Capacity Mounted-on`.
-fn parse_df_available_kb(output: &str) -> Option<u64> {
+///
+/// Returns `(total, available)` in 1024-byte blocks.
+fn parse_df_kb(output: &str) -> Option<(u64, u64)> {
     let line = output.lines().nth(1)?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
+    let mut fields: Vec<&str> = line.split_whitespace().collect();
     // A long device name can wrap onto the next line; POSIX mode prevents
     // that, but stay defensive and index from the end instead.
-    if fields.len() < 5 {
-        let joined: Vec<&str> = output.lines().skip(1).flat_map(|l| l.split_whitespace()).collect();
-        return joined.get(joined.len().checked_sub(3)?)?.parse().ok();
+    if fields.len() < 6 {
+        fields = output.lines().skip(1).flat_map(|l| l.split_whitespace()).collect();
     }
-    fields[fields.len() - 3].parse().ok()
+    let n = fields.len();
+    let total = fields.get(n.checked_sub(5)?)?.parse().ok()?;
+    let available = fields.get(n.checked_sub(3)?)?.parse().ok()?;
+    Some((total, available))
 }
 
 #[cfg(test)]
@@ -78,7 +105,7 @@ mod tests {
     fn parses_posix_df_output() {
         let out = "Filesystem 1024-blocks      Used Available Capacity Mounted on\n\
                    /dev/nvme0n1p2 982940788 123456789 809483999      14% /\n";
-        assert_eq!(parse_df_available_kb(out), Some(809_483_999));
+        assert_eq!(parse_df_kb(out), Some((982_940_788, 809_483_999)));
     }
 
     #[test]
@@ -86,13 +113,26 @@ mod tests {
         let out = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
                    /dev/mapper/a-very-long-logical-volume-name\n\
                     982940788 123456789 809483999 14% /\n";
-        assert_eq!(parse_df_available_kb(out), Some(809_483_999));
+        assert_eq!(parse_df_kb(out), Some((982_940_788, 809_483_999)));
+    }
+
+    #[test]
+    fn the_total_is_read_from_the_same_line_as_the_free_space() {
+        // A 2 TB volume with 900 GB left: the two numbers the scheduler needs
+        // to turn "GB left" into a fraction of the disk.
+        let out = "Filesystem 1024-blocks      Used Available Capacity Mounted on\n\
+                   /dev/nvme1n1p1 1953514584 1000000000 943514584      52% /data\n";
+        let usage = parse_df_kb(out).expect("parsed");
+        assert_eq!(usage, (1_953_514_584, 943_514_584));
     }
 
     #[test]
     fn malformed_df_output_does_not_panic() {
-        assert_eq!(parse_df_available_kb(""), None);
-        assert_eq!(parse_df_available_kb("Filesystem\n"), None);
+        assert_eq!(parse_df_kb(""), None);
+        assert_eq!(parse_df_kb("Filesystem\n"), None);
+        // A line with no numbers at all must not be read as a zero-sized disk.
+        assert_eq!(parse_df_kb("Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                                /dev/disk3s1 x y z 10% /\n"), None);
     }
 
     #[test]
@@ -105,7 +145,13 @@ mod tests {
     fn disk_free_reports_something_for_a_real_path() {
         // The exact number is environment-specific; zero would mean the
         // scheduler always treats this worker as full.
-        assert!(disk_free_gb(&std::env::temp_dir()) > 0);
+        let usage = disk_usage(&std::env::temp_dir());
+        assert!(usage.free_gb > 0);
+        // The total may legitimately be 0 on an exotic `df`, but when it is
+        // there it must bound the free space.
+        if usage.total_gb > 0 {
+            assert!(usage.free_gb <= usage.total_gb, "{usage:?}");
+        }
     }
 
     #[test]

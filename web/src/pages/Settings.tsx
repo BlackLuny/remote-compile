@@ -224,6 +224,14 @@ export function Settings({ role }: { role: Role }) {
               onChange={(v) => set("min_disk_free_gb", v)}
               readOnly={readOnly}
             />
+            <NumberField
+              label="最低可用磁盘占比 %"
+              hint="按每台 worker 自己的盘算；与上面的 GB 下限取大者。大盘不能靠“还剩几十 GB”过关"
+              value={draft.min_disk_free_percent}
+              step={1}
+              onChange={(v) => set("min_disk_free_percent", v)}
+              readOnly={readOnly}
+            />
           </Group>
 
           <Group title="安全">

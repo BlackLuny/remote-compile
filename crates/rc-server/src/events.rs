@@ -25,6 +25,8 @@ pub enum Event {
         status: String,
         cpu_load: f64,
         disk_free_gb: u64,
+        /// 0 when the worker reports no filesystem size.
+        disk_total_gb: u64,
         running_tasks: u32,
         at: i64,
     },

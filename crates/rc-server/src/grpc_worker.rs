@@ -198,6 +198,7 @@ impl WorkerApi for WorkerService {
                 status: "offline".into(),
                 cpu_load: 0.0,
                 disk_free_gb: 0,
+                disk_total_gb: 0,
                 running_tasks: 0,
                 at: now_ms(),
             });
@@ -291,6 +292,7 @@ async fn handle_event(app: &Arc<App>, worker_id: &str, event: WorkerEvent) -> an
                 status: hb.status.clone(),
                 cpu_load: stats.cpu_load,
                 disk_free_gb: stats.disk_free_gb,
+                disk_total_gb: stats.disk_total_gb,
                 running_tasks: stats.running_tasks,
                 at: now_ms(),
             });

@@ -155,6 +155,8 @@ export interface TaskDetail {
 export interface WorkerStats {
   cpu_load: number;
   disk_free_gb: number;
+  /** Filesystem size, 0 or absent from a worker that does not report one. */
+  disk_total_gb?: number;
   running_tasks: number;
   cached_worktrees: string[];
   cached_projects: string[];
@@ -302,6 +304,8 @@ export interface Policy {
   w_cache_affinity: number;
   w_image_affinity: number;
   min_disk_free_gb: number;
+  /** Hard floor as a share of each worker's own disk, e.g. 10 for "10%". */
+  min_disk_free_percent: number;
   alert_webhook: string;
   default_image: string;
   /** External registry host, e.g. hub.covm.net */

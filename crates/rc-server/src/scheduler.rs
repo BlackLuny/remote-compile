@@ -14,6 +14,10 @@ pub struct Candidate {
     pub status: String,
     pub cpu_load: f64,
     pub disk_free_gb: u64,
+    /// Filesystem size, 0 when the worker does not report one (an older
+    /// binary). Every percentage-shaped rule below is skipped at 0, which
+    /// degrades to exactly the pre-percentage behaviour.
+    pub disk_total_gb: u64,
     pub free_slots: u32,
     /// Worktrees whose target volume lives on this worker.
     pub cached_worktrees: Vec<String>,
@@ -101,14 +105,11 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
     if c.busy_worktrees.iter().any(|w| w == &d.worktree_id) {
         return Err(Reject::WorktreeBusy);
     }
-    let needed = ((d.est_disk_gb as f64) * 1.5).ceil() as u64;
-    if c.disk_free_gb < p.min_disk_free_gb.max(needed) {
+    if c.disk_free_gb < disk_floor_gb(c, d, p) {
         return Err(Reject::InsufficientDisk);
     }
 
-    // disk_fit saturates: three times the estimate is as good as ten.
-    let headroom = (d.est_disk_gb.max(1) as f64) * 3.0;
-    let disk_fit = ((c.disk_free_gb as f64) / headroom).min(1.0);
+    let disk_fit = disk_fit(c, d, p);
     let cpu_fit = (1.0 - c.cpu_load).clamp(0.0, 1.0);
     let cache_affinity = if c.cached_worktrees.iter().any(|w| w == &d.worktree_id) {
         1.0
@@ -127,6 +128,62 @@ pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
         + p.w_cpu * cpu_fit
         + p.w_cache_affinity * cache_affinity
         + p.w_image_affinity * image_affinity)
+}
+
+/// Space a worker must keep free to be eligible for this task, in GB.
+///
+/// The largest of three floors, because they answer different questions:
+///
+/// * `min_disk_free_gb` — the admin's absolute reserve, and the only floor an
+///   older worker that reports no total size can be held to.
+/// * `est * 1.5` — this task's own footprint plus room to finish it.
+/// * `min_disk_free_percent` of the worker's disk — what has to be left over so
+///   the target caches on that volume can still be pruned. A 2 TB worker with
+///   40 GB free is not "fine because 40 > 30": it is full, and the next build
+///   that needs 50 GB takes the machine down for every worktree on it.
+///
+/// Taking the max matters: a percentage must never *lower* the absolute floor
+/// (a 64 GB worker would otherwise be admitted at 6 GB left), and the estimate
+/// must never be undercut either.
+pub fn disk_floor_gb(c: &Candidate, d: &Demand, p: &Policy) -> u64 {
+    let needed = ((d.est_disk_gb as f64) * 1.5).ceil() as u64;
+    let share = if c.disk_total_gb > 0 {
+        (c.disk_total_gb as f64 * reserve_ratio(p)).ceil() as u64
+    } else {
+        0
+    };
+    p.min_disk_free_gb.max(needed).max(share)
+}
+
+/// How much of a disk the fleet insists on keeping free, as a share.
+///
+/// The policy value is admin input, so it is clamped rather than trusted: a
+/// typo of `1000` would take the whole fleet out of the pool, and a negative
+/// one would silently disable the term.
+fn reserve_ratio(p: &Policy) -> f64 {
+    (p.min_disk_free_percent / 100.0).clamp(0.0, 1.0)
+}
+
+/// How good a worker's disk is for this task, in `[0, 1]`, for the score.
+///
+/// Two terms, both required. The absolute one is the old rule — three times the
+/// estimate is as much headroom as ten times — so a worker barely above the
+/// floor still loses to an empty one. The fractional one ranks two workers that
+/// both have "enough": 300 GB free is 60% of a 500 GB volume and 15% of a 2 TB
+/// one, and the first is the machine that is still healthy next month.
+pub fn disk_fit(c: &Candidate, d: &Demand, p: &Policy) -> f64 {
+    let headroom = (d.est_disk_gb.max(1) as f64) * 3.0;
+    let absolute = (c.disk_free_gb as f64 / headroom).min(1.0);
+    if c.disk_total_gb == 0 {
+        // No total reported: the absolute term is all there is. Inventing a
+        // fraction from nothing would silently re-rank the whole fleet.
+        return absolute;
+    }
+    let free_share = c.disk_free_gb as f64 / c.disk_total_gb as f64;
+    // Twice the reserve is comfortable; at exactly the reserve a worker is
+    // admissible but should lose to anything roomier.
+    let comfortable = (2.0 * reserve_ratio(p)).max(0.02);
+    absolute.min((free_share / comfortable).clamp(0.0, 1.0))
 }
 
 pub fn has_image(c: &Candidate, image: &str) -> bool {
@@ -307,6 +364,94 @@ mod tests {
         let mut tiny = worker("d");
         tiny.disk_free_gb = 25; // below est(20) * 1.5
         assert_eq!(evaluate(&tiny, &d, &p), Err(Reject::InsufficientDisk));
+    }
+
+    #[test]
+    fn a_big_disk_is_gated_on_a_share_of_itself_not_on_a_fixed_number() {
+        // 100 GB free is 5% of this volume: the task would fit, and the machine
+        // would still be unable to GC, so it must stay out of the pool.
+        let p = Policy::default();
+        let mut big = worker("a");
+        big.disk_total_gb = 2000;
+        big.disk_free_gb = 100;
+        assert_eq!(evaluate(&big, &demand(), &p), Err(Reject::InsufficientDisk));
+        assert_eq!(disk_floor_gb(&big, &demand(), &p), 200);
+
+        // Just above the reserve it is admissible again, and it is the
+        // fraction — not `est * 1.5 = 30` — that decided both answers.
+        big.disk_free_gb = 210;
+        assert!(evaluate(&big, &demand(), &p).is_ok());
+    }
+
+    #[test]
+    fn a_percentage_never_lowers_the_absolute_floor() {
+        // 10% of a 64 GB worker is 7 GB, which would admit a build that needs
+        // 30. The floors are a max, not a replacement.
+        let p = Policy::default();
+        let mut small = worker("a");
+        small.disk_total_gb = 64;
+        small.disk_free_gb = 25;
+        assert_eq!(evaluate(&small, &demand(), &p), Err(Reject::InsufficientDisk));
+        assert_eq!(disk_floor_gb(&small, &demand(), &p), 30);
+    }
+
+    #[test]
+    fn a_worker_that_reports_no_total_keeps_the_gb_rule() {
+        // An older binary: no total, so no percentage. It must not be judged
+        // as if it were a 2 TB machine, and it must not become ineligible
+        // either.
+        let p = Policy::default();
+        let mut old = worker("a");
+        old.disk_total_gb = 0;
+        old.disk_free_gb = 100;
+        assert!(evaluate(&old, &demand(), &p).is_ok());
+        assert_eq!(disk_floor_gb(&old, &demand(), &p), 30);
+    }
+
+    #[test]
+    fn an_absurd_percentage_from_the_console_is_clamped() {
+        // A typo of 1000% must not take the fleet out of the pool for good, and
+        // a negative value must not silently switch the term off.
+        let mut p = Policy::default();
+        p.min_disk_free_percent = 1000.0;
+        let mut w = worker("a");
+        w.disk_total_gb = 1000;
+        w.disk_free_gb = 999;
+        assert_eq!(disk_floor_gb(&w, &demand(), &p), 1000);
+
+        p.min_disk_free_percent = -50.0;
+        assert_eq!(disk_floor_gb(&w, &demand(), &p), 30);
+    }
+
+    #[test]
+    fn equal_free_space_on_a_smaller_disk_scores_higher() {
+        // Both have 300 GB left, well past every floor. The one where that is
+        // 60% of the volume is the one that stays healthy; the 2 TB machine at
+        // 15% should lose even though it looks emptier in absolute terms.
+        let p = Policy::default();
+        let mut big = worker("a");
+        big.disk_total_gb = 2000;
+        big.disk_free_gb = 300;
+        let mut small = worker("b");
+        small.disk_total_gb = 500;
+        small.disk_free_gb = 300;
+        assert!(disk_fit(&small, &demand(), &p) > disk_fit(&big, &demand(), &p));
+        assert_eq!(pick(&[big, small], &demand(), &p).unwrap().worker_id, "b");
+    }
+
+    #[test]
+    fn a_worker_at_the_reserve_loses_to_one_with_room() {
+        // Same volume size, so the percentage cannot separate them: the
+        // absolute headroom must.
+        let p = Policy::default();
+        let mut tight = worker("a");
+        tight.disk_total_gb = 1000;
+        tight.disk_free_gb = 110;
+        let mut roomy = worker("b");
+        roomy.disk_total_gb = 1000;
+        roomy.disk_free_gb = 600;
+        assert!(disk_fit(&roomy, &demand(), &p) > disk_fit(&tight, &demand(), &p));
+        assert_eq!(pick(&[tight, roomy], &demand(), &p).unwrap().worker_id, "b");
     }
 
     #[test]

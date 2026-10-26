@@ -303,6 +303,9 @@ fn worker_json(w: crate::workers::WorkerConn) -> serde_json::Value {
         "stats": {
             "cpu_load": w.stats.cpu_load,
             "disk_free_gb": w.stats.disk_free_gb,
+            // 0 means the worker does not report a size; the console says
+            // "unknown" rather than drawing a 0% bar.
+            "disk_total_gb": w.stats.disk_total_gb,
             "running_tasks": w.stats.running_tasks,
             "cached_worktrees": w.stats.cached_worktrees,
             "cached_projects": w.stats.cached_projects,

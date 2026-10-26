@@ -544,6 +544,12 @@ message WorkerStats {
   // carried volume names and the console labels it so; this is the field
   // the scheduler matches a task's image against.
   repeated string local_images = 10;
+  // Size of the filesystem `disk_free_gb` was measured on. The scheduler turns
+  // its disk reserve into a fraction of the disk, which an absolute number of
+  // GB cannot express: 20 GB left is comfortable on a 100 GB host and is the
+  // end of the world on a 2 TB one. 0 from a worker that predates this field,
+  // which leaves it gated on the GB terms exactly as before.
+  uint64 disk_total_gb = 11;
 }
 
 message Heartbeat {

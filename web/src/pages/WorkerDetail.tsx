@@ -28,7 +28,7 @@ import {
   Th,
 } from "../components/ui";
 import { Chart, axisStyle, chartBase } from "../components/Chart";
-import { agoSecs, ms, percent, resultTone, shortId, statusTone } from "../lib/format";
+import { agoSecs, disk, diskShare, ms, percent, resultTone, shortId, statusTone } from "../lib/format";
 
 interface Sample {
   t: number;
@@ -180,7 +180,12 @@ export function WorkerDetail({ role }: { role: Role }) {
         <Stat label="CPU 负载" value={live ? percent(live.stats.cpu_load) : "–"} tone="info" />
         <Stat
           label="磁盘余量"
-          value={live ? `${live.stats.disk_free_gb} GB` : "–"}
+          value={live ? disk(live.stats.disk_free_gb, live.stats.disk_total_gb) : "–"}
+          hint={
+            live && diskShare(live.stats.disk_free_gb, live.stats.disk_total_gb) !== null
+              ? `占全盘 ${percent(diskShare(live.stats.disk_free_gb, live.stats.disk_total_gb) ?? 0)} 空闲`
+              : undefined
+          }
           tone={live && live.stats.disk_free_gb < 50 ? "warn" : "ok"}
         />
         <Stat

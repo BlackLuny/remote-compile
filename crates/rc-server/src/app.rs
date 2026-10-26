@@ -833,6 +833,7 @@ impl App {
                 status: w.status.clone(),
                 cpu_load: w.stats.cpu_load,
                 disk_free_gb: w.stats.disk_free_gb,
+                disk_total_gb: w.stats.disk_total_gb,
                 free_slots: w.free_slots(),
                 cached_worktrees: w.stats.cached_worktrees.clone(),
                 cached_projects: w.stats.cached_projects.clone(),
