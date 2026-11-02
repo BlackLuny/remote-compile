@@ -554,6 +554,7 @@ async fn collect_stats(cfg: &WorkerConfig, runner: &Runner, running: u32) -> pb:
         cpu_load: sysinfo::cpu_load(),
         disk_free_gb: disk.free_gb,
         disk_total_gb: disk.total_gb,
+        container_limits: Some(pb::ContainerLimits { memory_mb: cfg.memory_mb, cpus: cfg.cpus, pids_limit: cfg.pids_limit }),
         running_tasks: running,
         cached_worktrees,
         cached_projects,

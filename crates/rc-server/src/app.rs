@@ -348,6 +348,11 @@ impl App {
         if !ids::is_valid_worktree_id(&req.worktree_id) {
             return Err(anyhow!("malformed worktree_id: {}", req.worktree_id));
         }
+        if !req.required_worker_id.is_empty()
+            && !self.store.list_workers()?.iter().any(|w| w.id == req.required_worker_id)
+        {
+            return Err(anyhow!("unknown required worker `{}`", req.required_worker_id));
+        }
         self.check_image_admissible(&profile.image, &policy)?;
         self.check_capabilities_available(manifest, profile)?;
 
@@ -455,7 +460,7 @@ impl App {
         }
 
         // §5.1 task cache.
-        if !req.no_cache {
+        if !req.no_cache && req.required_worker_id.is_empty() {
             let cached = self
                 .store
                 .find_cached_result(&fingerprint, &egress_key, policy.task_cache_ttl_secs)?
@@ -495,7 +500,9 @@ impl App {
 
         // §5.3 identical work already in flight: subscribe rather than
         // enqueue a duplicate.
-        if let Some(active) = self.store.find_active_by_fingerprint(&fingerprint, &egress_key)? {
+        if let Some(active) = if req.required_worker_id.is_empty() {
+            self.store.find_active_by_fingerprint(&fingerprint, &egress_key)?
+        } else { None } {
             self.store.add_subscriber(&active.id, &req.agent_session)?;
             self.metrics.incr("tasks_dedup_total", 1.0);
             return Ok(Admission::Subscribed { task_id: active.id });
@@ -564,12 +571,11 @@ impl App {
             agent_session: req.agent_session.clone(),
             fingerprint: fingerprint.to_string(),
             egress_key: egress_key.to_string(),
-            supersede_key: ids::supersede_key(
-                &req.worktree_id,
-                &req.agent_session,
-                &req.task_type,
-                scope_hash,
-            ),
+            supersede_key: {
+                let base = ids::supersede_key(&req.worktree_id, &req.agent_session, &req.task_type, scope_hash);
+                if req.required_worker_id.is_empty() { base } else { format!("{}:worker:{}", base, req.required_worker_id) }
+            },
+            required_worker_id: req.required_worker_id.clone(),
             status: status.as_str().to_string(),
             command: command.to_string(),
             created_at: now_ms(),
@@ -729,7 +735,8 @@ impl App {
             image: task.image.clone(),
             arch: self.demand_arch_for(task, profile.as_ref()),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
-            excluded: self.store.attempted_workers(&task.id)?,
+            required_worker_id: task.required_worker_id.clone(),
+            excluded: if task.required_worker_id.is_empty() { self.store.attempted_workers(&task.id)? } else { vec![] },
             required_capabilities: required_capabilities(manifest.as_ref(), profile.as_ref()),
             // Published images can be fetched anywhere; only unpublished ones
             // are tied to the workers that hold them.
@@ -909,13 +916,17 @@ impl App {
             image: task.image.clone(),
             arch: self.demand_arch_for(task, profile.as_ref()),
             est_disk_gb: self.estimate_disk_gb(&task.project_id),
-            excluded: self.store.attempted_workers(&task.id).unwrap_or_default(),
+            required_worker_id: task.required_worker_id.clone(),
+            excluded: if task.required_worker_id.is_empty() { self.store.attempted_workers(&task.id).unwrap_or_default() } else { vec![] },
             required_capabilities,
             require_local_image: scheduler::require_local_image(&candidates, &task.image)
                 && images::pull_ref_for_image(self, &task.image).is_none(),
         };
-        scheduler::explain(&candidates, &demand, &policy)
-            .into_iter()
+        let mut reasons = scheduler::explain(&candidates, &demand, &policy);
+        if !task.required_worker_id.is_empty() && !candidates.iter().any(|c| c.worker_id == task.required_worker_id) {
+            reasons.push((task.required_worker_id.clone(), scheduler::Reject::NotOnline));
+        }
+        reasons.into_iter()
             .map(|(worker, reason)| (worker, format!("{reason:?}")))
             .collect()
     }
@@ -1559,6 +1570,78 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[test]
+    fn pinned_submissions_are_persisted_and_never_deduplicate_across_placement() {
+        let app = test_app();
+        for id in ["worker-a", "worker-b"] {
+            app.store.upsert_worker(&crate::store::WorkerRow { id: id.into(), ..Default::default() }, "hash").unwrap();
+        }
+        let mut req = request(&app, "session", "check", b"same source");
+        let unpinned = queued_id(app.submit(&req).unwrap());
+        req.required_worker_id = "worker-a".into();
+        let a = queued_id(app.submit(&req).unwrap());
+        assert_ne!(a, unpinned);
+        assert_eq!(app.store.get_task(&a).unwrap().unwrap().required_worker_id, "worker-a");
+        assert_eq!(app.store.get_task(&unpinned).unwrap().unwrap().status, "queued");
+        req.required_worker_id = "worker-b".into();
+        let b = queued_id(app.submit(&req).unwrap());
+        assert_ne!(a, b);
+        assert_eq!(app.store.get_task(&a).unwrap().unwrap().status, "queued");
+        req.required_worker_id = "missing".into();
+        assert!(app.submit(&req).unwrap_err().to_string().contains("unknown required worker"));
+    }
+
+    #[test]
+    fn pinned_checks_bypass_cached_results_and_unpinned_checks_do_not_subscribe_to_them() {
+        let app = test_app();
+        app.store.upsert_worker(&crate::store::WorkerRow { id: "worker-a".into(), ..Default::default() }, "hash").unwrap();
+        let mut req = request(&app, "first", "check", b"cached source");
+        let previous = queued_id(app.submit(&req).unwrap());
+        app.store.complete_task(&previous, "done", &pb::TaskResult { kind: "success".into(), ..Default::default() }, "", "", 0).unwrap();
+        req.required_worker_id = "worker-a".into();
+        let pinned = queued_id(app.submit(&req).unwrap());
+        assert_ne!(pinned, previous);
+        assert_eq!(app.store.get_task(&pinned).unwrap().unwrap().cache_hit, 0);
+
+        let mut other = request(&app, "second", "check", b"different source");
+        other.required_worker_id = "worker-a".into();
+        let pinned_only = queued_id(app.submit(&other).unwrap());
+        other.required_worker_id.clear();
+        let automatic = queued_id(app.submit(&other).unwrap());
+        assert_ne!(pinned_only, automatic);
+    }
+
+    #[tokio::test]
+    async fn pinned_task_waits_for_its_worker_and_retry_never_changes_worker() {
+        let app = test_app();
+        for id in ["worker-a", "worker-b"] {
+            app.store.upsert_worker(&crate::store::WorkerRow { id: id.into(), ..Default::default() }, "hash").unwrap();
+        }
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(10);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
+        app.workers.connect("worker-b", "x86_64", "test", 1, tx_b);
+        let stats = pb::WorkerStats { disk_free_gb: 500, ..Default::default() };
+        app.workers.heartbeat("worker-b", stats.clone(), "online", &[], &[]);
+        let mut req = request(&app, "session", "check", b"pinned source");
+        req.required_worker_id = "worker-a".into();
+        let id = queued_id(app.submit(&req).unwrap());
+        let task = app.store.get_task(&id).unwrap().unwrap();
+        assert!(!app.try_dispatch(&task, &app.policy()).await.unwrap());
+        assert!(rx_b.try_recv().is_err());
+        app.workers.connect("worker-a", "x86_64", "test", 1, tx_a);
+        app.workers.heartbeat("worker-a", stats, "online", &[], &[]);
+        assert!(app.try_dispatch(&task, &app.policy()).await.unwrap());
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
+        assert_eq!(app.store.get_task(&id).unwrap().unwrap().worker_id, "worker-a");
+        app.workers.note_finished("worker-a", &id);
+        app.store.requeue(&id, "worker-a", "test failure").unwrap();
+        let task = app.store.get_task(&id).unwrap().unwrap();
+        assert!(app.try_dispatch(&task, &app.policy()).await.unwrap());
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
     }
 
     #[test]

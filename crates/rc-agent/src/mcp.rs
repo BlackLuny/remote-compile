@@ -232,12 +232,16 @@ impl McpServer {
                 }
             }
         }
+        if args.get("worker_id").is_some_and(|v| !v.is_string()) {
+            return Err(McpError::InvalidParams("worker_id must be an exact worker ID string".into()));
+        }
         let req = CheckRequest {
             path,
             task,
             command: args.get("command").and_then(|v| v.as_str()).map(String::from),
             wait_secs: args.get("wait_secs").and_then(|v| v.as_u64()).map(|v| v as u32),
             no_cache: args.get("no_cache").and_then(|v| v.as_bool()).unwrap_or(false),
+            worker_id: args.get("worker_id").and_then(|v| v.as_str()).map(String::from),
             env,
             no_remediate: args.get("no_remediate").and_then(|v| v.as_bool()).unwrap_or(false),
             baseline: args
@@ -536,17 +540,25 @@ impl McpServer {
         );
         for w in resp.workers.iter().take(30) {
             text.push_str(&format!(
-                "{}  {}  cpu {:.0}%  disk {}GB  {}/{} 任务\n",
+                "{}{}  {}  cpu {:.0}%  disk {}GB  {}/{} 任务  容器 {}\n",
                 w.worker_id,
+                if w.name.is_empty() { String::new() } else { format!(" ({})", w.name) },
                 w.status,
                 w.cpu_load * 100.0,
                 w.disk_free_gb,
                 w.running_tasks,
-                w.max_parallel
+                w.max_parallel,
+                w.container_limits.as_ref().map(format_container_limits).unwrap_or_else(|| "限制未知".into())
             ));
         }
         Ok(text)
     }
+}
+
+fn format_container_limits(l: &rc_core::pb::ContainerLimits) -> String {
+    let memory = if l.memory_mb == 0 { "内存无限制".into() } else { format!("{} MiB", l.memory_mb) };
+    let pids = if l.pids_limit <= 0 { "PID 无限制".into() } else { format!("{} PIDs", l.pids_limit) };
+    format!("{memory} / {} CPU / {pids}", l.cpus)
 }
 
 pub enum McpError {
@@ -622,6 +634,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "command": { "type": "string", "description": "覆盖默认命令（少用；优先写进 .remote-compile.toml）" },
                     "wait_secs": { "type": "integer", "description": "同步等待秒数，默认 4；冷 monorepo 建议 60~120" },
                     "no_cache": { "type": "boolean", "description": "跳过指纹缓存强制重编，默认 false" },
+                    "worker_id": { "type": "string", "description": "必须在此 worker ID 执行；不可用时排队，不回退，跳过结果缓存" },
                     "env": { "type": "object", "description": "请求级环境变量（分层叠加；有 denylist）", "additionalProperties": { "type": "string" } },
                     "no_remediate": { "type": "boolean", "description": "关闭 OOM 自动降配重试，默认 false" },
                     "baseline": { "type": "string", "description": "诊断增量基线：auto|none|last_success|<task_id>，默认 auto" },

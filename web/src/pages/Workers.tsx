@@ -1,3 +1,4 @@
+import { containerLimits } from "../lib/format";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
@@ -104,6 +105,7 @@ export function Workers({ role }: { role: Role }) {
                 <Th>CPU</Th>
                 <Th>磁盘</Th>
                 <Th>任务</Th>
+                <Th>单容器限制</Th>
                 <Th>缓存</Th>
                 <Th>版本</Th>
                 <Th>心跳</Th>
@@ -154,6 +156,7 @@ export function Workers({ role }: { role: Role }) {
                   <Td className="tnum">
                     {w.stats ? `${w.stats.running_tasks}/${w.max_parallel}` : `–/${w.max_parallel}`}
                   </Td>
+                  <Td className="tnum text-[var(--color-ink-dim)]">{containerLimits(w.stats?.container_limits)}</Td>
                   <Td className="tnum text-[var(--color-ink-dim)]">
                     {w.stats
                       ? `${w.stats.cached_worktrees.length} worktree · ${w.stats.cached_projects.length} project`

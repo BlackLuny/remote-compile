@@ -143,7 +143,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   egress_key     TEXT NOT NULL DEFAULT '',
   units_seen_total INTEGER NOT NULL DEFAULT 0,
   scope_hash     TEXT NOT NULL DEFAULT '',
-  disk_used_gb   INTEGER NOT NULL DEFAULT 0
+  disk_used_gb   INTEGER NOT NULL DEFAULT 0,
+  required_worker_id TEXT NOT NULL DEFAULT ''
 );
 -- `egress_key` is the egress grant this task's fingerprint was computed from
 -- (§7.1), so the build cannot run with a grant its cache key does not describe.

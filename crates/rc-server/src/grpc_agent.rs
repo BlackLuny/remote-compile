@@ -286,6 +286,13 @@ impl AgentApi for AgentService {
         }
     }
 
+    async fn submit_pinned_task(&self, req: Request<SubmitTaskReq>) -> Result<Response<TaskHandle>, Status> {
+        if req.get_ref().required_worker_id.is_empty() {
+            return Err(Status::invalid_argument("required_worker_id must not be empty"));
+        }
+        self.submit_task(req).await
+    }
+
     /// Long-poll: return as soon as the task reaches a terminal state, or when
     /// `wait_secs` elapses. With `return_on_progress`, also returns when
     /// progress_version advances past `seen_progress_version` (§5.4).
@@ -599,6 +606,8 @@ impl AgentApi for AgentService {
                 arch: w.arch,
                 version: w.version,
                 last_heartbeat: w.last_hb_ms,
+                container_limits: w.stats.container_limits,
+                name: w.name,
             })
             .collect();
         let counters = self.app.store.overview_counters(3600).map_err(internal)?;

@@ -91,6 +91,7 @@ export interface Task {
   image: string;
   log_ref: string;
   worker_id: string;
+  required_worker_id?: string;
   // Display-only: the operator-given name for `worker_id`, or "" when the
   // machine has none (then the console falls back to the id).
   worker_name?: string;
@@ -152,7 +153,14 @@ export interface TaskDetail {
   base_commit: string | null;
 }
 
+export interface ContainerLimits {
+  memory_mb: number;
+  cpus: number;
+  pids_limit: number;
+}
+
 export interface WorkerStats {
+  container_limits?: ContainerLimits | null;
   cpu_load: number;
   disk_free_gb: number;
   /** Filesystem size, 0 or absent from a worker that does not report one. */

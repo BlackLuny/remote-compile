@@ -117,12 +117,14 @@ impl AgentClient {
     }
 
     pub async fn submit(&mut self, req: SubmitTaskReq) -> Result<TaskHandle> {
-        Ok(self
-            .inner
-            .submit_task(self.authed(req))
-            .await
-            .map_err(status_error)?
-            .into_inner())
+        let pinned = !req.required_worker_id.is_empty();
+        let request = self.authed(req);
+        let response = if pinned {
+            self.inner.submit_pinned_task(request).await
+        } else {
+            self.inner.submit_task(request).await
+        };
+        Ok(response.map_err(status_error)?.into_inner())
     }
 
     pub async fn get_task(&mut self, task_id: &str, wait_secs: u32) -> Result<TaskStatus> {

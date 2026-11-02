@@ -1,0 +1,2 @@
+# rc-server embeds the real console; tests also assert hashed assets exist.
+include = ["web/dist/"]

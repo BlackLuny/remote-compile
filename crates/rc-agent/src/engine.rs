@@ -184,6 +184,8 @@ pub struct CheckRequest {
     pub command: Option<String>,
     pub wait_secs: Option<u32>,
     pub no_cache: bool,
+    /// Exact worker identity, if placement must not fall back.
+    pub worker_id: Option<String>,
     /// Request-level env (denylist applied in resolve_env).
     pub env: std::collections::BTreeMap<String, String>,
     /// Disable auto-remediation for this call.
@@ -217,6 +219,9 @@ impl Engine {
     }
 
     pub async fn check(&self, req: CheckRequest) -> Result<Outcome> {
+        if req.worker_id.as_ref().is_some_and(|id| id.trim().is_empty() || id.trim() != id) {
+            return Err(anyhow!("worker_id must be a non-empty exact worker ID"));
+        }
         let root = resolve_root(&req.path)?;
         let mut client = self.client().await?;
 
@@ -389,7 +394,7 @@ impl Engine {
         let local_cache = local_cache_allowed(&egress_hosts)
             && !rc_core::artifacts::is_declared(profile_pb.artifacts.as_ref());
         let results = ResultCache::open(&self.cfg.results_path())?;
-        if !req.no_cache && local_cache {
+        if !req.no_cache && req.worker_id.is_none() && local_cache {
             if let Some((task_id, kind, cached)) =
                 results.get(&fingerprint, rc_core::TASK_CACHE_TTL_SECS)
             {
@@ -469,6 +474,7 @@ impl Engine {
             fingerprint: fingerprint.clone(),
             bundle_blob,
             no_cache: req.no_cache,
+            required_worker_id: req.worker_id.clone().unwrap_or_default(),
             // A request the control plane records and an administrator decides
             // on. The build is submitted either way: an unapproved host fails
             // the build with a network error, which is a far better answer than
@@ -2740,6 +2746,7 @@ mod tests {
             command: None,
             wait_secs: None,
             no_cache: false,
+            worker_id: None,
             env: Default::default(),
             no_remediate: false,
             baseline: "auto".into(),

@@ -129,3 +129,11 @@ export const statusTone: Record<string, "ok" | "bad" | "warn" | "info" | "muted"
   failing: "bad",
   rejected: "muted",
 };
+
+/** Limits are per container; null means an old or disconnected worker. */
+export function containerLimits(limits?: { memory_mb: number; cpus: number; pids_limit: number } | null): string {
+  if (!limits) return "未知";
+  const memory = limits.memory_mb === 0 ? "内存无限制" : limits.memory_mb % 1024 === 0 ? `${limits.memory_mb / 1024} GiB` : `${limits.memory_mb} MiB`;
+  const pids = limits.pids_limit <= 0 ? "PID 无限制" : `${limits.pids_limit} PID`;
+  return `${memory} · ${limits.cpus} CPU · ${pids}`;
+}

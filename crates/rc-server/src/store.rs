@@ -96,6 +96,7 @@ const MIGRATIONS: &[&str] = &[
     // scheduler's per-project estimate used to be the constant 20 GB wearing a
     // doc comment that claimed it came from history; this is the history.
     "ALTER TABLE tasks ADD COLUMN disk_used_gb INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE tasks ADD COLUMN required_worker_id TEXT NOT NULL DEFAULT '';",
 ];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -154,6 +155,8 @@ pub struct TaskRow {
     pub image: String,
     pub log_ref: String,
     pub worker_id: String,
+    #[serde(default)]
+    pub required_worker_id: String,
     pub attempt: i64,
     pub created_at: i64,
     pub started_at: i64,
@@ -191,6 +194,7 @@ impl TaskRow {
             image: r.get("image")?,
             log_ref: r.get("log_ref")?,
             worker_id: r.get("worker_id")?,
+            required_worker_id: r.get("required_worker_id")?,
             attempt: r.get("attempt")?,
             created_at: r.get("created_at")?,
             started_at: r.get("started_at")?,
@@ -508,11 +512,11 @@ impl Store {
             "INSERT INTO tasks (id, task_type, project_id, worktree_id, agent_session, fingerprint,
                 supersede_key, status, result_kind, command, image, log_ref, worker_id, attempt,
                 created_at, started_at, finished_at, error, superseded_by, result_json,
-                queue_ms, sync_ms, build_ms, bytes_synced, cache_hit, egress_key, scope_hash)
+                queue_ms, sync_ms, build_ms, bytes_synced, cache_hit, egress_key, scope_hash, required_worker_id)
              -- `image` is filled in by set_task_image once the task is placed;
              -- `command` must be bound here or the worker is handed an empty
              -- script and every task exits 0 having compiled nothing.
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9, '','','',0, ?10,0,0,'','','',0,0,0,?11,0,?12,?13)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'',?9, '','','',0, ?10,0,0,'','','',0,0,0,?11,0,?12,?13,?14)",
             params![
                 row.id,
                 row.task_type,
@@ -527,6 +531,7 @@ impl Store {
                 row.bytes_synced,
                 row.egress_key,
                 row.scope_hash,
+                row.required_worker_id,
             ],
         )?;
         conn.execute(
@@ -616,7 +621,7 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT * FROM tasks
-                 WHERE fingerprint = ?1 AND egress_key = ?2
+                 WHERE fingerprint = ?1 AND egress_key = ?2 AND required_worker_id = ''
                    AND status IN ('pending','syncing','queued','running','uploading')
                  ORDER BY created_at ASC LIMIT 1",
                 params![fingerprint, egress_key],
@@ -2965,6 +2970,7 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN units_seen_total;
                  ALTER TABLE tasks DROP COLUMN scope_hash;
                  ALTER TABLE tasks DROP COLUMN disk_used_gb;
+                 ALTER TABLE tasks DROP COLUMN required_worker_id;
                  ALTER TABLE workers DROP COLUMN name;
                  INSERT INTO images (id, digest) VALUES ('e1', 'd');
                  INSERT INTO tasks (id, task_type, fingerprint) VALUES ('t1', 'check', 'fp1');",
@@ -3343,7 +3349,7 @@ mod tests {
             let id = rc_core::ids::task_id();
             s.insert_task(&task(&id, "fp", "k", "s", "queued"), "{}", "{}", "")
                 .unwrap();
-            s.complete_task(&id, "done", &result, "", "").unwrap();
+            s.complete_task(&id, "done", &result, "", "", 0).unwrap();
             s.conn
                 .lock()
                 .execute(
@@ -3380,7 +3386,7 @@ mod tests {
             let result = TaskResult { kind: kind.into(), summary: id.clone(), ..Default::default() };
             s.insert_task(&task(&id, "same-fp", "k", "s", "queued"), "{}", "{}", "")
                 .unwrap();
-            s.complete_task(&id, "done", &result, "", "").unwrap();
+            s.complete_task(&id, "done", &result, "", "", 0).unwrap();
             s.conn
                 .lock()
                 .execute(

@@ -1,3 +1,4 @@
+import { containerLimits } from "../lib/format";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
@@ -195,6 +196,12 @@ export function WorkerDetail({ role }: { role: Role }) {
         <Stat label="架构" value={worker.arch || "–"} />
         <Stat label="最近心跳" value={agoSecs(worker.last_hb)} hint={`版本 ${worker.version}`} />
       </div>
+
+      <Card title="单个构建容器限制">
+        <p className="text-[12px] text-[var(--color-ink-dim)]">
+          {containerLimits(live?.stats.container_limits)}（每个并发构建各自适用）
+        </p>
+      </Card>
 
       <Card title="资源曲线（本会话采样）">
         {history.length < 2 ? (
