@@ -306,6 +306,7 @@ fn worker_json(w: crate::workers::WorkerConn) -> serde_json::Value {
             // 0 means the worker does not report a size; the console says
             // "unknown" rather than drawing a 0% bar.
             "disk_total_gb": w.stats.disk_total_gb,
+            "container_limits": w.stats.container_limits,
             "running_tasks": w.stats.running_tasks,
             "cached_worktrees": w.stats.cached_worktrees,
             "cached_projects": w.stats.cached_projects,

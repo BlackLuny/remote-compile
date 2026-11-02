@@ -66,6 +66,7 @@ export function TaskDetail({ role }: { role: Role }) {
             label="Worker"
             value={<WorkerRef id={task.worker_id} name={task.worker_name} showId />}
           />
+          {task.required_worker_id && <Field label="指定 Worker" value={task.required_worker_id} mono />}
           <Field label="尝试次数" value={String(task.attempt)} />
           <Field label="Project" value={task.project_id} mono />
           <Field label="Worktree" value={task.worktree_id} mono />

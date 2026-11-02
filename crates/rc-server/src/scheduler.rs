@@ -34,6 +34,7 @@ pub struct Candidate {
 /// What a task needs.
 #[derive(Debug, Clone, Default)]
 pub struct Demand {
+    pub required_worker_id: String,
     pub worktree_id: String,
     pub project_id: String,
     pub image: String,
@@ -61,6 +62,7 @@ pub struct Scored {
 /// because "task stuck in queue" with no explanation is the worst outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reject {
+    RequiredWorkerMismatch,
     NotOnline,
     ArchMismatch,
     NoFreeSlot,
@@ -74,6 +76,9 @@ pub enum Reject {
 }
 
 pub fn evaluate(c: &Candidate, d: &Demand, p: &Policy) -> Result<f64, Reject> {
+    if !d.required_worker_id.is_empty() && c.worker_id != d.required_worker_id {
+        return Err(Reject::RequiredWorkerMismatch);
+    }
     if c.status != "online" {
         return Err(Reject::NotOnline);
     }
@@ -253,6 +258,7 @@ mod tests {
 
     fn demand() -> Demand {
         Demand {
+            required_worker_id: String::new(),
             worktree_id: "w1".into(),
             project_id: "p1".into(),
             image: "img@sha256:a".into(),
@@ -262,6 +268,26 @@ mod tests {
             required_capabilities: vec![],
             require_local_image: false,
         }
+    }
+
+    #[test]
+    fn required_worker_is_a_hard_constraint_and_still_obeys_safety_gates() {
+        let policy = Policy::default();
+        let mut selected = worker("selected");
+        let other = worker("other");
+        let mut d = demand();
+        d.required_worker_id = "selected".into();
+        assert_eq!(pick(&[other.clone(), selected.clone()], &d, &policy).unwrap().worker_id, "selected");
+        assert_eq!(evaluate(&other, &d, &policy), Err(Reject::RequiredWorkerMismatch));
+        selected.free_slots = 0;
+        assert!(pick(&[other.clone(), selected.clone()], &d, &policy).is_none());
+        selected.free_slots = 1;
+        selected.status = "draining".into();
+        assert!(pick(&[other.clone(), selected.clone()], &d, &policy).is_none());
+        selected.status = "online".into();
+        selected.disk_free_gb = 0;
+        assert!(pick(&[other], &d, &policy).is_none());
+        assert_eq!(evaluate(&selected, &d, &policy), Err(Reject::InsufficientDisk));
     }
 
     #[test]

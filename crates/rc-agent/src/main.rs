@@ -53,6 +53,9 @@ enum Command {
         wait_secs: Option<u32>,
         #[arg(long)]
         no_cache: bool,
+        /// Execute only on this enrolled worker ID (bypasses result caches).
+        #[arg(long)]
+        worker_id: Option<String>,
         /// Override the default command (same as MCP `command`).
         #[arg(long)]
         command: Option<String>,
@@ -127,6 +130,7 @@ fn main() -> Result<()> {
             task,
             wait_secs,
             no_cache,
+            worker_id,
             command,
             artifacts,
             out,
@@ -141,6 +145,7 @@ fn main() -> Result<()> {
                 command,
                 wait_secs,
                 no_cache,
+                worker_id,
                 env: Default::default(),
                 no_remediate: false,
                 baseline: "auto".into(),

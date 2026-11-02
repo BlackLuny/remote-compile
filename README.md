@@ -165,14 +165,29 @@ rc-server --data-dir ./rc-data approve-image <env_id>
 
 | tool | what it is for |
 |---|---|
-| `check(path, task?, command?, wait_secs?, no_cache?)` | the main one — verdict plus structured diagnostics |
+| `check(path, task?, command?, wait_secs?, no_cache?, worker_id?)` | the main one — verdict plus structured diagnostics |
 | `get_result(task_id, wait_secs?)` | poll an async task; costs almost nothing |
 | `get_log(task_id, offset?, limit?, grep?, tail?)` | paged full log — paging is mandatory |
 | `get_build_profile(path)` | what the fleet already knows about building this project |
 | `list_envs(query?, arch?, target?)` | find an existing environment before building one |
 | `prepare_env(dockerfile\|image, reason?)` | request an environment; always async |
 | `get_env_status(env_id)` | build progress and health |
-| `list_workers()` | resource-pool overview, for diagnosing a stuck queue |
+| `list_workers()` | online workers, per-container memory/CPU/PID limits and resource-pool overview |
+
+To run on one particular enrolled machine, first use `list_workers()` to find
+its exact ID, then pass `worker_id` to the MCP `check` tool, or use:
+
+```bash
+rc-agent check /path/to/repo --worker-id worker-… --command 'cargo check -p my-package'
+```
+
+The worker is a hard requirement: offline, busy, draining or incompatible workers
+leave the task queued, and retries never move it elsewhere. Pinned checks bypass
+result caches and in-flight deduplication so the requested machine really runs
+the command. The usual disk, architecture, capability and image gates still
+apply. New agents refuse pinned submissions to older servers rather than
+silently ignoring the requirement. Container memory is reported in MiB and
+applies to each concurrent build, not to the entire worker.
 
 `check` returns one of five result kinds, because the agent's next move differs
 completely between them (§3.5):
