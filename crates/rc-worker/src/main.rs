@@ -22,8 +22,19 @@ use runner::{GcPolicy, Runner};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
+
+/// How long the TCP/TLS half of opening a session may take. Slightly above the
+/// transport's own connect timeout so this is the outer bound, not a duplicate.
+const SESSION_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the control plane may take to accept the channel after the
+/// transport is up.
+const SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Startup container cleanup; generous, because a busy daemon is slow but a
+/// wedged one is silent forever.
+const RECONCILE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Parser)]
 #[command(name = "rc-worker", version, about = "remote-compile build worker")]
@@ -156,11 +167,16 @@ async fn run(data_dir: PathBuf, offline: bool) -> Result<()> {
     let runner = Arc::new(Runner::new(cfg.clone(), sandbox.clone(), proxy_url)?);
 
     // Crash recovery (§8.1): anything of ours still running belongs to a task
-    // that no longer exists.
-    match sandbox.reconcile(&[]).await {
-        Ok(n) if n > 0 => tracing::info!(removed = n, "cleaned up containers from a previous run"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "reconcile failed"),
+    // that no longer exists. Bounded, because a wedged docker daemon must not
+    // keep the worker from ever opening its session.
+    match tokio::time::timeout(RECONCILE_TIMEOUT, sandbox.reconcile(&[])).await {
+        Ok(Ok(n)) if n > 0 => tracing::info!(removed = n, "cleaned up containers from a previous run"),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "reconcile failed"),
+        Err(_) => tracing::warn!(
+            after = ?RECONCILE_TIMEOUT,
+            "reconcile timed out; starting the session anyway"
+        ),
     }
 
     let mut backoff = std::time::Duration::from_secs(1);
@@ -233,9 +249,35 @@ async fn start_proxy(
 
 /// One connection to the control plane, from opening the channel to losing it.
 async fn session(cfg: &WorkerConfig, runner: Arc<Runner>) -> Result<()> {
-    let mut client = ServerClient::connect(&cfg.server, &cfg.worker_id, &cfg.worker_token).await?;
+    // Opening a session is the one place this process can wait on somebody
+    // else with no clock running. The transport bounds the TCP/TLS half
+    // (`rc_core::transport`), but `open_channel` is a request like any other:
+    // a control plane that accepts the connection and then never answers leaves
+    // the worker waiting forever, with systemd perfectly happy (§8.1). Both
+    // halves get a deadline so the retry loop in `run` always regains control,
+    // and a stall shows up in the log instead of as a silent offline worker.
+    let mut client = match tokio::time::timeout(
+        SESSION_CONNECT_TIMEOUT,
+        ServerClient::connect(&cfg.server, &cfg.worker_id, &cfg.worker_token),
+    )
+    .await
+    {
+        Ok(client) => client?,
+        Err(_) => anyhow::bail!(
+            "timed out connecting to the control plane at {} after {:?}",
+            cfg.server,
+            SESSION_CONNECT_TIMEOUT
+        ),
+    };
     let (events_tx, events_rx) = mpsc::channel::<pb::WorkerEvent>(256);
-    let mut commands = client.open_channel(events_rx).await?;
+    let mut commands = match tokio::time::timeout(SESSION_OPEN_TIMEOUT, client.open_channel(events_rx)).await {
+        Ok(commands) => commands?,
+        Err(_) => anyhow::bail!(
+            "control plane at {} did not accept the worker channel within {:?}",
+            cfg.server,
+            SESSION_OPEN_TIMEOUT
+        ),
+    };
     tracing::info!(server = %cfg.server, "channel open");
 
     // task_id -> worktree_id for every assignment accepted on this session.
