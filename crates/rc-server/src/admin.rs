@@ -409,6 +409,13 @@ async fn list_workers(_u: User, State(app): State<Arc<App>>) -> ApiResult<Json<s
                 base["status"] = l["status"].clone();
                 base["stats"] = l["stats"].clone();
                 base["free_slots"] = l["free_slots"].clone();
+                // `version` and `arch` are enrollment facts, so a worker
+                // upgraded in place keeps reporting whatever it first arrived
+                // with — which is how a fleet-wide upgrade used to look like
+                // nothing happened (§8.1). The handshake knows the truth; use
+                // it whenever the worker is connected.
+                base["version"] = l["version"].clone();
+                base["arch"] = l["arch"].clone();
             }
             base
         })
