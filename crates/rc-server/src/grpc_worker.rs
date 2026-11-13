@@ -191,6 +191,7 @@ impl WorkerApi for WorkerService {
             // would sit in `running` forever.
             tracing::info!(worker = %id, "worker channel closed");
             app.workers.disconnect(&id);
+            app.fail_inflight_cleanup(&id, "worker disconnected during cleanup");
             app.store.touch_worker(&id, "offline").ok();
             app.reclaim_worker_tasks(&id).ok();
             app.events.publish(Event::WorkerUpdated {

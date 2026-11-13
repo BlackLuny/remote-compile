@@ -26,6 +26,7 @@ use tokio_stream::StreamExt;
 
 // ------------------------------- errors -------------------------------
 
+#[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
 impl ApiError {
@@ -121,7 +122,14 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/workers/{id}/drain", post(drain_worker))
         .route("/api/workers/{id}/resume", post(resume_worker))
         .route("/api/workers/{id}/rename", post(rename_worker))
-        .route("/api/workers/{id}/cleanup", post(cleanup_worker))
+        .route(
+            "/api/workers/{id}/cleanup",
+            get(cleanup_worker_status).post(cleanup_worker),
+        )
+        .route(
+            "/api/workers/{id}/cleanup/{request_id}",
+            get(get_cleanup_worker_job),
+        )
         .route("/api/enrollment-tokens", get(list_enrollment).post(create_enrollment))
         .route("/api/agent-tokens", get(list_agent_tokens).post(create_agent_token))
         .route("/api/agent-tokens/{hash}", delete(delete_agent_token))
@@ -528,27 +536,60 @@ fn default_cleanup_idle_days() -> i64 {
 /// How long the control plane waits for a worker to finish reclaiming volumes.
 const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Manual disk reclaim on one worker. Temporarily drains it so new work cannot
-/// race the delete, leaves in-flight tasks alone, and restores the prior status
-/// when the worker was online before the call.
+/// Ensures the per-worker cleanup lock and draining pin are always released if
+/// the request or background watcher is cancelled or dropped before finishing.
+struct CleanupGuard {
+    app: Arc<App>,
+    worker_id: String,
+    request_id: String,
+    prior_status: String,
+    prior_was_draining: bool,
+    armed: bool,
+}
+
+impl CleanupGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.app.finish_cleanup_failed(
+            &self.worker_id,
+            &self.request_id,
+            "cleanup aborted before completion",
+        );
+        restore_worker_status(
+            &self.app,
+            &self.worker_id,
+            &self.prior_status,
+            self.prior_was_draining,
+        );
+    }
+}
+
+/// Start manual disk reclaim on one worker asynchronously. Temporarily drains
+/// it so new work cannot race the delete, leaves in-flight tasks alone, and
+/// returns the job handle immediately so callers can poll for completion without
+/// holding a 300s HTTP connection open.
 async fn cleanup_worker(
     AdminUser(u): AdminUser,
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     Json(body): Json<CleanupReq>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     if !body.all_unused && body.idle_days < 0 {
         return Err(ApiError::bad("idle_days must be >= 0"));
     }
     if !app.workers.is_connected(&id) {
         return Err(ApiError::bad(format!("worker {id} is not connected")));
     }
-    if !app.try_begin_cleanup(&id) {
-        return Err(ApiError::bad(format!(
-            "worker {id} already has a cleanup in progress"
-        )));
-    }
 
+    let idle_days = body.idle_days.max(0);
     let prior_status = app
         .workers
         .get(&id)
@@ -562,23 +603,34 @@ async fn cleanup_worker(
         .unwrap_or_else(|| "online".into());
     let prior_was_draining = prior_status == "draining";
     let request_id = ids::random_token();
+
+    let Some(rx) = app.try_begin_cleanup(&id, &request_id, body.all_unused, idle_days) else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("worker {id} already has a cleanup in progress"),
+        ));
+    };
+
+    let mut guard = CleanupGuard {
+        app: app.clone(),
+        worker_id: id.clone(),
+        request_id: request_id.clone(),
+        prior_status: prior_status.clone(),
+        prior_was_draining,
+        armed: true,
+    };
+
     let order = pb::CleanupOrder {
         request_id: request_id.clone(),
         all_unused: body.all_unused,
-        idle_days: body.idle_days.max(0),
+        idle_days,
     };
 
     // Keep the scheduler off this machine for the duration of the pass.
     // admin_drain pin blocks "online" heartbeats until we clear it.
     app.workers.set_status(&id, "draining");
-    app.store
-        .set_worker_status(&id, "draining")
-        .map_err(|e| {
-            app.end_cleanup(&id);
-            ApiError::from(e)
-        })?;
+    app.store.set_worker_status(&id, "draining")?;
 
-    let rx = app.register_cleanup_wait(&request_id);
     let sent = app
         .workers
         .send(
@@ -589,73 +641,104 @@ async fn cleanup_worker(
         )
         .await;
     if !sent {
-        app.cancel_cleanup_wait(&request_id);
-        app.end_cleanup(&id);
+        app.finish_cleanup_failed(&id, &request_id, "worker is not connected");
         restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+        guard.disarm();
         return Err(ApiError::bad(format!("worker {id} is not connected")));
     }
 
-    let done = match tokio::time::timeout(CLEANUP_TIMEOUT, rx).await {
-        Ok(Ok(done)) => done,
-        Ok(Err(_)) => {
-            app.cancel_cleanup_wait(&request_id);
-            app.end_cleanup(&id);
-            restore_worker_status(&app, &id, &prior_status, prior_was_draining);
-            return Err(ApiError(
-                StatusCode::GATEWAY_TIMEOUT,
-                "cleanup waiter dropped (worker disconnected?)".into(),
-            ));
+    let initial = app.get_cleanup_job(&id, &request_id);
+    let actor = u.username;
+    let all_unused = body.all_unused;
+
+    tokio::spawn(async move {
+        let mut guard = guard;
+        match tokio::time::timeout(CLEANUP_TIMEOUT, rx).await {
+            Ok(Ok(done)) => {
+                app.finish_cleanup_with_done(&id, &done);
+                restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+                app.store
+                    .audit(
+                        &actor,
+                        "cleanup_worker",
+                        &id,
+                        &format!(
+                            "all_unused={} idle_days={} reclaimed={} ok={}",
+                            all_unused, idle_days, done.reclaimed, done.ok
+                        ),
+                    )
+                    .ok();
+                guard.disarm();
+            }
+            Ok(Err(_)) => {
+                app.finish_cleanup_failed(
+                    &id,
+                    &request_id,
+                    "cleanup waiter dropped (worker disconnected?)",
+                );
+                restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+                app.store
+                    .audit(
+                        &actor,
+                        "cleanup_worker",
+                        &id,
+                        &format!(
+                            "all_unused={} idle_days={} reclaimed=0 ok=false (disconnected)",
+                            all_unused, idle_days
+                        ),
+                    )
+                    .ok();
+                guard.disarm();
+            }
+            Err(_) => {
+                app.finish_cleanup_failed(&id, &request_id, "cleanup timed out after 300s");
+                // Leave admin_drain pinned only if the machine was already drained;
+                // otherwise free the pin so a late heartbeat can report online once
+                // the worker finishes and clears its local flag.
+                restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+                app.store
+                    .audit(
+                        &actor,
+                        "cleanup_worker",
+                        &id,
+                        &format!(
+                            "all_unused={} idle_days={} reclaimed=0 ok=false (timeout)",
+                            all_unused, idle_days
+                        ),
+                    )
+                    .ok();
+                guard.disarm();
+            }
         }
-        Err(_) => {
-            app.cancel_cleanup_wait(&request_id);
-            app.end_cleanup(&id);
-            // Leave admin_drain pinned only if the machine was already drained;
-            // otherwise free the pin so a late heartbeat can report online once
-            // the worker finishes and clears its local flag.
-            restore_worker_status(&app, &id, &prior_status, prior_was_draining);
-            return Err(ApiError(
-                StatusCode::GATEWAY_TIMEOUT,
-                "cleanup timed out after 300s".into(),
-            ));
-        }
-    };
+    });
 
-    app.end_cleanup(&id);
-    restore_worker_status(&app, &id, &prior_status, prior_was_draining);
+    Ok((StatusCode::ACCEPTED, Json(json!(initial))))
+}
 
-    app.store
-        .audit(
-            &u.username,
-            "cleanup_worker",
-            &id,
-            &format!(
-                "all_unused={} idle_days={} reclaimed={} ok={}",
-                body.all_unused, body.idle_days, done.reclaimed, done.ok
-            ),
-        )
-        .ok();
+async fn cleanup_worker_status(
+    _u: User,
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (active, latest) = app.worker_cleanup_summary(&id);
+    Ok(Json(json!({ "active": active, "latest": latest })))
+}
 
-    if !done.ok {
-        return Err(ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            done.message,
-        ));
-    }
-
-    Ok(Json(json!({
-        "ok": true,
-        "request_id": done.request_id,
-        "reclaimed": done.reclaimed,
-        "skipped_active": done.skipped_active,
-        "skipped_fresh": done.skipped_fresh,
-        "disk_free_gb_before": done.disk_free_gb_before,
-        "disk_free_gb_after": done.disk_free_gb_after,
-        "reclaimed_worktrees": done.reclaimed_worktrees,
-        "message": done.message,
-    })))
+async fn get_cleanup_worker_job(
+    _u: User,
+    State(app): State<Arc<App>>,
+    Path((id, request_id)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let job = app
+        .get_cleanup_job(&id, &request_id)
+        .ok_or_else(|| ApiError::not_found("unknown cleanup job"))?;
+    Ok(Json(json!(job)))
 }
 
 fn restore_worker_status(app: &App, id: &str, status: &str, keep_admin_drain: bool) {
+    if !app.workers.is_connected(id) {
+        return;
+    }
     if keep_admin_drain || status == "draining" {
         app.workers.set_status(id, "draining");
         let _ = app.store.set_worker_status(id, "draining");
@@ -1410,5 +1493,170 @@ mod tests {
         let task =
             TaskRow { id: "t2".into(), worker_id: "gone".into(), ..Default::default() };
         assert_eq!(task_json(&task, &names)["worker_name"], "");
+    }
+
+    fn test_app_with_worker(
+        worker_id: &str,
+    ) -> (
+        Arc<App>,
+        tokio::sync::mpsc::Receiver<Result<pb::ServerCmd, tonic::Status>>,
+    ) {
+        let dir = std::env::temp_dir().join(format!("rc-admin-{}", ulid::Ulid::generate()));
+        let app = App::new(crate::config::Config {
+            data_dir: dir,
+            http_addr: "127.0.0.1:0".into(),
+            grpc_addr: "127.0.0.1:0".into(),
+            allow_anonymous_agents: true,
+            session_ttl_secs: 3600,
+        })
+        .unwrap();
+        app.store
+            .upsert_worker(
+                &crate::store::WorkerRow {
+                    id: worker_id.into(),
+                    arch: "x86_64".into(),
+                    status: "online".into(),
+                    version: "0.1.4".into(),
+                    max_parallel: 4,
+                    ..Default::default()
+                },
+                "tokhash",
+            )
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        app.workers.connect(worker_id, "x86_64", "0.1.4", 4, tx);
+        (app, rx)
+    }
+
+    fn admin_user() -> AdminUser {
+        AdminUser(User {
+            username: "admin".into(),
+            role: Role::Admin,
+        })
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_runs_async_and_releases_lock_on_done() {
+        let (app, mut rx) = test_app_with_worker("w1");
+
+        let (status, Json(started)) = cleanup_worker(
+            admin_user(),
+            State(app.clone()),
+            Path("w1".into()),
+            Json(CleanupReq {
+                all_unused: false,
+                idle_days: 7,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(started["status"], "running");
+        let req_id = started["request_id"].as_str().unwrap().to_string();
+
+        assert_eq!(app.workers.get("w1").unwrap().status, "draining");
+
+        // Second concurrent trigger must be rejected with 409 CONFLICT.
+        let err = cleanup_worker(
+            admin_user(),
+            State(app.clone()),
+            Path("w1".into()),
+            Json(CleanupReq {
+                all_unused: false,
+                idle_days: 7,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        // Worker receives CleanupOrder and replies with CleanupDone.
+        let cmd = rx.recv().await.unwrap().unwrap();
+        let Some(pb::server_cmd::Body::Cleanup(order)) = cmd.body else {
+            panic!("expected CleanupOrder");
+        };
+        assert_eq!(order.request_id, req_id);
+
+        app.complete_cleanup(pb::CleanupDone {
+            request_id: req_id.clone(),
+            ok: true,
+            message: "reclaimed 2".into(),
+            reclaimed: 2,
+            skipped_active: 0,
+            skipped_fresh: 1,
+            disk_free_gb_before: 10,
+            disk_free_gb_after: 20,
+            reclaimed_worktrees: vec!["wt1".into(), "wt2".into()],
+        });
+
+        // Background watcher settles quickly.
+        let mut settled = None;
+        for _ in 0..50 {
+            let job = app.get_cleanup_job("w1", &req_id).unwrap();
+            if job.status != "running" {
+                settled = Some(job);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let job = settled.expect("cleanup job did not settle");
+        assert_eq!(job.status, "done");
+        assert!(job.ok);
+        assert_eq!(job.reclaimed, 2);
+        assert_eq!(app.workers.get("w1").unwrap().status, "online");
+        assert!(!app.workers.get("w1").unwrap().admin_drain);
+        assert!(app.worker_cleanup_summary("w1").0.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_guard_drop_releases_lock_and_restores_status() {
+        let (app, _rx) = test_app_with_worker("w1");
+        let _rx_wait = app.try_begin_cleanup("w1", "req-drop", false, 7).unwrap();
+        app.workers.set_status("w1", "draining");
+
+        {
+            let _guard = CleanupGuard {
+                app: app.clone(),
+                worker_id: "w1".into(),
+                request_id: "req-drop".into(),
+                prior_status: "online".into(),
+                prior_was_draining: false,
+                armed: true,
+            };
+        }
+
+        let job = app.get_cleanup_job("w1", "req-drop").unwrap();
+        assert_eq!(job.status, "failed");
+        assert!(app.worker_cleanup_summary("w1").0.is_none());
+        assert_eq!(app.workers.get("w1").unwrap().status, "online");
+        assert!(!app.workers.get("w1").unwrap().admin_drain);
+    }
+
+    #[tokio::test]
+    async fn cleanup_releases_lock_immediately_on_worker_disconnect() {
+        let (app, mut rx) = test_app_with_worker("w1");
+
+        let (_status, Json(started)) = cleanup_worker(
+            admin_user(),
+            State(app.clone()),
+            Path("w1".into()),
+            Json(CleanupReq {
+                all_unused: true,
+                idle_days: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let req_id = started["request_id"].as_str().unwrap().to_string();
+        let _ = rx.recv().await;
+
+        app.workers.disconnect("w1");
+        app.fail_inflight_cleanup("w1", "worker disconnected during cleanup");
+
+        let job = app.get_cleanup_job("w1", &req_id).unwrap();
+        assert_eq!(job.status, "failed");
+        assert!(!job.ok);
+        assert!(app.worker_cleanup_summary("w1").0.is_none());
     }
 }

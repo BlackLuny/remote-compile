@@ -14,7 +14,8 @@ use rc_core::cas::FsCas;
 use rc_core::model::{ResultKind, TaskState, TaskType};
 use rc_core::pb;
 use rc_core::{ids, manifest, now_ms};
-use std::collections::{HashMap, HashSet};
+use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Notify};
 
@@ -58,11 +59,77 @@ pub struct App {
     /// Terminal extras (delta + history_ref) memoized per (task_id, baseline)
     /// so repeated get_task does not recompute (R10').
     pub terminal_cache: Mutex<HashMap<String, TerminalExtras>>,
-    /// Pending admin cleanup RPCs waiting on a worker `CleanupDone` event.
-    /// Keyed by request_id (unique per call).
-    pending_cleanups: Mutex<HashMap<String, oneshot::Sender<pb::CleanupDone>>>,
-    /// Workers currently running an admin cleanup (one at a time per id).
-    cleanup_inflight: Mutex<HashSet<String>>,
+    /// Admin disk cleanup coordination and recent job results.
+    cleanups: Mutex<CleanupRegistry>,
+}
+
+/// Lifecycle state of an admin-triggered worker disk cleanup.
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupJob {
+    pub request_id: String,
+    pub worker_id: String,
+    /// `"running"` | `"done"` | `"failed"`.
+    pub status: String,
+    pub ok: bool,
+    pub all_unused: bool,
+    pub idle_days: i64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub reclaimed: u64,
+    pub skipped_active: u64,
+    pub skipped_fresh: u64,
+    pub disk_free_gb_before: u64,
+    pub disk_free_gb_after: u64,
+    pub reclaimed_worktrees: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Default)]
+struct CleanupRegistry {
+    /// Active cleanup `request_id` per `worker_id` (at most one per worker).
+    inflight: HashMap<String, String>,
+    /// Oneshot waiters keyed by `request_id`.
+    waiters: HashMap<String, oneshot::Sender<pb::CleanupDone>>,
+    /// Running and recently completed cleanup jobs keyed by `request_id`.
+    jobs: HashMap<String, CleanupJob>,
+    /// Latest `request_id` per `worker_id` (running or most recent).
+    latest_by_worker: HashMap<String, String>,
+}
+
+const MAX_RETAINED_CLEANUP_JOBS: usize = 128;
+
+fn apply_cleanup_done(job: &mut CleanupJob, done: &pb::CleanupDone) {
+    job.status = if done.ok { "done" } else { "failed" }.into();
+    job.ok = done.ok;
+    job.finished_at = Some(now_ms());
+    job.reclaimed = done.reclaimed;
+    job.skipped_active = done.skipped_active;
+    job.skipped_fresh = done.skipped_fresh;
+    job.disk_free_gb_before = done.disk_free_gb_before;
+    job.disk_free_gb_after = done.disk_free_gb_after;
+    job.reclaimed_worktrees = done.reclaimed_worktrees.clone();
+    job.message = done.message.clone();
+}
+
+fn prune_cleanup_jobs(reg: &mut CleanupRegistry) {
+    if reg.jobs.len() <= MAX_RETAINED_CLEANUP_JOBS {
+        return;
+    }
+    let mut evictable: Vec<(i64, String)> = reg
+        .jobs
+        .iter()
+        .filter(|(id, job)| {
+            job.status != "running"
+                && !reg.inflight.values().any(|active| active == *id)
+                && !reg.latest_by_worker.values().any(|latest| latest == *id)
+        })
+        .map(|(id, job)| (job.started_at, id.clone()))
+        .collect();
+    evictable.sort_by_key(|(ts, _)| *ts);
+    let excess = reg.jobs.len().saturating_sub(MAX_RETAINED_CLEANUP_JOBS);
+    for (_, id) in evictable.into_iter().take(excess) {
+        reg.jobs.remove(&id);
+    }
 }
 
 /// Latest unit progress for a running task (mechanism five).
@@ -171,43 +238,148 @@ impl App {
             building: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
             terminal_cache: Mutex::new(HashMap::new()),
-            pending_cleanups: Mutex::new(HashMap::new()),
-            cleanup_inflight: Mutex::new(HashSet::new()),
+            cleanups: Mutex::new(CleanupRegistry::default()),
         }))
     }
 
-    /// Try to claim exclusive cleanup for `worker_id`. Returns false if one is
+    /// Try to claim exclusive cleanup for `worker_id`. Returns `None` if one is
     /// already running (admins must not stack reclaim passes).
-    pub fn try_begin_cleanup(&self, worker_id: &str) -> bool {
-        self.cleanup_inflight.lock().insert(worker_id.to_string())
-    }
-
-    pub fn end_cleanup(&self, worker_id: &str) {
-        self.cleanup_inflight.lock().remove(worker_id);
-    }
-
-    /// Register a waiter for a worker cleanup reply. Returns the receiver side.
-    pub fn register_cleanup_wait(
+    pub fn try_begin_cleanup(
         &self,
+        worker_id: &str,
         request_id: &str,
-    ) -> oneshot::Receiver<pb::CleanupDone> {
+        all_unused: bool,
+        idle_days: i64,
+    ) -> Option<oneshot::Receiver<pb::CleanupDone>> {
+        let mut reg = self.cleanups.lock();
+        if reg.inflight.contains_key(worker_id) {
+            return None;
+        }
         let (tx, rx) = oneshot::channel();
-        self.pending_cleanups
-            .lock()
-            .insert(request_id.to_string(), tx);
-        rx
+        reg.inflight
+            .insert(worker_id.to_string(), request_id.to_string());
+        reg.latest_by_worker
+            .insert(worker_id.to_string(), request_id.to_string());
+        reg.waiters.insert(request_id.to_string(), tx);
+        reg.jobs.insert(
+            request_id.to_string(),
+            CleanupJob {
+                request_id: request_id.to_string(),
+                worker_id: worker_id.to_string(),
+                status: "running".into(),
+                ok: false,
+                all_unused,
+                idle_days,
+                started_at: now_ms(),
+                finished_at: None,
+                reclaimed: 0,
+                skipped_active: 0,
+                skipped_fresh: 0,
+                disk_free_gb_before: 0,
+                disk_free_gb_after: 0,
+                reclaimed_worktrees: Vec::new(),
+                message: String::new(),
+            },
+        );
+        prune_cleanup_jobs(&mut reg);
+        Some(rx)
     }
 
-    /// Complete a cleanup wait if one is still registered for this request.
+    /// Complete a cleanup wait if one is still registered for this request,
+    /// and defensively ensure any matching inflight lock is released.
     pub fn complete_cleanup(&self, done: pb::CleanupDone) {
-        if let Some(tx) = self.pending_cleanups.lock().remove(&done.request_id) {
+        let mut reg = self.cleanups.lock();
+        if let Some(tx) = reg.waiters.remove(&done.request_id) {
             let _ = tx.send(done);
+            return;
+        }
+        if let Some(job) = reg.jobs.get_mut(&done.request_id) {
+            let worker_id = job.worker_id.clone();
+            apply_cleanup_done(job, &done);
+            if reg.inflight.get(&worker_id).map(|r| r == &done.request_id).unwrap_or(false) {
+                reg.inflight.remove(&worker_id);
+            }
         }
     }
 
-    /// Drop a waiter without delivering (timeout / send failure).
-    pub fn cancel_cleanup_wait(&self, request_id: &str) {
-        self.pending_cleanups.lock().remove(request_id);
+    /// Mark an active cleanup finished from a worker `CleanupDone` reply and
+    /// release the per-worker lock.
+    pub fn finish_cleanup_with_done(&self, worker_id: &str, done: &pb::CleanupDone) {
+        let mut reg = self.cleanups.lock();
+        reg.waiters.remove(&done.request_id);
+        if reg
+            .inflight
+            .get(worker_id)
+            .map(|r| r == &done.request_id)
+            .unwrap_or(false)
+        {
+            reg.inflight.remove(worker_id);
+        }
+        if let Some(job) = reg.jobs.get_mut(&done.request_id) {
+            apply_cleanup_done(job, done);
+        }
+    }
+
+    /// Mark an active cleanup failed and release the per-worker lock.
+    pub fn finish_cleanup_failed(&self, worker_id: &str, request_id: &str, message: &str) {
+        let mut reg = self.cleanups.lock();
+        reg.waiters.remove(request_id);
+        if reg
+            .inflight
+            .get(worker_id)
+            .map(|r| r == request_id)
+            .unwrap_or(false)
+        {
+            reg.inflight.remove(worker_id);
+        }
+        if let Some(job) = reg.jobs.get_mut(request_id) {
+            if job.status == "running" {
+                job.status = "failed".into();
+                job.ok = false;
+                job.finished_at = Some(now_ms());
+                job.message = message.to_string();
+            }
+        }
+    }
+
+    /// Abort any inflight cleanup for `worker_id` (e.g. worker channel closed).
+    pub fn fail_inflight_cleanup(&self, worker_id: &str, reason: &str) {
+        let mut reg = self.cleanups.lock();
+        let Some(request_id) = reg.inflight.remove(worker_id) else {
+            return;
+        };
+        reg.waiters.remove(&request_id);
+        if let Some(job) = reg.jobs.get_mut(&request_id) {
+            if job.status == "running" {
+                job.status = "failed".into();
+                job.ok = false;
+                job.finished_at = Some(now_ms());
+                job.message = reason.to_string();
+            }
+        }
+    }
+
+    pub fn get_cleanup_job(&self, worker_id: &str, request_id: &str) -> Option<CleanupJob> {
+        let reg = self.cleanups.lock();
+        reg.jobs
+            .get(request_id)
+            .filter(|j| j.worker_id == worker_id)
+            .cloned()
+    }
+
+    pub fn worker_cleanup_summary(&self, worker_id: &str) -> (Option<CleanupJob>, Option<CleanupJob>) {
+        let reg = self.cleanups.lock();
+        let active = reg
+            .inflight
+            .get(worker_id)
+            .and_then(|id| reg.jobs.get(id))
+            .cloned();
+        let latest = reg
+            .latest_by_worker
+            .get(worker_id)
+            .and_then(|id| reg.jobs.get(id))
+            .cloned();
+        (active, latest)
     }
 
     /// Update in-memory progress from a worker event. Does not touch task_events.
