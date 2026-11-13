@@ -7,6 +7,7 @@
 use parking_lot::Mutex;
 use rc_core::pb::{ServerCmd, WorkerStats};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -37,6 +38,9 @@ pub struct WorkerConn {
     /// to `online`. Used by drain and disk cleanup so a 2s heartbeat lag does
     /// not reopen the scheduler.
     pub admin_drain: bool,
+    /// Monotonic connection generation assigned on `connect()`, used so stale
+    /// disconnect/cleanup handlers cannot mutate a newer connection.
+    pub conn_gen: u64,
 }
 
 impl WorkerConn {
@@ -51,6 +55,7 @@ impl WorkerConn {
 #[derive(Clone, Default)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<HashMap<String, WorkerConn>>>,
+    next_gen: Arc<AtomicU64>,
 }
 
 impl WorkerRegistry {
@@ -65,8 +70,9 @@ impl WorkerRegistry {
         version: &str,
         max_parallel: u32,
         tx: CmdSender,
-    ) {
+    ) -> u64 {
         let now = rc_core::now_ms();
+        let conn_gen = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
         let mut g = self.inner.lock();
         g.insert(
             id.to_string(),
@@ -86,8 +92,10 @@ impl WorkerRegistry {
                 tx,
                 assigned: HashSet::new(),
                 admin_drain: false,
+                conn_gen,
             },
         );
+        conn_gen
     }
 
     pub fn disconnect(&self, id: &str) -> Vec<String> {
@@ -95,6 +103,21 @@ impl WorkerRegistry {
         g.remove(id)
             .map(|w| w.assigned.into_iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Disconnect `id` only if it is still on `expected_gen`. Returns `None` if
+    /// a newer connection already replaced it.
+    pub fn disconnect_if_gen(&self, id: &str, expected_gen: u64) -> Option<Vec<String>> {
+        let mut g = self.inner.lock();
+        if g.get(id).map(|w| w.conn_gen == expected_gen).unwrap_or(false) {
+            Some(
+                g.remove(id)
+                    .map(|w| w.assigned.into_iter().collect())
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        }
     }
 
     pub fn heartbeat(
@@ -175,6 +198,25 @@ impl WorkerRegistry {
         }
     }
 
+    /// Update status only if `id` is still connected on `expected_gen`.
+    pub fn set_status_if_gen(&self, id: &str, expected_gen: u64, status: &str) -> bool {
+        let mut g = self.inner.lock();
+        let Some(w) = g.get_mut(id) else {
+            return false;
+        };
+        if w.conn_gen != expected_gen {
+            return false;
+        }
+        w.status = status.to_string();
+        if status == "online" {
+            w.admin_drain = false;
+        }
+        if status == "draining" {
+            w.admin_drain = true;
+        }
+        true
+    }
+
     pub fn online_count(&self) -> usize {
         self.inner.lock().values().filter(|w| w.status == "online").count()
     }
@@ -192,6 +234,24 @@ impl WorkerRegistry {
             Ok(()) => true,
             Err(_) => {
                 self.disconnect(id);
+                false
+            }
+        }
+    }
+
+    /// Deliver a command only if `id` is still on `expected_gen`.
+    pub async fn send_if_gen(&self, id: &str, expected_gen: u64, cmd: ServerCmd) -> bool {
+        let tx = {
+            let g = self.inner.lock();
+            match g.get(id) {
+                Some(w) if w.conn_gen == expected_gen => w.tx.clone(),
+                _ => return false,
+            }
+        };
+        match tx.send(Ok(cmd)).await {
+            Ok(()) => true,
+            Err(_) => {
+                self.disconnect_if_gen(id, expected_gen);
                 false
             }
         }

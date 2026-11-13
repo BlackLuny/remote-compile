@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   ApiError,
@@ -8,6 +8,7 @@ import {
   type WorkerCleanupResult,
   type WorkerCleanupSummary,
 } from "../api";
+import { resolveInitialCleanupView } from "../lib/cleanupState";
 import { Button, ErrorBox, Input, Modal, Mono } from "./ui";
 
 const POLL_INTERVAL_MS = 1000;
@@ -25,19 +26,24 @@ export function CleanupModal({
   const [idleDays, setIdleDays] = useState("7");
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [result, setResult] = useState<WorkerCleanupResult | null>(null);
+  const [isHistoricalResult, setIsHistoricalResult] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const touchedRef = useRef(false);
 
-  // If a cleanup is already running on this worker (e.g. page was refreshed),
-  // attach to it automatically so the operator sees live progress/outcome.
+  // Restore active or latest cleanup state when opening the modal (e.g. after
+  // closing mid-cleanup or refreshing the page).
   useEffect(() => {
     let cancelled = false;
+    touchedRef.current = false;
     api
       .get<WorkerCleanupSummary>(`/api/workers/${worker.id}/cleanup`)
       .then((summary) => {
-        if (cancelled) return;
-        if (summary.active && summary.active.status === "running") {
-          setActiveRequestId(summary.active.request_id);
-        }
+        if (cancelled || touchedRef.current) return;
+        const view = resolveInitialCleanupView(summary);
+        setActiveRequestId(view.activeRequestId);
+        setResult(view.result);
+        setIsHistoricalResult(view.isHistoricalResult);
+        setError(view.error);
       })
       .catch(() => {
         // Non-fatal: starting a new cleanup still works normally.
@@ -64,6 +70,7 @@ export function CleanupModal({
         if (job.status === "done") {
           setActiveRequestId(null);
           setResult(job);
+          setIsHistoricalResult(false);
           setError(null);
           qc.invalidateQueries({ queryKey: ["workers"] });
           qc.invalidateQueries({ queryKey: ["worker", worker.id] });
@@ -71,6 +78,7 @@ export function CleanupModal({
         }
         if (job.status === "failed") {
           setActiveRequestId(null);
+          setIsHistoricalResult(false);
           setError(job.message || "清理失败");
           qc.invalidateQueries({ queryKey: ["workers"] });
           qc.invalidateQueries({ queryKey: ["worker", worker.id] });
@@ -102,12 +110,15 @@ export function CleanupModal({
     mutationFn: (body: WorkerCleanupReq) =>
       api.post<WorkerCleanupResult>(`/api/workers/${worker.id}/cleanup`, body),
     onMutate: () => {
+      touchedRef.current = true;
       setError(null);
       setResult(null);
+      setIsHistoricalResult(false);
     },
     onSuccess: (job) => {
       if (job.status === "done") {
         setResult(job);
+        setIsHistoricalResult(false);
         qc.invalidateQueries({ queryKey: ["workers"] });
         qc.invalidateQueries({ queryKey: ["worker", worker.id] });
       } else if (job.status === "failed") {
@@ -219,6 +230,9 @@ export function CleanupModal({
 
       {result && (
         <div className="mt-3 space-y-2 rounded border border-[var(--color-line)] bg-[var(--color-surface)] p-3 text-[12px]">
+          {isHistoricalResult && (
+            <div className="text-[11px] text-[var(--color-ink-faint)]">上次后台清理已完成</div>
+          )}
           <div className="font-medium text-[var(--color-ok)]">{result.message}</div>
           <div className="grid grid-cols-2 gap-2 tnum text-[var(--color-ink-dim)]">
             <div>回收 volume：{result.reclaimed}</div>
@@ -245,7 +259,19 @@ export function CleanupModal({
 
       <div className="mt-4 flex justify-end gap-2">
         <Button onClick={onClose}>{result ? "关闭" : pending ? "后台运行" : "取消"}</Button>
-        {!result && (
+        {result ? (
+          <Button
+            variant="primary"
+            onClick={() => {
+              touchedRef.current = true;
+              setResult(null);
+              setIsHistoricalResult(false);
+              setError(null);
+            }}
+          >
+            再次清理
+          </Button>
+        ) : (
           <Button
             variant="primary"
             disabled={pending || (mode === "idle" && Number.isNaN(Number(idleDays)))}

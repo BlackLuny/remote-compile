@@ -156,12 +156,17 @@ impl WorkerApi for WorkerService {
             .ok_or_else(|| Status::not_found("worker not enrolled"))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        self.app.workers.connect(
+        let conn_gen = self.app.workers.connect(
             &worker_id,
             &stored.arch,
             &stored.version,
             stored.max_parallel as u32,
             tx,
+        );
+        self.app.fail_inflight_cleanups_before_gen(
+            &worker_id,
+            conn_gen,
+            "worker reconnected during cleanup",
         );
         // A fresh live entry starts with no name; the operator's name lives in
         // the enrollment row, so reconnecting must not lose it.
@@ -190,19 +195,24 @@ impl WorkerApi for WorkerService {
             // The channel dropped: its tasks must go back to the queue or they
             // would sit in `running` forever.
             tracing::info!(worker = %id, "worker channel closed");
-            app.workers.disconnect(&id);
-            app.fail_inflight_cleanup(&id, "worker disconnected during cleanup");
-            app.store.touch_worker(&id, "offline").ok();
-            app.reclaim_worker_tasks(&id).ok();
-            app.events.publish(Event::WorkerUpdated {
-                worker_id: id.clone(),
-                status: "offline".into(),
-                cpu_load: 0.0,
-                disk_free_gb: 0,
-                disk_total_gb: 0,
-                running_tasks: 0,
-                at: now_ms(),
-            });
+            app.fail_inflight_cleanup_for_gen(
+                &id,
+                conn_gen,
+                "worker disconnected during cleanup",
+            );
+            if app.workers.disconnect_if_gen(&id, conn_gen).is_some() {
+                app.store.touch_worker(&id, "offline").ok();
+                app.reclaim_worker_tasks(&id).ok();
+                app.events.publish(Event::WorkerUpdated {
+                    worker_id: id.clone(),
+                    status: "offline".into(),
+                    cpu_load: 0.0,
+                    disk_free_gb: 0,
+                    disk_total_gb: 0,
+                    running_tasks: 0,
+                    at: now_ms(),
+                });
+            }
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as CmdStream))
@@ -331,7 +341,7 @@ async fn handle_event(app: &Arc<App>, worker_id: &str, event: WorkerEvent) -> an
             images::on_mirror_done(app, worker_id, &done)?;
         }
         worker_event::Body::CleanupDone(done) => {
-            app.complete_cleanup(done);
+            app.complete_cleanup_from_worker(worker_id, done);
         }
     }
     Ok(())
