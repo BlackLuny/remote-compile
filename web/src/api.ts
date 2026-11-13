@@ -18,10 +18,6 @@ export class ApiError extends Error {
 // requests turn that into a visible error the user can act on.
 const DEFAULT_TIMEOUT_MS = 20_000;
 
-// Cleanup runs a disk reclaim on the worker and the server waits up to 300 s
-// for the report, so its caller has to outlast that.
-export const CLEANUP_TIMEOUT_MS = 320_000;
-
 export interface RequestOpts {
   timeoutMs?: number;
 }
@@ -192,7 +188,9 @@ export interface Worker {
 
 export interface WorkerCleanupResult {
   ok: boolean;
+  status?: "running" | "done" | "failed";
   request_id: string;
+  worker_id?: string;
   reclaimed: number;
   skipped_active: number;
   skipped_fresh: number;
@@ -200,6 +198,11 @@ export interface WorkerCleanupResult {
   disk_free_gb_after: number;
   reclaimed_worktrees: string[];
   message: string;
+}
+
+export interface WorkerCleanupSummary {
+  active: WorkerCleanupResult | null;
+  latest: WorkerCleanupResult | null;
 }
 
 export interface WorkerCleanupReq {
